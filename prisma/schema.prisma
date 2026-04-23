@@ -1,0 +1,75 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  scans     Scan[]
+}
+
+model Scan {
+  id          String     @id @default(cuid())
+  targetUrl   String
+  status      ScanStatus @default(PENDING)
+  createdAt   DateTime   @default(now())
+  completedAt DateTime?
+  userId      String
+  user        User       @relation(fields: [userId], references: [id])
+  findings    Finding[]
+}
+
+model Finding {
+  id          String   @id @default(cuid())
+  scanId      String
+  scan        Scan     @relation(fields: [scanId], references: [id])
+  type        String   // sqli, xss, csrf, idor, headers, redirect, secrets, lfi, cve
+  severity    Severity
+  url         String
+  parameter   String?
+  evidence    String?
+  cvssScore   Float?
+  cveId       String?
+  // RAG-generated fix
+  title       String?
+  explanation String?
+  fixSteps    Json?
+  codeExample String?
+  // embedding for semantic search
+  embedding   Float[]  // pgvector
+  createdAt   DateTime @default(now())
+}
+
+model KnowledgeChunk {
+  id        String   @id @default(cuid())
+  source    String   // "owasp", "nvd", "cwe"
+  title     String
+  content   String
+  embedding Float[]  // pgvector
+  createdAt DateTime @default(now())
+}
+
+enum ScanStatus {
+  PENDING
+  CRAWLING
+  SCANNING
+  ANALYZING
+  COMPLETED
+  FAILED
+}
+
+enum Severity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+  INFO
+}
