@@ -43,10 +43,11 @@ model Finding {
   explanation String?
   fixSteps    Json?
   codeExample String?
-  // embedding for semantic search
+  // embedding for semantic search (optional – populated only when RAG search is enabled)
   embedding   Float[]  // pgvector
   createdAt   DateTime @default(now())
 }
+
 
 model KnowledgeChunk {
   id        String   @id @default(cuid())
