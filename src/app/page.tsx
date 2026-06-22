@@ -122,7 +122,7 @@ export default function LandingPage() {
         <nav className="hidden md:flex items-center gap-8 text-sm font-semibold text-[#86868B]">
           <a href="#features" className="hover:text-[#D4380D] transition-colors">Product</a>
           <a href="#code" className="hover:text-[#D4380D] transition-colors">Remediation</a>
-          <a href="#pricing" className="hover:text-[#D4380D] transition-colors">Pricing</a>
+          <a href="#capabilities" className="hover:text-[#D4380D] transition-colors">Capabilities</a>
           <a href="#faq" className="hover:text-[#D4380D] transition-colors">FAQ</a>
         </nav>
 
@@ -389,107 +389,72 @@ cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))`}
         </div>
       </section>
 
-      {/* 🚀 5. TRANSPARENT PRICING GRID */}
-      <section id="pricing" className="py-20 bg-[#F2F2F7]/50 border-t border-[#E5E5EA] px-6">
+      {/* 🚀 5. CAPABILITIES OVERVIEW SECTION */}
+      <section id="capabilities" className="py-20 bg-[#F2F2F7]/50 border-t border-[#E5E5EA] px-6">
         <div className="max-w-6xl mx-auto">
           <div className="text-center max-w-xl mx-auto mb-16">
             <h2 className="text-3xl font-extrabold text-[#1D1D1F] tracking-tight mb-4">
-              Transparent, scale-ready pricing.
+              Comprehensive Security Audits
             </h2>
             <p className="text-sm text-[#86868B]">
-              Choose the tier that matches your development speed. Upgrade or downgrade at any time.
+              Discover what vulnerabilities and parameters VulnScanner is capable of inspecting in real-time.
             </p>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
             
-            {/* TIER 1: FREE */}
-            <div className="p-5 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
+            {/* Capability 1: Injection & Payloads */}
+            <div className="p-6 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
               <div>
-                <h3 className="font-bold text-sm text-[#86868B] uppercase tracking-wider mb-2">Free</h3>
-                <div className="flex items-baseline gap-1 mb-4">
-                  <span className="text-3xl font-black text-[#1D1D1F]">$0</span>
-                  <span className="text-xs text-[#86868B] font-medium">/mo</span>
-                </div>
-                <p className="text-[11px] text-[#86868B] leading-relaxed mb-6">For individual devs testing hobby projects.</p>
-                <ul className="space-y-3 border-t border-[#E5E5EA] pt-4 text-xs font-semibold text-[#86868B]">
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> 1 domain</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Monthly scans</li>
-                  <li className="flex items-center gap-2"><X className="w-4 h-4 text-[#86868B]/30 shrink-0" /> Slack alerts</li>
-                  <li className="flex items-center gap-2"><X className="w-4 h-4 text-[#86868B]/30 shrink-0" /> PDF reports</li>
+                <h3 className="font-bold text-sm text-[#1D1D1F] uppercase tracking-wider mb-3">Injection & Data Flow</h3>
+                <p className="text-xs text-[#86868B] leading-relaxed mb-4">Probes and analyzes inputs for critical execution vulnerabilities.</p>
+                <ul className="space-y-2.5 text-xs text-[#86868B]">
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> SQL Injection (Reflected / Blind)</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Cross-Site Scripting (XSS)</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Local File Inclusion & Traversal</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Server-Side Template Injection</li>
                 </ul>
               </div>
             </div>
 
-            {/* TIER 2: STARTER */}
-            <div className="p-5 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
+            {/* Capability 2: Access & Headers */}
+            <div className="p-6 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
               <div>
-                <h3 className="font-bold text-sm text-[#86868B] uppercase tracking-wider mb-2">Starter</h3>
-                <div className="flex items-baseline gap-1 mb-4">
-                  <span className="text-3xl font-black text-[#1D1D1F]">$16</span>
-                  <span className="text-xs text-[#86868B] font-medium">/mo</span>
-                </div>
-                <p className="text-[11px] text-[#86868B] leading-relaxed mb-6">For single active apps or simple landing pages.</p>
-                <ul className="space-y-3 border-t border-[#E5E5EA] pt-4 text-xs font-semibold text-[#86868B]">
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> 3 domains</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Weekly scans</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Email alerts</li>
-                  <li className="flex items-center gap-2"><X className="w-4 h-4 text-[#86868B]/30 shrink-0" /> Slack alerts</li>
+                <h3 className="font-bold text-sm text-[#1D1D1F] uppercase tracking-wider mb-3">Headers & Access Control</h3>
+                <p className="text-xs text-[#86868B] leading-relaxed mb-4">Validates proxy policies, origins, and authorization exposure.</p>
+                <ul className="space-y-2.5 text-xs text-[#86868B]">
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> CORS Wildcard & Reflection</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> HSTS, CSP & X-Frame headers</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Session Cookie attributes</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Host Header redirection</li>
                 </ul>
               </div>
             </div>
 
-            {/* TIER 3: PROTECTOR */}
-            <div className="p-5 rounded-2xl bg-white border border-[#D4380D]/40 border-2 shadow-md flex flex-col justify-between relative">
-              <span className="absolute -top-3 left-1/2 -translate-x-1/2 bg-[#D4380D] text-white text-[9px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-full shadow-sm">Popular</span>
+            {/* Capability 3: Architecture & Ingestion */}
+            <div className="p-6 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
               <div>
-                <h3 className="font-bold text-sm text-[#D4380D] uppercase tracking-wider mb-2">Protector</h3>
-                <div className="flex items-baseline gap-1 mb-4">
-                  <span className="text-3xl font-black text-[#1D1D1F]">$49</span>
-                  <span className="text-xs text-[#86868B] font-medium">/mo</span>
-                </div>
-                <p className="text-[11px] text-[#86868B] leading-relaxed mb-6">For small startups keeping apps continuously safe.</p>
-                <ul className="space-y-3 border-t border-[#E5E5EA] pt-4 text-xs font-semibold text-[#86868B]">
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> 10 domains</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Daily scans</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Slack & Email</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> PDF exports</li>
+                <h3 className="font-bold text-sm text-[#1D1D1F] uppercase tracking-wider mb-3">API & Infrastructure</h3>
+                <p className="text-xs text-[#86868B] leading-relaxed mb-4">Checks GraphQL configurations, network boundaries, and endpoints.</p>
+                <ul className="space-y-2.5 text-xs text-[#86868B]">
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> GraphQL Introspection</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Dangerous HTTP options</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Rate Limiting & DoS validation</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> SSRF & Parameter redirects</li>
                 </ul>
               </div>
             </div>
 
-            {/* TIER 4: PRO */}
-            <div className="p-5 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
+            {/* Capability 4: Leak Detection */}
+            <div className="p-6 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
               <div>
-                <h3 className="font-bold text-sm text-[#86868B] uppercase tracking-wider mb-2">Pro</h3>
-                <div className="flex items-baseline gap-1 mb-4">
-                  <span className="text-3xl font-black text-[#1D1D1F]">$129</span>
-                  <span className="text-xs text-[#86868B] font-medium">/mo</span>
-                </div>
-                <p className="text-[11px] text-[#86868B] leading-relaxed mb-6">For growing teams and multi-app SaaS networks.</p>
-                <ul className="space-y-3 border-t border-[#E5E5EA] pt-4 text-xs font-semibold text-[#86868B]">
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> 25 domains</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> AI RAG remediate</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Slack / Webhooks</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> API Access</li>
-                </ul>
-              </div>
-            </div>
-
-            {/* TIER 5: MAX */}
-            <div className="p-5 rounded-2xl bg-white border border-[#E5E5EA] shadow-sm flex flex-col justify-between">
-              <div>
-                <h3 className="font-bold text-sm text-[#86868B] uppercase tracking-wider mb-2">Max</h3>
-                <div className="flex items-baseline gap-1 mb-4">
-                  <span className="text-3xl font-black text-[#1D1D1F]">$299</span>
-                  <span className="text-xs text-[#86868B] font-medium">/mo</span>
-                </div>
-                <p className="text-[11px] text-[#86868B] leading-relaxed mb-6">For agencies managing dozens of client portals.</p>
-                <ul className="space-y-3 border-t border-[#E5E5EA] pt-4 text-xs font-semibold text-[#86868B]">
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Unlimited domains</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Continuous auditing</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Full webhook logs</li>
-                  <li className="flex items-center gap-2 text-[#1D1D1F]"><Check className="w-4 h-4 text-[#D4380D] shrink-0" /> Dedicated support</li>
+                <h3 className="font-bold text-sm text-[#1D1D1F] uppercase tracking-wider mb-3">Secrets & Metadata</h3>
+                <p className="text-xs text-[#86868B] leading-relaxed mb-4">Audits script files and metadata layouts for hidden leak factors.</p>
+                <ul className="space-y-2.5 text-xs text-[#86868B]">
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Env variables & Credentials</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Hardcoded API keys</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Exposed Git & Config dirs</li>
+                  <li className="flex items-center gap-2"><Check className="w-3.5 h-3.5 text-[#D4380D] shrink-0" /> Default credentials</li>
                 </ul>
               </div>
             </div>
@@ -548,7 +513,7 @@ cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))`}
           <div className="flex gap-8 text-xs font-semibold">
             <a href="#features" className="hover:text-white transition-colors">Product</a>
             <a href="#code" className="hover:text-white transition-colors">Remediation</a>
-            <a href="#pricing" className="hover:text-white transition-colors">Pricing</a>
+            <a href="#capabilities" className="hover:text-white transition-colors">Capabilities</a>
             <a href="#faq" className="hover:text-white transition-colors">FAQ</a>
           </div>
         </div>
