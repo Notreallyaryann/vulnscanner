@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { retrieveContext } from "./rag";
 import { generateFixReport } from "./cerebras";
 import { emitLog, cleanupScan } from "./scan-logger";
+import { renderWithBrowser } from "./browser";
 
 interface PendingFinding {
   type: string;
@@ -2982,43 +2983,71 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     let discoveredForms: FormTarget[] = [];
     let jsBundleEndpoints: JsApiEndpoint[] = [];
 
-    if (fetchSucceeded && pageHtml) {
-      // ── L1: Crawl same-origin links ──────────────────────────────────────
-      discoveredLinks = extractSameOriginLinks(pageHtml, targetUrl);
-      const apiEndpoints = extractApiEndpoints(pageHtml, targetUrl);
-      discoveredParamUrls = extractParamUrls(pageHtml, targetUrl);
-      discoveredForms = extractForms(pageHtml, targetUrl);
+    // ── Playwright browser rendering — PRIMARY DOM source ──────────────────
+    // The browser-rendered HTML is the authoritative source for all active probing.
+    // Raw `pageHtml` from fetch() is only used for passive header/cookie checks above.
+    let renderedHtml = pageHtml;
+    let runtimeFrameworks: string[] = [];
+    let browserLinks: string[] = [];
+
+    const browserResult = await renderWithBrowser(targetUrl, log);
+    if (browserResult) {
+      renderedHtml = browserResult.html;
+      runtimeFrameworks = browserResult.runtimeFrameworks;
+      browserLinks = browserResult.discoveredLinks;
+    }
+
+    if (fetchSucceeded || browserResult) {
+      // ── L1: Crawl same-origin links (merge static regex + Playwright SPA links) ─
+      const staticLinks = extractSameOriginLinks(renderedHtml, targetUrl);
+      discoveredLinks = [...new Set([...staticLinks, ...browserLinks])].slice(0, 50);
+      const apiEndpoints = extractApiEndpoints(renderedHtml, targetUrl);
+      discoveredParamUrls = extractParamUrls(renderedHtml, targetUrl);
+      discoveredForms = extractForms(renderedHtml, targetUrl);
       log(`🕸️   Phase 6: Crawler complete — ${discoveredLinks.length} links, ${apiEndpoints.length} API refs, ${discoveredParamUrls.length} param URLs, ${discoveredForms.length} form(s)`);
-      if (discoveredForms.length > 0) log(`📝  Discovered ${discoveredForms.length} HTML form(s) for injection testing`);
+      if (discoveredForms.length > 0) log(`📝  Discovered ${discoveredForms.length} form(s) for injection testing`);
       if (discoveredParamUrls.length > 0) log(`🔗  Discovered ${discoveredParamUrls.length} parameterised URL(s) for active probing`);
 
       // ── L1b: JS Bundle endpoint extraction (SPA field discovery) ─────────
-      // Downloads JS bundles and reads fetch/axios POST calls to discover input fields
-      // that are invisible in the static HTML (Angular, React, Vue SPAs)
-      log(`🔬  Phase 6b: JS bundle analysis — scanning scripts for hidden POST endpoints and input fields...`);
-      jsBundleEndpoints = await extractJsBundleEndpoints(pageHtml, targetUrl);
+      log(`🔬  Phase 6b: JS bundle analysis — scanning scripts for hidden POST endpoints...`);
+      jsBundleEndpoints = await extractJsBundleEndpoints(renderedHtml, targetUrl);
       if (jsBundleEndpoints.length > 0) {
         log(`🎯  JS analysis found ${jsBundleEndpoints.length} injectable POST endpoint(s): ${jsBundleEndpoints.map(e => e.path).join(", ")}`);
       }
 
-      // ── L2: Technology fingerprinting ────────────────────────────────────
-      const techs: string[] = [];
-      if (/__NEXT_DATA__|_next\/static/.test(pageHtml)) techs.push("Next.js");
-      if (/window\.__nuxt__|__NUXT__/.test(pageHtml)) techs.push("Nuxt.js");
-      if (/ng-version=|angular\.js/i.test(pageHtml)) techs.push("Angular");
-      if (/__VUE__|window\.__vue__/i.test(pageHtml)) techs.push("Vue.js");
-      if (/wp-content\/|wp-includes\//i.test(pageHtml)) techs.push("WordPress");
-      if (/drupal\.settings|Drupal\./i.test(pageHtml)) techs.push("Drupal");
-      if (/Joomla!/i.test(pageHtml)) techs.push("Joomla");
-      if (/shopify\.com\/s\/files/i.test(pageHtml)) techs.push("Shopify");
-      if (/jquery[.-]([\d.]+)(\.min)?\.js/i.test(pageHtml)) techs.push("jQuery");
-      if (/react(?:\.production|\.development)?\.min\.js/i.test(pageHtml)) techs.push("React");
-      if (techs.length > 0) {
+      // ── L2: Tech fingerprinting — runtime Playwright signals + static patterns ─
+      // runtimeFrameworks from page.evaluate() catches pure SPAs with no static traces.
+      // Static patterns catch SSR frameworks and CDN-served libraries.
+      const techs: string[] = [...runtimeFrameworks];
+      if (!techs.includes("Next.js")   && /__NEXT_DATA__|_next\/static/.test(renderedHtml))                              techs.push("Next.js");
+      if (!techs.includes("Nuxt.js")   && /window\.__nuxt__|__NUXT__/.test(renderedHtml))                               techs.push("Nuxt.js");
+      if (!techs.includes("Angular")   && /ng-version=|angular\.js/i.test(renderedHtml))                                techs.push("Angular");
+      if (!techs.includes("Vue.js")    && /__VUE__|window\.__vue__/i.test(renderedHtml))                                techs.push("Vue.js");
+      if (!techs.includes("React")     && /react(?:\.production|\.development)?\.min\.js|__react_/i.test(renderedHtml)) techs.push("React");
+      if (!techs.includes("SvelteKit") && /__sveltekit|sveltekit-preload/i.test(renderedHtml))                          techs.push("SvelteKit");
+      if (!techs.includes("Remix")     && /__remix_server_manifest__|remix-island/i.test(renderedHtml))                 techs.push("Remix");
+      if (!techs.includes("Gatsby")    && /gatsby-chunk-mapping|gatsby-image/i.test(renderedHtml))                      techs.push("Gatsby");
+      if (!techs.includes("Astro")     && /astro-page|\/@astrojs\//i.test(renderedHtml))                               techs.push("Astro");
+      if (/wp-content\/|wp-includes\//i.test(renderedHtml))                                                             techs.push("WordPress");
+      if (/drupal\.settings|Drupal\./i.test(renderedHtml))                                                              techs.push("Drupal");
+      if (/Joomla!/i.test(renderedHtml))                                                                                 techs.push("Joomla");
+      if (/shopify\.com\/s\/files/i.test(renderedHtml))                                                                 techs.push("Shopify");
+      if (/jquery[.-]([\d.]+)(\.min)?\.js/i.test(renderedHtml))                                                         techs.push("jQuery");
+      if (/csrfmiddlewaretoken/i.test(renderedHtml))                                                                     techs.push("Django");
+      if (/laravel_session|laravel\/framework/i.test(renderedHtml + (headers["set-cookie"] ?? "")))                     techs.push("Laravel");
+      if (/\/api\/trpc\//i.test(renderedHtml))                                                                           techs.push("tRPC");
+      if (/\/@vite\/client|vite\.config/i.test(renderedHtml))                                                            techs.push("Vite");
+      const poweredBy = headers["x-powered-by"] ?? "";
+      if (/express/i.test(poweredBy))  techs.push("Express.js");
+      if (/php/i.test(poweredBy))      techs.push("PHP");
+      if (/asp\.net/i.test(poweredBy)) techs.push("ASP.NET");
+      const uniqueTechs = [...new Set(techs)];
+      if (uniqueTechs.length > 0) {
         findings.push({
           type: "technology-fingerprinting",
           severity: "INFO",
           url: targetUrl,
-          evidence: `Detected technology stack: ${techs.join(", ")}. Technology fingerprinting allows attackers to look up known CVEs and version-specific exploits for each detected library or framework.`,
+          evidence: `Detected technology stack: ${uniqueTechs.join(", ")}. Detected via Playwright runtime evaluation + static HTML/header analysis. Fingerprinting exposes version-specific CVEs attackers can exploit.`,
           cvssScore: 2.0,
           cveId: "CWE-200",
         });
@@ -3125,8 +3154,9 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     if (gqlFinding) findings.push(gqlFinding);
 
     // ── L8: NEXT_PUBLIC_ / env variable leak detection ───────────────────────
-    if (fetchSucceeded && pageHtml) {
-      const envLeak = detectEnvLeaks(pageHtml, targetUrl);
+    // Uses renderedHtml so we catch env vars injected at runtime by React/Next.js
+    if (renderedHtml) {
+      const envLeak = detectEnvLeaks(renderedHtml, targetUrl);
       if (envLeak) findings.push(envLeak);
     }
 
@@ -3137,32 +3167,35 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     }
 
     // ── L10: Subdomain takeover signals ──────────────────────────────────────
-    if (fetchSucceeded && pageHtml) {
-      const takeoverSignal = detectSubdomainTakeoverSignals(pageHtml, targetUrl);
+    // Uses renderedHtml to catch JS-rendered external resource references
+    if (renderedHtml) {
+      const takeoverSignal = detectSubdomainTakeoverSignals(renderedHtml, targetUrl);
       if (takeoverSignal) findings.push(takeoverSignal);
     }
 
     // ── L11: SSRF parameter detection ────────────────────────────────────────
-    if (fetchSucceeded && pageHtml) {
-      const ssrfFinding = detectSSRF(pageHtml, discoveredParamUrls, targetUrl);
+    // Uses renderedHtml to catch SSRF-prone params in client-side rendered URLs
+    if (renderedHtml) {
+      const ssrfFinding = detectSSRF(renderedHtml, discoveredParamUrls, targetUrl);
       if (ssrfFinding) findings.push(ssrfFinding);
     }
 
     // ── L12: JS file secrets and dangerous sinks ─────────────────────────────
-    if (fetchSucceeded && pageHtml) {
+    // Uses renderedHtml to catch dynamically-added <script> tags in SPAs
+    if (renderedHtml) {
       log(`🔬  Phase 7: Scanning JS files for hardcoded secrets, API keys, and dangerous sinks...`);
-      const jsFindings = await analyzeJSFiles(pageHtml, targetUrl);
+      const jsFindings = await analyzeJSFiles(renderedHtml, targetUrl);
       findings.push(...jsFindings);
     }
 
     // ── L13: Broken auth (login form detection + default credential probe) ────
-    if (fetchSucceeded && pageHtml) {
-      const loginForms = [...pageHtml.matchAll(/<form[^>]*>([\s\S]*?)<\/form>/gi)];
+    // Uses renderedHtml — catches React/Next.js/Angular login forms rendered by JS
+    if (renderedHtml) {
+      const loginForms = [...renderedHtml.matchAll(/<form[^>]*>([\s\S]*?)<\/form>/gi)];
       for (const formMatch of loginForms.slice(0, 3)) {
         const formBody = formMatch[1] || "";
         const hasPasswordField = /type=["']?password["']?/i.test(formBody);
         if (!hasPasswordField) continue;
-        // Extract form action from the full match (formMatch[0])
         const fullForm = formMatch[0];
         const actionMatch = fullForm.match(/action=["']([^"']+)["']/i);
         const formAction = actionMatch ? new URL(actionMatch[1], targetUrl).toString() : targetUrl;
@@ -3380,8 +3413,9 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
     // ── PHASE 3d: INFRASTRUCTURE & PROTOCOL CHECKS ───────────────────────────
     log(`🌐  Phase 11: Infrastructure checks — CORS reflection, Host header injection, XXE, HTTP methods, debug exposure...`);
-    const apiEndpointsForMethods = fetchSucceeded && pageHtml
-      ? extractApiEndpoints(pageHtml, targetUrl)
+    // Use renderedHtml so we catch API endpoints injected by client-side routing (React Router, etc.)
+    const apiEndpointsForMethods = renderedHtml
+      ? extractApiEndpoints(renderedHtml, targetUrl)
       : [];
 
     const infraResults = await Promise.all([
@@ -3396,8 +3430,7 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
       probeNoSQLi(targetUrl, jsBundleEndpoints),
       probeJWTNone(targetUrl),
       probeExposedBackupFiles(targetUrl),
-      // GAP FIX: Add new gap fix probes to infrastructure checks
-      fetchSucceeded && pageHtml ? probeActiveOpenRedirect(pageHtml, targetUrl) : Promise.resolve(null),
+      renderedHtml ? probeActiveOpenRedirect(renderedHtml, targetUrl) : Promise.resolve(null),
       probeIDORWithDualToken(targetUrl, jsBundleEndpoints),
     ]);
 
