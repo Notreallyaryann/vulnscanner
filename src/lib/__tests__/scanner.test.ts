@@ -1,20 +1,8 @@
-/**
- * scanner.test.ts
- * Unit tests for core scanner probe helpers.
- *
- * Run with:   npx tsx --test src/lib/__tests__/scanner.test.ts
- * (or add `"test": "tsx --test src/**\/__tests__\/*.test.ts"` to package.json)
- */
+
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-// ─── Helpers under test (extracted pure functions) ─────────────────────────
-
-/**
- * Evaluates a CSP header string and returns a list of detected weaknesses.
- * Mirrors the logic in scanner.ts::evaluateCSP.
- */
 function evaluateCSP(cspValue: string): string[] {
   const weaknesses: string[] = [];
   if (/unsafe-inline/i.test(cspValue))
@@ -30,10 +18,6 @@ function evaluateCSP(cspValue: string): string[] {
   return weaknesses;
 }
 
-/**
- * Checks if a response body contains unencoded SQL error signatures.
- * Mirrors SQL_ERROR_PATTERNS_ACTIVE from scanner.ts.
- */
 const SQL_ERROR_PATTERNS = [
   /SQL syntax.*MySQL/i,
   /Warning.*mysql_/i,
@@ -48,10 +32,7 @@ function detectSQLiError(body: string): boolean {
   return SQL_ERROR_PATTERNS.some((p) => p.test(body));
 }
 
-/**
- * Checks if a payload is reflected unencoded in a response body.
- * Mirrors the XSS reflection check in probeReflectedXSS.
- */
+
 function isXSSReflected(body: string, payload: string): boolean {
   return (
     body.includes(payload) &&
@@ -59,10 +40,6 @@ function isXSSReflected(body: string, payload: string): boolean {
   );
 }
 
-/**
- * Detects environment variable / secret leaks in HTML.
- * Mirrors detectEnvLeaks from scanner.ts.
- */
 function detectEnvLeaks(html: string): boolean {
   const ENV_PATTERNS = [
     /NEXT_PUBLIC_[A-Z0-9_]+=([^"'\s]{4,})/g,
@@ -74,10 +51,7 @@ function detectEnvLeaks(html: string): boolean {
   return ENV_PATTERNS.some((re) => { re.lastIndex = 0; return re.test(html); });
 }
 
-/**
- * Extracts injectable form fields from an HTML string.
- * Mirrors the extractForms helper.
- */
+
 function countFormFields(html: string): number {
   const INJECTABLE_TYPES = /^(text|search|email|number|tel|url|hidden|password|)$/i;
   let count = 0;

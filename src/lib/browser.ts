@@ -1,6 +1,5 @@
 import { chromium, Browser } from "playwright";
 
-// ─── Result type returned from browser rendering ───────────────────────────
 
 export interface BrowserResult {
   /** Fully rendered HTML after JS hydration */
@@ -9,6 +8,8 @@ export interface BrowserResult {
   runtimeFrameworks: string[];
   /** Additional same-origin links discovered client-side (SPA routes) */
   discoveredLinks: string[];
+  /** API or background endpoints intercepted during page execution (fetch/XHR) */
+  interceptedRequests: string[];
 }
 
 // ─── Chromium launch args safe for both local and server/Docker environments ─
@@ -32,7 +33,6 @@ const CHROMIUM_ARGS = [
 // ─── Main export: render a URL and return structured results ─────────────────
 
 /**
- * Industry-grade Playwright renderer.
  *
  * Strategy:
  *   1. Navigate with `domcontentloaded` (fast) to get the shell immediately.
@@ -73,6 +73,32 @@ export async function renderWithBrowser(
 
     const page = await context.newPage();
 
+    const parsedBase = new URL(url);
+    const baseHostname = parsedBase.hostname;
+    const interceptedRequests: string[] = [];
+
+    // Intercept background API / Fetch / XHR requests
+    page.on("request", (request) => {
+      const resourceType = request.resourceType();
+      const urlStr = request.url();
+      if (resourceType === "fetch" || resourceType === "xhr" || urlStr.includes("/api/")) {
+        try {
+          const reqUrl = new URL(urlStr);
+          const baseParts = baseHostname.split(".");
+          const reqParts = reqUrl.hostname.split(".");
+          const isSameOrSub = reqUrl.hostname === baseHostname ||
+            (reqParts.length >= 2 && baseParts.length >= 2 &&
+              reqUrl.hostname.endsWith(baseParts.slice(-2).join(".")));
+
+          if (isSameOrSub && !interceptedRequests.includes(urlStr)) {
+            interceptedRequests.push(urlStr);
+          }
+        } catch {
+          // Ignore invalid URLs
+        }
+      }
+    });
+
     // Stage 1: Navigate — use domcontentloaded for initial paint
     try {
       await page.goto(url, {
@@ -95,7 +121,7 @@ export async function renderWithBrowser(
     // This is a real wait, NOT a fixed sleep — uses requestAnimationFrame heuristic
     await page.waitForFunction(() => document.readyState === "complete", {
       timeout: 5000,
-    }).catch(() => {});
+    }).catch(() => { });
 
     // Stage 4: Extract rendered HTML (the full hydrated DOM)
     const html = await page.content();
@@ -110,22 +136,22 @@ export async function renderWithBrowser(
         const detected: string[] = [];
         const w = window as any;
 
-        if (w.__NEXT_DATA__ || w.next)                          detected.push("Next.js");
-        if (w.__nuxt__ || w.$nuxt || w.__NUXT__)               detected.push("Nuxt.js");
+        if (w.__NEXT_DATA__ || w.next) detected.push("Next.js");
+        if (w.__nuxt__ || w.$nuxt || w.__NUXT__) detected.push("Nuxt.js");
         if (w.angular || document.querySelector("[ng-version]")) detected.push("Angular");
-        if (w.__VUE__ || w.Vue)                                 detected.push("Vue.js");
-        if (w.React || w.__REACT_DEVTOOLS_GLOBAL_HOOK__)        detected.push("React");
-        if (w.__remix_server_manifest__ || w.__remixContext)    detected.push("Remix");
-        if (w.__gatsby)                                          detected.push("Gatsby");
+        if (w.__VUE__ || w.Vue) detected.push("Vue.js");
+        if (w.React || w.__REACT_DEVTOOLS_GLOBAL_HOOK__) detected.push("React");
+        if (w.__remix_server_manifest__ || w.__remixContext) detected.push("Remix");
+        if (w.__gatsby) detected.push("Gatsby");
         if (w.__sveltekit_dev || document.querySelector("[data-sveltekit-preload-data]"))
-                                                                 detected.push("SvelteKit");
+          detected.push("SvelteKit");
         if (document.querySelector("astro-page") || w.__astro_hmr)
-                                                                 detected.push("Astro");
-        if (w.htmx)                                              detected.push("HTMX");
-        if (w.Alpine)                                            detected.push("Alpine.js");
-        if (w.Ember)                                             detected.push("Ember.js");
-        if (w.Backbone)                                          detected.push("Backbone.js");
-        if (w.jQuery || w.$?.fn?.jquery)                        detected.push("jQuery");
+          detected.push("Astro");
+        if (w.htmx) detected.push("HTMX");
+        if (w.Alpine) detected.push("Alpine.js");
+        if (w.Ember) detected.push("Ember.js");
+        if (w.Backbone) detected.push("Backbone.js");
+        if (w.jQuery || w.$?.fn?.jquery) detected.push("jQuery");
         return detected;
       })
       .catch(() => [] as string[]);
@@ -136,7 +162,6 @@ export async function renderWithBrowser(
 
     // Stage 6: Extract client-side discovered links for SPA route coverage
     // Playwright sees the full rendered anchor tags that fetch() would miss
-    const parsedBase = new URL(url);
     const discoveredLinks = await page
       .evaluate(
         (baseHostname: string) => {
@@ -157,20 +182,23 @@ export async function renderWithBrowser(
             })
             .slice(0, 50);
         },
-        parsedBase.hostname,
+        baseHostname,
       )
       .catch(() => [] as string[]);
 
     log(`🔗  Playwright: Found ${discoveredLinks.length} client-side links`);
+    if (interceptedRequests.length > 0) {
+      log(`📡  Playwright: Intercepted ${interceptedRequests.length} background API request(s)`);
+    }
 
-    return { html, runtimeFrameworks, discoveredLinks };
+    return { html, runtimeFrameworks, discoveredLinks, interceptedRequests };
   } catch (error: any) {
     log(`⚠️  Playwright: Browser rendering failed — ${error?.message ?? String(error)}`);
     log(`↩️  Playwright: Falling back to static HTTP fetch results`);
     return null;
   } finally {
     if (browser) {
-      await browser.close().catch(() => {});
+      await browser.close().catch(() => { });
     }
   }
 }

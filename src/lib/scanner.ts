@@ -2989,22 +2989,27 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     let renderedHtml = pageHtml;
     let runtimeFrameworks: string[] = [];
     let browserLinks: string[] = [];
+    let browserApiEndpoints: string[] = [];
 
     const browserResult = await renderWithBrowser(targetUrl, log);
     if (browserResult) {
       renderedHtml = browserResult.html;
       runtimeFrameworks = browserResult.runtimeFrameworks;
       browserLinks = browserResult.discoveredLinks;
+      browserApiEndpoints = browserResult.interceptedRequests || [];
     }
 
     if (fetchSucceeded || browserResult) {
       // ── L1: Crawl same-origin links (merge static regex + Playwright SPA links) ─
       const staticLinks = extractSameOriginLinks(renderedHtml, targetUrl);
       discoveredLinks = [...new Set([...staticLinks, ...browserLinks])].slice(0, 50);
-      const apiEndpoints = extractApiEndpoints(renderedHtml, targetUrl);
+      
+      const staticApiEndpoints = extractApiEndpoints(renderedHtml, targetUrl);
+      const apiEndpoints = [...new Set([...staticApiEndpoints, ...browserApiEndpoints])];
+      
       discoveredParamUrls = extractParamUrls(renderedHtml, targetUrl);
       discoveredForms = extractForms(renderedHtml, targetUrl);
-      log(`🕸️   Phase 6: Crawler complete — ${discoveredLinks.length} links, ${apiEndpoints.length} API refs, ${discoveredParamUrls.length} param URLs, ${discoveredForms.length} form(s)`);
+      log(`🕸️   Phase 6: Crawler complete — ${discoveredLinks.length} links, ${apiEndpoints.length} API refs (including ${browserApiEndpoints.length} intercepted runtime APIs), ${discoveredParamUrls.length} param URLs, ${discoveredForms.length} form(s)`);
       if (discoveredForms.length > 0) log(`📝  Discovered ${discoveredForms.length} form(s) for injection testing`);
       if (discoveredParamUrls.length > 0) log(`🔗  Discovered ${discoveredParamUrls.length} parameterised URL(s) for active probing`);
 
