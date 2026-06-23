@@ -83,24 +83,7 @@ export default function LandingPage() {
     if (!domain.trim()) return;
 
     setIsScanning(true);
-    setLogs([]);
-    setCurrentProgress(0);
-    stepRef.current = 0;
-
-    const interval = setInterval(() => {
-      const step = stepRef.current;
-      if (step < SIMULATION_STEPS.length) {
-        setLogs(prev => [...prev, SIMULATION_STEPS[step].log]);
-        setCurrentProgress(SIMULATION_STEPS[step].progress);
-        stepRef.current = step + 1;
-      } else {
-        clearInterval(interval);
-        // Redirect to dashboard with the scanned domain
-        setTimeout(() => {
-          router.push(`/dashboard?domain=${encodeURIComponent(domain)}`);
-        }, 800);
-      }
-    }, 380);
+    router.push(`/dashboard?domain=${encodeURIComponent(domain)}`);
   };
 
   const toggleFaq = (index: number) => {

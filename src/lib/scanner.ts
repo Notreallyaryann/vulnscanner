@@ -625,19 +625,41 @@ async function checkGraphQLIntrospection(baseUrl: string): Promise<PendingFindin
         // @ts-ignore
         next: { revalidate: 0 },
       });
-      if (resp.status === 200 || resp.status === 400) {
-        const text = await resp.text();
-        if (text.includes("__schema") || text.includes("queryType")) {
-          return {
-            type: "graphql-introspection-enabled",
-            severity: "MEDIUM",
-            url,
-            evidence: `GraphQL introspection is enabled at ${url}. Any visitor can query the full API schema — all types, fields, mutations, and queries — giving attackers a complete blueprint of the backend for targeted exploitation.`,
-            cvssScore: 5.3,
-            cveId: "CWE-200",
-          };
-        }
-      }
+      if (resp.status !== 200 && resp.status !== 400) continue;
+      const text = await resp.text();
+
+      // ── Strict verification ────────────────────────────────────────────────
+      // Only flag if the server actually returned schema data in the JSON
+      // response body. A server that blocks introspection may still echo the
+      // word "__schema" inside an error message — that is NOT a true positive.
+      let json: any;
+      try { json = JSON.parse(text); } catch { continue; }
+
+      // Confirmed vulnerable: data.__schema or data.__type is a non-null object
+      const schemaReturned =
+        json?.data?.__schema != null && typeof json.data.__schema === "object";
+      const typeReturned =
+        json?.data?.__type != null && typeof json.data.__type === "object";
+
+      if (!schemaReturned && !typeReturned) continue;
+
+      // Double-check: the schema object should have at least one typed field
+      const hasTypes =
+        Array.isArray(json?.data?.__schema?.types) &&
+        json.data.__schema.types.length > 0;
+      const hasQueryType =
+        json?.data?.__schema?.queryType?.name != null;
+
+      if (!hasTypes && !hasQueryType && !typeReturned) continue;
+
+      return {
+        type: "graphql-introspection-enabled",
+        severity: "MEDIUM",
+        url,
+        evidence: `GraphQL introspection is enabled at ${url}. Any visitor can query the full API schema — all types, fields, mutations, and queries — giving attackers a complete blueprint of the backend for targeted exploitation.`,
+        cvssScore: 5.3,
+        cveId: "CWE-200",
+      };
     } catch { /* skip */ }
   }
   return null;
@@ -702,7 +724,17 @@ async function probeBrokenAuth(
       const noErrorInBody = respText.length > 0 &&
         !/invalid|incorrect|wrong|failed|error|denied/i.test(respText);
 
-      if (isRedirect || (hasAuthCookie && noErrorInBody)) {
+      let success = false;
+      if (isRedirect) {
+        const location = resp.headers.get("location") || "";
+        if (location && !location.includes("login") && !location.includes("error") && !location.includes("fail")) {
+          success = true;
+        }
+      } else if (hasAuthCookie && noErrorInBody) {
+        success = true;
+      }
+
+      if (success) {
         return {
           type: "broken-authentication-default-creds",
           severity: "CRITICAL",
@@ -736,12 +768,12 @@ function detectSSRF(html: string, paramUrls: string[], targetUrl: string): Pendi
   }
   if (hits.length > 0) {
     return {
-      type: "ssrf-parameter-detected",
-      severity: "HIGH",
+      type: "ssrf-parameter-signal",
+      severity: "INFO",
       url: targetUrl,
       parameter: hits[0],
-      evidence: `Found ${hits.length} parameter(s) that accept URLs or remote paths: ${hits.slice(0, 3).join(", ")}. If the server fetches these URLs without validation, an attacker can make the server send requests to internal services (metadata APIs, databases, internal admin panels), leading to SSRF.`,
-      cvssScore: 8.6,
+      evidence: `Potential SSRF / Open Redirect indicator (not confirmed). Found ${hits.length} parameter(s) commonly used for fetching remote resources: ${hits.slice(0, 3).join(", ")}. This is a passive signal indicating the application might perform server-side fetching, which requires manual verification.`,
+      cvssScore: 0.0,
       cveId: "CWE-918",
     };
   }
@@ -892,10 +924,10 @@ function detectSubdomainTakeoverSignals(html: string, targetUrl: string): Pendin
   if (externalRefs.length >= 2) {
     return {
       type: "subdomain-takeover-signal",
-      severity: "MEDIUM",
+      severity: "INFO",
       url: targetUrl,
-      evidence: `Found ${externalRefs.length} references to external cloud-hosted domains in page source (${externalRefs.slice(0, 3).join(", ")}). If any CNAMEs are unclaimed, an attacker can register the resource and serve malicious content from your domain.`,
-      cvssScore: 6.4,
+      evidence: `Found ${externalRefs.length} references to external cloud-hosted domains in page source (${externalRefs.slice(0, 3).join(", ")}). This is a passive signal (not a confirmed vulnerability). If your application has DNS CNAMEs pointing to these services, ensure they are actively claimed to prevent subdomain takeover.`,
+      cvssScore: 0.0,
       cveId: "CWE-350",
     };
   }
@@ -1029,15 +1061,30 @@ async function probeBlindSQLiTiming(paramUrl: string): Promise<PendingFinding | 
           const elapsed = Date.now() - start;
           // Confirm if response took ≥3.5s longer than baseline (accounting for network variance)
           if (resp && elapsed > baselineTime + 3500) {
-            return {
-              type: "sql-injection-blind-timing",
-              severity: "CRITICAL",
-              url: testUrl.toString(),
-              parameter: param,
-              evidence: `Blind Time-Based SQL Injection confirmed via ${db} SLEEP payload. The request with payload "${payload}" in parameter "${param}" took ${elapsed}ms vs baseline ${baselineTime}ms (delta: ${elapsed - baselineTime}ms). This proves SQL injection even without visible error messages. An attacker can use time delays to extract the entire database character by character.`,
-              cvssScore: 9.8,
-              cveId: "CWE-89",
-            };
+            // Verify with 2 more measurements to eliminate network jitter
+            let hitCount = 1;
+            for (let i = 0; i < 2; i++) {
+              const start2 = Date.now();
+              await fetch(testUrl.toString(), {
+                headers: FETCH_HEADERS,
+                signal: AbortSignal.timeout(10000),
+                // @ts-ignore
+                next: { revalidate: 0 },
+              }).catch(() => null);
+              if ((Date.now() - start2) > baselineTime + 3500) hitCount++;
+            }
+            
+            if (hitCount >= 2) {
+              return {
+                type: "sql-injection-blind-timing",
+                severity: "CRITICAL",
+                url: testUrl.toString(),
+                parameter: param,
+                evidence: `Blind Time-Based SQL Injection confirmed via ${db} SLEEP payload. The request with payload "${payload}" in parameter "${param}" took >3.5s longer than baseline on multiple attempts. This proves SQL injection even without visible error messages. An attacker can use time delays to extract the entire database character by character.`,
+                cvssScore: 9.8,
+                cveId: "CWE-89",
+              };
+            }
           }
         } catch { /* next payload */ }
       }
@@ -1180,7 +1227,7 @@ async function probeDangerousHTTPMethods(targetUrl: string, apiPaths: string[]):
       }).catch(() => null);
       if (traceResp && traceResp.ok) {
         const body = await traceResp.text().catch(() => "");
-        if (body.includes("vulnscan-trace-test") || traceResp.status === 200) {
+        if (body.includes("vulnscan-trace-test")) {
           return {
             type: "http-trace-method-enabled",
             severity: "MEDIUM",
@@ -1290,18 +1337,23 @@ async function probePrototypePollution(paramUrl: string): Promise<PendingFinding
         const resp = await safeFetch(testUrl.toString(), 5000);
         if (!resp) continue;
         const body = await resp.text();
-        // If the polluted value appears in the response body, prototype was accessed
-        if (body.includes(value)) {
-          return {
-            type: "prototype-pollution",
-            severity: "HIGH",
-            url: testUrl.toString(),
-            parameter: param,
-            evidence: `Prototype Pollution detected. The injected parameter "${param}=${value}" was reflected in the server response, suggesting the query parser merges the prototype-modifying key into the application's object graph. In Node.js applications, this can be escalated to Remote Code Execution, authentication bypass, or denial of service by corrupting properties inherited by all objects.`,
-            cvssScore: 8.0,
-            cveId: "CWE-1321",
-          };
-        }
+        // Check if the polluted value appears as a JSON value, not just echoed in an error/HTML
+        try {
+          const json = JSON.parse(body);
+          const bodyStr = JSON.stringify(json);
+          // ensure the value is present and the original param string is not just echoed
+          if (bodyStr.includes(value) && !bodyStr.includes(param)) {
+            return {
+              type: "prototype-pollution",
+              severity: "HIGH",
+              url: testUrl.toString(),
+              parameter: param,
+              evidence: `Prototype Pollution detected. The injected parameter "${param}=${value}" was reflected as an object property in the server JSON response, suggesting the query parser merges the prototype-modifying key into the application's object graph. In Node.js applications, this can be escalated to Remote Code Execution, authentication bypass, or denial of service.`,
+              cvssScore: 8.0,
+              cveId: "CWE-1321",
+            };
+          }
+        } catch { /* not json, likely false positive */ }
       } catch { /* next */ }
     }
   } catch { /* skip */ }
@@ -1659,14 +1711,17 @@ async function probeHTMLInjection(paramUrl: string): Promise<PendingFinding | nu
           const resp = await safeFetch(testUrl.toString(), 5000);
           if (!resp) continue;
           const body = await resp.text();
-          // Reflected unencoded HTML tag (without it becoming &lt;) = HTML injection
-          if (body.includes(payload) && !body.includes(payload.replace(/</g, "&lt;"))) {
+          // Reflected unencoded HTML tag inside the body
+          const bodyMatch = body.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+          const contentToCheck = bodyMatch ? bodyMatch[1] : body;
+          
+          if (contentToCheck.includes(payload) && !contentToCheck.includes(payload.replace(/</g, "&lt;")) && !contentToCheck.includes("&#60;") && !contentToCheck.includes("\\u003c")) {
             return {
               type: "html-injection",
               severity: "MEDIUM",
               url: testUrl.toString(),
               parameter: param,
-              evidence: `HTML Injection detected. The payload "${payload.substring(0, 50)}" injected into parameter "${param}" is reflected as raw HTML in the response. While XSS may be blocked by a WAF, HTML injection enables phishing content injection (fake login forms), page defacement, and social engineering attacks targeting real users.`,
+              evidence: `HTML Injection detected. The payload "${payload.substring(0, 50)}" injected into parameter "${param}" is reflected as raw HTML in the response body. While XSS may be blocked by a WAF, HTML injection enables phishing content injection, page defacement, and social engineering attacks.`,
               cvssScore: 5.4,
               cveId: "CWE-79",
             };
@@ -1984,16 +2039,14 @@ async function probeSoftwareCompositionAnalysis(baseUrl: string): Promise<Pendin
 
       // package-lock.json analysis (more detailed dependency tree)
       if (path === "/package-lock.json") {
-        if (/vulnerable|deprecated|cve|exploit/i.test(content)) {
-          findings.push({
-            type: "sensitive-file-exposed",
-            severity: "MEDIUM",
-            url,
-            evidence: `package-lock.json is publicly accessible. This file contains the full dependency tree with exact versions of all transitive dependencies. Attackers can use this to identify vulnerable sub-dependencies and build targeted exploits.`,
-            cvssScore: 5.3,
-            cveId: "CWE-1104",
-          });
-        }
+        findings.push({
+          type: "sensitive-file-exposed",
+          severity: "MEDIUM",
+          url,
+          evidence: `package-lock.json is publicly accessible. This file contains the full dependency tree with exact versions of all transitive dependencies. Attackers can use this to identify vulnerable sub-dependencies and build targeted exploits.`,
+          cvssScore: 5.3,
+          cveId: "CWE-1104",
+        });
       }
     } catch { /* skip */ }
   }
@@ -2069,89 +2122,10 @@ async function probeBlindSSRFWithTiming(paramUrl: string): Promise<PendingFindin
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Tests for Insecure Direct Object References (IDOR) / Broken Object Level Authorization (BOLA)
- * by attempting to access resources with different user tokens.
- * This requires obtaining two valid tokens (admin + user, or two different user tokens).
+ * Testing IDOR / BOLA with dual-tokens removed to prevent false positives.
+ * (The original implementation tested without a valid token, which is covered by probeUnauthenticatedAPIAccess).
  */
 async function probeIDORWithDualToken(baseUrl: string, jsBundleEndpoints: JsApiEndpoint[]): Promise<PendingFinding | null> {
-  const userApiEndpoints = [
-    "/api/users/1",
-    "/api/v1/users/1",
-    "/api/profile",
-    "/api/me",
-    "/api/account",
-    "/api/orders",
-    "/api/invoices",
-    "/rest/user/profile",
-    "/api/profile/1",
-  ];
-
-  // Generate two mock JWT tokens for different users
-  // In production, these would be obtained from actual login flows
-  const generateMockJWT = (userId: number): string => {
-    const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-    const payload = Buffer.from(JSON.stringify({ sub: userId, id: userId, role: userId === 1 ? "admin" : "user" })).toString("base64url");
-    return `${header}.${payload}.mock_signature`;
-  };
-
-  try {
-    for (const endpoint of jsBundleEndpoints) {
-      const endpointPath = endpoint.path;
-      
-      // Check if endpoint looks like a user resource (contains numeric ID)
-      if (!/\d+|{id}|{userId}|{user_id}/i.test(endpointPath)) continue;
-
-      try {
-        const adminUrl = new URL(endpointPath, baseUrl).toString();
-        
-        // Attempt 1: Request as Admin (ID=1)
-        const adminToken = generateMockJWT(1);
-        const adminResp = await fetch(adminUrl, {
-          headers: {
-            ...FETCH_HEADERS,
-            "Authorization": `Bearer ${adminToken}`,
-          },
-          signal: AbortSignal.timeout(5000),
-          // @ts-ignore
-          next: { revalidate: 0 },
-        }).catch(() => null);
-
-        if (!adminResp || adminResp.status === 401) continue;
-        const adminData = adminResp.ok ? await adminResp.text() : "";
-
-        // Attempt 2: Request same endpoint as User (ID=2)
-        const userToken = generateMockJWT(2);
-        const userResp = await fetch(adminUrl, {
-          headers: {
-            ...FETCH_HEADERS,
-            "Authorization": `Bearer ${userToken}`,
-          },
-          signal: AbortSignal.timeout(5000),
-          // @ts-ignore
-          next: { revalidate: 0 },
-        }).catch(() => null);
-
-        if (!userResp || userResp.status === 401) continue;
-        const userData = userResp.ok ? await userResp.text() : "";
-
-        // IDOR detected: User token accessed admin resource
-        if (userResp.ok && userResp.status === 200 && userData.length > 50) {
-          // Verify the response contains different user data (not same as admin)
-          if (adminData !== userData) {
-            return {
-              type: "idor-broken-object-level-authorization",
-              severity: "CRITICAL",
-              url: adminUrl,
-              parameter: "Authorization (JWT token)",
-              evidence: `Insecure Direct Object Reference (IDOR) / Broken Object Level Authorization confirmed at ${endpointPath}. User with token for ID=2 accessed the resource intended for ID=1 (admin). The server returns different data without properly validating ownership. An attacker can enumerate all user IDs and access arbitrary user profiles, orders, or sensitive data belonging to any other user.`,
-              cvssScore: 9.1,
-              cveId: "CWE-639",
-            };
-          }
-        }
-      } catch { /* skip endpoint */ }
-    }
-  } catch { /* skip */ }
   return null;
 }
 
@@ -2369,8 +2343,15 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
       // D1 – Scan the main HTML page for XSS sinks
       const htmlSinks: string[] = [];
+      const inlineScripts = [...pageHtml.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]).join("\n");
       for (const { pattern, label } of DOM_XSS_SINKS) {
-        if (pattern.test(pageHtml)) htmlSinks.push(label);
+        if (label.includes("dangerouslySetInnerHTML")) {
+          if (pattern.test(pageHtml) && /location\.search|window\.location|params|query|router/i.test(pageHtml)) htmlSinks.push(label);
+        } else if (label.includes("eval") || label.includes("document.write")) {
+          if (pattern.test(inlineScripts)) htmlSinks.push(label);
+        } else {
+          if (pattern.test(pageHtml)) htmlSinks.push(label);
+        }
         pattern.lastIndex = 0; // reset stateful regex
       }
       if (htmlSinks.length > 0) {
@@ -2414,7 +2395,15 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
           const jsSinks: string[] = [];
           for (const { pattern, label } of DOM_XSS_SINKS) {
-            if (pattern.test(jsCode)) jsSinks.push(label);
+            if (label.includes("dangerouslySetInnerHTML")) {
+              if (pattern.test(jsCode) && /location\.search|window\.location|params|query|router/i.test(jsCode)) {
+                 jsSinks.push(label);
+              }
+            } else if (label.includes("eval") || label.includes("document.write")) {
+              // skip eval and document.write in bundle files to avoid false positives with bundler runtimes
+            } else {
+              if (pattern.test(jsCode)) jsSinks.push(label);
+            }
             pattern.lastIndex = 0;
           }
 
@@ -2489,17 +2478,20 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
             next: { revalidate: 0 },
           }).catch(() => null);
 
-          if (resp && resp.status !== 404 && resp.status !== 405 && resp.status !== 503) {
-            // Server processed a non-preflight cross-origin POST — CSRF vulnerable
+          if (resp && resp.status >= 200 && resp.status < 300) {
+            const bodyText = await resp.text().catch(() => "");
             const corsOrigin = resp.headers.get("access-control-allow-origin") ?? "";
             const corsCredentials = resp.headers.get("access-control-allow-credentials") ?? "";
             spaCsrfFound = true;
+            
+            const isConfirmed = bodyText.includes("token") || bodyText.includes("success") || bodyText.includes("user") || bodyText.includes("id");
+            
             findings.push({
               type: "csrf-missing-token",
-              severity: "HIGH",
+              severity: isConfirmed ? "HIGH" : "INFO",
               url: csrfUrl,
-              evidence: `CSRF vulnerability detected on REST API endpoint ${path}. The server accepted a POST request sent with Content-Type: text/plain (a "simple" cross-origin request that browsers send WITHOUT a CORS preflight). CORS: Allow-Origin="${corsOrigin}", Allow-Credentials="${corsCredentials}". An attacker hosting a malicious page can silently POST to this endpoint using the victim's cookies, performing actions (login, purchase, profile change) on their behalf without any user interaction.`,
-              cvssScore: 7.5,
+              evidence: `CSRF vulnerability ${isConfirmed ? "detected" : "signal"} on REST API endpoint ${path}. The server accepted a POST request sent with Content-Type: text/plain (a "simple" cross-origin request that browsers send WITHOUT a CORS preflight) and returned HTTP ${resp.status}. CORS: Allow-Origin="${corsOrigin}", Allow-Credentials="${corsCredentials}". An attacker hosting a malicious page can silently POST to this endpoint using the victim's cookies.`,
+              cvssScore: isConfirmed ? 7.5 : 0.0,
               cveId: "CWE-352",
             });
           }
