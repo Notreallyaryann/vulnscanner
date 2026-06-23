@@ -61,17 +61,7 @@ async function main() {
     console.warn("⚠️ Warning: Could not enable vector extension automatically. It might already be enabled or require administrative permissions:", error);
   }
 
-  // 1. Seed default user
-  const defaultUser = await prisma.user.upsert({
-    where: { email: "admin@vulnscanner.io" },
-    update: {},
-    create: {
-      id: "default-user",
-      email: "admin@vulnscanner.io",
-      name: "Security Admin",
-    },
-  });
-  console.log(`👤 Seeded User: ${defaultUser.name} (${defaultUser.email})`);
+
 
   // 2. Clear previous knowledge chunks (optional, to prevent duplicates)
   console.log("🧹 Clearing old KnowledgeChunks...");

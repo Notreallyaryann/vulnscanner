@@ -25,7 +25,6 @@ export async function createScanAction(url: string): Promise<string> {
     data: {
       targetUrl: cleanUrl,
       status: "PENDING",
-      userId: "default-user",
     },
   });
 
@@ -43,7 +42,6 @@ export async function createScanAction(url: string): Promise<string> {
 export async function getScansAction() {
   try {
     return await prisma.scan.findMany({
-      where: { userId: "default-user" },
       orderBy: { createdAt: "desc" },
       include: {
         _count: {
@@ -147,7 +145,7 @@ export async function askRAGAction(query: string) {
 
   try {
     const referenceContext = await retrieveContext(query, 3);
-    const relatedFindings = await searchPastFindings(query, "default-user", 3);
+    const relatedFindings = await searchPastFindings(query, 3);
 
     let findingsContext = "No related past findings found.";
     if (relatedFindings.length > 0) {

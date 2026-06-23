@@ -27,12 +27,12 @@ export async function retrieveContext(
 
   // pgvector cosine similarity query via Prisma raw SQL
   // The <=> operator = cosine distance (lower = more similar)
-  const chunks = await prisma.$queryRaw<KnowledgeChunkResult[]>`
+  const chunks = await prisma.$queryRawUnsafe<KnowledgeChunkResult[]>(`
     SELECT title, content, source
     FROM "KnowledgeChunk"
-    ORDER BY embedding <=> ${vectorString}::vector
+    ORDER BY embedding::text::vector <=> '[${embedding.join(",")}]'::vector
     LIMIT ${topK}
-  `;
+  `);
 
   if (chunks.length === 0) {
     return "No relevant context found in knowledge base.";
@@ -65,13 +65,12 @@ export async function retrieveContext(
  */
 export async function searchPastFindings(
   queryText: string,
-  userId: string,
   topK: number = 10
 ) {
   const embedding = await generateEmbedding(queryText);
   const vectorString = `[${embedding.join(",")}]`;
 
-  const findings = await prisma.$queryRaw<PastFindingResult[]>`
+  const findings = await prisma.$queryRawUnsafe<PastFindingResult[]>(`
     SELECT 
       f.id,
       f.type,
@@ -80,13 +79,12 @@ export async function searchPastFindings(
       f.title,
       f."scanId" as scan_id,
       f."createdAt" as created_at,
-      f.embedding <=> ${vectorString}::vector as distance
+      f.embedding::text::vector <=> '[${embedding.join(",")}]'::vector as distance
     FROM "Finding" f
     JOIN "Scan" s ON s.id = f."scanId"
-    WHERE s."userId" = ${userId}
     ORDER BY distance ASC
     LIMIT ${topK}
-  `;
+  `);
 
   return findings;
 }
@@ -102,15 +100,15 @@ export async function storeKnowledgeChunk(params: {
   );
   const vectorString = `[${embedding.join(",")}]`;
 
-  await prisma.$executeRaw`
+  await prisma.$executeRawUnsafe(`
     INSERT INTO "KnowledgeChunk" (id, source, title, content, embedding, "createdAt")
     VALUES (
       gen_random_uuid()::text,
-      ${params.source},
-      ${params.title},
-      ${params.content},
-      ${vectorString}::vector,
+      '${params.source}',
+      '${params.title.replace(/'/g, "''")}',
+      '${params.content.replace(/'/g, "''")}',
+      '[${embedding.join(",")}]'::vector,
       NOW()
     )
-  `;
+  `);
 }

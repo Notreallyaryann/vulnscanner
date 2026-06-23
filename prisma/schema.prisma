@@ -8,13 +8,7 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  createdAt DateTime @default(now())
-  scans     Scan[]
-}
+
 
 model Scan {
   id          String     @id @default(cuid())
@@ -22,8 +16,7 @@ model Scan {
   status      ScanStatus @default(PENDING)
   createdAt   DateTime   @default(now())
   completedAt DateTime?
-  userId      String
-  user        User       @relation(fields: [userId], references: [id])
+
   findings    Finding[]
 }
 
