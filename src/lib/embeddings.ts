@@ -1,83 +1,19 @@
-import { pipeline, env } from '@xenova/transformers';
 
-// ✅ CRITICAL: Force WASM backend FIRST before anything else
-// This prevents it from trying to load native libonnxruntime.so
-(env.backends as any).onnx = {
-    wasm: {
-        numThreads: 1,
-        proxy: false,
-    }
-};
+import { InferenceClient } from "@huggingface/inference";
 
-// Configure cache directory
-if (process.env.VERCEL) {
-    env.cacheDir = '/tmp/model_cache';
-    env.localModelPath = '/tmp/model_cache';
-    console.log('📁 Using Vercel /tmp cache');
-} else {
-    env.cacheDir = './.model_cache';
-    env.localModelPath = './.model_cache';
-    console.log('📁 Using local .model_cache');
-}
-
-env.allowRemoteModels = true;
-env.useFSCache = true;
-
-type EmbeddingPipeline = Awaited<ReturnType<typeof pipeline>>;
-
-const globalForEmbedder = globalThis as unknown as {
-    embedder: EmbeddingPipeline | undefined;
-    modelPromise: Promise<EmbeddingPipeline> | undefined;
-};
-
-async function getEmbedder(): Promise<EmbeddingPipeline> {
-    if (globalForEmbedder.embedder) return globalForEmbedder.embedder;
-    if (globalForEmbedder.modelPromise) return globalForEmbedder.modelPromise;
-
-    globalForEmbedder.modelPromise = (async () => {
-        try {
-            console.log('⏳ Loading model with @xenova/transformers (WASM mode)...');
-            const start = Date.now();
-            const extractor = await pipeline(
-                'feature-extraction',
-                'Xenova/all-MiniLM-L6-v2',
-                {
-                    quantized: true,
-                    // ✅ Explicitly set backend to wasm
-                    backend: 'wasm',
-                    progress_callback: (progress: any) => {
-                        if (progress.status === 'download') {
-                            const percent = Math.round(progress.progress * 100);
-                            console.log(`📥 Downloading model: ${percent}%`);
-                        }
-                    },
-                }
-            );
-            console.log(`✅ Model loaded in ${((Date.now() - start) / 1000).toFixed(2)}s`);
-            globalForEmbedder.embedder = extractor;
-            return extractor;
-        } catch (error) {
-            console.error('❌ Failed to load model:', error);
-            globalForEmbedder.modelPromise = undefined;
-            throw error;
-        }
-    })();
-
-    return globalForEmbedder.modelPromise;
-}
+const client = new InferenceClient(process.env.HF_TOKEN!);
 
 export async function generateEmbedding(text: string): Promise<number[]> {
-    try {
-        const extractor = await getEmbedder();
-        const output = await (extractor as any)([text], {
-            pooling: 'mean',
-            normalize: true,
-        });
-        return Array.from(output.data as Float32Array);
-    } catch (error: any) {
-        console.error('Embedding error:', error);
-        throw new Error(`Embedding failed: ${error.message}`);
+    const result = await client.featureExtraction({
+        model: "sentence-transformers/all-MiniLM-L6-v2",
+        inputs: text,
+    });
+
+    if (Array.isArray(result[0])) {
+        return Array.from(result[0] as number[]);
     }
+
+    return Array.from(result as number[]);
 }
 
 export function cosineSimilarity(a: number[], b: number[]): number {
