@@ -504,10 +504,6 @@ cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))`}
 
         <div className="max-w-6xl mx-auto flex flex-col sm:flex-row justify-between text-[11px] font-mono leading-relaxed">
           <p>© 2026 VulnScanner Node. All rights reserved.</p>
-          <p className="flex gap-4">
-            <span>Support: support@vulnscanner.io</span>
-            <span>Host: Local Node</span>
-          </p>
         </div>
       </footer>
 

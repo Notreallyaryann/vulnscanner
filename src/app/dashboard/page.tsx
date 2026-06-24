@@ -537,13 +537,7 @@ export default function DashboardPage() {
 
       {/* 🚀 MAIN CONTENT CONTAINER */}
       <main className="flex-1 flex flex-col min-h-screen max-h-screen overflow-y-auto bg-[#FAF8F5]">
-        {/* TOP STATUS BAR */}
-        <header className="h-16 border-b border-stone-200/80 bg-[#FFFEFB]/85 backdrop-blur-md px-8 flex items-center justify-between z-10 sticky top-0">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-[#D4380D] animate-ping" />
-            <span className="text-xs font-semibold text-stone-600 uppercase tracking-widest font-mono">Auditor Node Active</span>
-          </div>
-        </header>
+
 
         <div className="flex-1 p-8">
           {/* TAB 1: AUDITS DASHBOARD */}
