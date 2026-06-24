@@ -1,0 +1,13 @@
+{
+  "name": "vulnscanner-browser-service",
+  "version": "1.0.0",
+  "description": "Microservice to run Playwright browser rendering for VulnScanner",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.44.0"
+  }
+}

@@ -32,27 +32,61 @@ const CHROMIUM_ARGS = [
 
 // ─── Main export: render a URL and return structured results ─────────────────
 
-/**
- *
- * Strategy:
- *   1. Navigate with `domcontentloaded` (fast) to get the shell immediately.
- *   2. Wait for `networkidle` with a generous timeout to let SPAs hydrate.
- *   3. If networkidle times out (background polling / WebSockets), we still
- *      proceed with whatever has rendered — we do NOT block the scan.
- *   4. Evaluate runtime JS to detect frameworks that don't leave static traces.
- *   5. Extract client-side discovered anchor links for SPA route coverage.
- *
- * Falls back to `null` gracefully on any error so the scanner always continues.
- */
+
 export async function renderWithBrowser(
   url: string,
   log: (msg: string) => void,
 ): Promise<BrowserResult | null> {
+  const serviceUrl = process.env.BROWSER_SERVICE_URL;
+
+  // ─── Case 1: External Render Service is configured ─────────────────────────
+  if (serviceUrl) {
+    try {
+      log(`🌐  Browser Service: Delegating rendering for ${url} to external service at ${serviceUrl}`);
+      const response = await fetch(`${serviceUrl.replace(/\/$/, "")}/render`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ url }),
+        // Set a timeout to prevent hanging the scan
+        signal: AbortSignal.timeout(30000),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = (await response.json()) as BrowserResult;
+      log(`✅  Browser Service: Successfully rendered via external service`);
+      return data;
+    } catch (err: any) {
+      log(`⚠️  Browser Service: External service failed — ${err?.message ?? String(err)}. Falling back to static fetch.`);
+      return null;
+    }
+  }
+
+  // ─── Case 2: No external service. Check if we are running on Vercel ─────────
+  if (process.env.VERCEL || process.env.NEXT_PUBLIC_VERCEL) {
+    log(`ℹ️  Vercel environment detected: Bypassing browser rendering (no BROWSER_SERVICE_URL configured) and falling back to static HTTP fetch.`);
+    return null;
+  }
+
+  // ─── Case 3: Local environment, no service URL. Run Playwright locally ─────
   let browser: Browser | null = null;
   try {
-    log(`🌐  Playwright: Launching headless Chromium for ${url}`);
+    log(`🌐  Playwright (Local): Launching headless Chromium for ${url}`);
 
-    browser = await chromium.launch({
+    // Dynamically import playwright to prevent loading it on Vercel/serverless environments
+    let playwrightModule;
+    try {
+      playwrightModule = await import("playwright");
+    } catch (importErr: any) {
+      log(`⚠️  Playwright (Local): Failed to load module — ${importErr?.message ?? String(importErr)}`);
+      return null;
+    }
+
+    browser = await playwrightModule.chromium.launch({
       headless: true,
       args: CHROMIUM_ARGS,
     });
