@@ -3,6 +3,17 @@ import { pipeline, env } from "@xenova/transformers";
 env.allowLocalModels = false;
 env.useBrowserCache = false;
 
+// Set cache directory to /tmp for serverless functions
+if (typeof process !== "undefined" && process.env) {
+    env.cacheDir = "/tmp/.cache";
+}
+
+// Limit execution threads to 1 for serverless compatibility
+const onnx = (env.backends as any)?.onnx;
+if (onnx?.wasm) {
+    onnx.wasm.numThreads = 1;
+}
+
 type EmbeddingPipeline = Awaited<ReturnType<typeof pipeline>>;
 
 const globalForEmbedder = globalThis as unknown as {
