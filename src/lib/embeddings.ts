@@ -1,12 +1,18 @@
-import { pipeline, env } from "@xenova/transformers";
+import { pipeline, env } from '@xenova/transformers';
 
-env.allowLocalModels = false;
-env.useBrowserCache = false;
-
-// Set cache directory to /tmp for serverless functions
-if (typeof process !== "undefined" && process.env) {
-    env.cacheDir = "/tmp/.cache";
+// Configure cache directory
+if (process.env.VERCEL) {
+    env.cacheDir = '/tmp/model_cache';
+    env.localModelPath = '/tmp/model_cache';
+    console.log('📁 Using Vercel /tmp cache');
+} else {
+    env.cacheDir = './.model_cache';
+    env.localModelPath = './.model_cache';
+    console.log('📁 Using local .model_cache');
 }
+
+env.allowRemoteModels = true;
+env.useFSCache = true;
 
 // Limit execution threads to 1 for serverless compatibility
 const onnx = (env.backends as any)?.onnx;
@@ -18,36 +24,57 @@ type EmbeddingPipeline = Awaited<ReturnType<typeof pipeline>>;
 
 const globalForEmbedder = globalThis as unknown as {
     embedder: EmbeddingPipeline | undefined;
+    modelPromise: Promise<EmbeddingPipeline> | undefined;
 };
 
 async function getEmbedder(): Promise<EmbeddingPipeline> {
     if (globalForEmbedder.embedder) return globalForEmbedder.embedder;
+    if (globalForEmbedder.modelPromise) return globalForEmbedder.modelPromise;
 
-    const model = await pipeline(
-        "feature-extraction",
-        "Xenova/all-MiniLM-L6-v2"
-    );
+    globalForEmbedder.modelPromise = (async () => {
+        try {
+            console.log('⏳ Loading model with @xenova/transformers...');
+            const start = Date.now();
 
-    if (process.env.NODE_ENV !== "production") {
-        globalForEmbedder.embedder = model;
-    }
+            const extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+                quantized: true,
+                progress_callback: (progress: any) => {
+                    if (progress.status === 'download') {
+                        const percent = Math.round(progress.progress * 100);
+                        console.log(`📥 Downloading model: ${percent}%`);
+                    }
+                }
+            });
 
-    return model;
+            console.log(`✅ Model loaded in ${((Date.now() - start) / 1000).toFixed(2)}s`);
+            globalForEmbedder.embedder = extractor;
+            return extractor;
+        } catch (error) {
+            console.error('❌ Failed to load model:', error);
+            globalForEmbedder.modelPromise = undefined;
+            throw error;
+        }
+    })();
+
+    return globalForEmbedder.modelPromise;
 }
-
 
 export async function generateEmbedding(text: string): Promise<number[]> {
-    const embedder = await getEmbedder();
+    try {
+        const extractor = await getEmbedder();
 
-    // Use any casting to bypass strict type checks for specific pipeline options/outputs
-    const output = await (embedder as any)(text, {
-        pooling: "mean",
-        normalize: true,
-    });
+        const output = await (extractor as any)([text], {
+            pooling: 'mean',
+            normalize: true
+        });
 
-    return Array.from(output.data as Float32Array);
+        // Convert to array
+        return Array.from(output.data as Float32Array);
+    } catch (error: any) {
+        console.error('Embedding error:', error);
+        throw new Error(`Embedding failed: ${error.message}`);
+    }
 }
-
 
 export function cosineSimilarity(a: number[], b: number[]): number {
     const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
