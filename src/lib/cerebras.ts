@@ -295,25 +295,35 @@ Respond with a JSON object containing exactly these fields:
         return getMockFixReport(params);
     }
 
-    const data = await response.json();
-    const raw = data.choices[0].message.content as string;
-    const clean = raw.replace(/```json|```/g, "").trim();
-
     try {
-        return JSON.parse(clean) as FixReport;
-    } catch (parseError) {
-        // If the model hit max_tokens and truncated the response, try to repair the JSON
-        try {
-            // A basic heuristic to close truncated JSON objects or arrays at the end of the string
-            let repaired = clean;
-            if (repaired.lastIndexOf('"') > repaired.lastIndexOf('}')) repaired += '"';
-            if (repaired.lastIndexOf('[') > repaired.lastIndexOf(']')) repaired += ']';
-            repaired += '}';
-            return JSON.parse(repaired) as FixReport;
-        } catch (repairError) {
-            console.warn(`⚠️ Failed to parse/repair Cerebras JSON response. Truncated output. Falling back to mock.`);
+        const data = await response.json();
+        const raw = data?.choices?.[0]?.message?.content;
+        if (!raw) {
+            console.warn(`⚠️ Cerebras response format invalid or empty. Falling back to mock.`);
             return getMockFixReport(params);
         }
+
+        const clean = (raw as string).replace(/```json|```/g, "").trim();
+
+        try {
+            return JSON.parse(clean) as FixReport;
+        } catch (parseError) {
+            // If the model hit max_tokens and truncated the response, try to repair the JSON
+            try {
+                // A basic heuristic to close truncated JSON objects or arrays at the end of the string
+                let repaired = clean;
+                if (repaired.lastIndexOf('"') > repaired.lastIndexOf('}')) repaired += '"';
+                if (repaired.lastIndexOf('[') > repaired.lastIndexOf(']')) repaired += ']';
+                repaired += '}';
+                return JSON.parse(repaired) as FixReport;
+            } catch (repairError) {
+                console.warn(`⚠️ Failed to parse/repair Cerebras JSON response. Truncated output. Falling back to mock.`);
+                return getMockFixReport(params);
+            }
+        }
+    } catch (err: any) {
+        console.error(`⚠️ Error parsing Cerebras API response: ${err?.message ?? String(err)}. Falling back to mock.`);
+        return getMockFixReport(params);
     }
 }
 
