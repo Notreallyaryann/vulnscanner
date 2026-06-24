@@ -3,6 +3,7 @@ import { retrieveContext } from "./rag";
 import { generateFixReport } from "./cerebras";
 import { emitLog, cleanupScan } from "./scan-logger";
 import { renderWithBrowser } from "./browser";
+import { runNmapScan, type NmapFinding } from "./nmap";
 
 interface PendingFinding {
   type: string;
@@ -2040,14 +2041,21 @@ async function probeSoftwareCompositionAnalysis(baseUrl: string): Promise<Pendin
 
       // package-lock.json analysis (more detailed dependency tree)
       if (path === "/package-lock.json") {
-        findings.push({
-          type: "sensitive-file-exposed",
-          severity: "MEDIUM",
-          url,
-          evidence: `package-lock.json is publicly accessible. This file contains the full dependency tree with exact versions of all transitive dependencies. Attackers can use this to identify vulnerable sub-dependencies and build targeted exploits.`,
-          cvssScore: 5.3,
-          cveId: "CWE-1104",
-        });
+        try {
+          const parsed = JSON.parse(content);
+          if (parsed && (parsed.lockfileVersion || parsed.dependencies || parsed.packages)) {
+            findings.push({
+              type: "sensitive-file-exposed",
+              severity: "MEDIUM",
+              url,
+              evidence: `package-lock.json is publicly accessible. This file contains the full dependency tree with exact versions of all transitive dependencies. Attackers can use this to identify vulnerable sub-dependencies and build targeted exploits.`,
+              cvssScore: 5.3,
+              cveId: "CWE-1104",
+            });
+          }
+        } catch {
+          // Content is not valid JSON, ignore false positive 200 OK HTML pages
+        }
       }
     } catch { /* skip */ }
   }
@@ -2142,6 +2150,12 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
   try {
     await prisma.scan.update({ where: { id: scanId }, data: { status: "CRAWLING" } });
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 0: NMAP PORT SCAN (fires in parallel with main page fetch)
+    // ══════════════════════════════════════════════════════════════════════════
+    log(`🔌  Phase 0: Nmap port scan & service fingerprinting (runs in parallel)...`);
+    const nmapPromise = runNmapScan(targetUrl, log);
+
     // ── Fetch main page ────────────────────────────────────────────────────────
     const mainResp = await safeFetch(targetUrl);
     const headers: Record<string, string> = {};
@@ -2167,6 +2181,19 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     await prisma.scan.update({ where: { id: scanId }, data: { status: "SCANNING" } });
 
     const findings: PendingFinding[] = [];
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Collect nmap findings — await the parallel promise here
+    // ══════════════════════════════════════════════════════════════════════════
+    try {
+      const nmapFindings: NmapFinding[] = await nmapPromise;
+      for (const nf of nmapFindings) {
+        findings.push(nf as PendingFinding);
+      }
+      log(`🗺️   Phase 0 complete — ${nmapFindings.length} network finding(s) merged into scan results`);
+    } catch (nmapErr) {
+      log(`⚠️   Phase 0 (nmap) encountered an error: ${nmapErr instanceof Error ? nmapErr.message : String(nmapErr)}`);
+    }
 
     // ══════════════════════════════════════════════════════════════════════════
     // SECTION A: SECURITY HEADER CHECKS

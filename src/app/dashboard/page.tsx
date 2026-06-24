@@ -10,7 +10,6 @@ import {
   Activity, 
   Search, 
   Cpu, 
-  BookOpen, 
   ArrowRight, 
   ChevronRight, 
   RefreshCw, 
@@ -98,6 +97,12 @@ const OWASP_MAP: Record<string, { code: string; name: string; color: string }> =
   "ssrf-parameter-detected":      { code: "A10", name: "SSRF", color: "#06b6d4" },
   "host-header-injection":        { code: "A10", name: "SSRF", color: "#06b6d4" },
   "host-header-injection-redirect": { code: "A10", name: "SSRF", color: "#06b6d4" },
+  // Nmap network findings
+  "open-port-risky":              { code: "A05", name: "Security Misconfiguration", color: "#a855f7" },
+  "open-port-info":               { code: "A05", name: "Security Misconfiguration", color: "#64748b" },
+  "service-version-disclosure":   { code: "A06", name: "Outdated Components", color: "#6366f1" },
+  "default-service-exposed":      { code: "A05", name: "Security Misconfiguration", color: "#a855f7" },
+  "cdn-edge-masking":             { code: "A05", name: "Security Misconfiguration", color: "#0ea5e9" },
 };
 
 function getOWASP(findingType: string) {
@@ -157,7 +162,7 @@ interface ChatMessage {
 
 export default function DashboardPage() {
   // Navigation State
-  const [activeTab, setActiveTab] = useState<"dashboard" | "scans" | "rag" | "knowledge">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "scans" | "rag">("dashboard");
 
   // Real-time clock
   const [now, setNow] = useState(new Date());
@@ -195,14 +200,21 @@ export default function DashboardPage() {
   const chatBottomRef = useRef<HTMLDivElement>(null);
 
   // Load Scans List on Mount + auto-trigger scan if domain param is present
+  const scanInitiated = useRef(false);
   useEffect(() => {
     loadScans();
     
     // If the landing page passed a domain via ?domain=, auto-start the real scan
+    // Guard against React StrictMode double-invocation in dev mode
+    if (scanInitiated.current) return;
+    
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       const autoDomain = params.get("domain");
       if (autoDomain) {
+        scanInitiated.current = true;
+        // Clean the URL param immediately to prevent re-triggering on any remount
+        window.history.replaceState({}, "", "/dashboard");
         setTargetUrl(autoDomain);
         // Auto-trigger the scan after state is set
         setTimeout(async () => {
@@ -219,8 +231,6 @@ export default function DashboardPage() {
             setSelectedScan(tempScanDetails);
             setSelectedFinding(null);
             loadScans();
-            // Clean the URL param to avoid re-triggering on refresh
-            window.history.replaceState({}, "", "/dashboard");
           } catch (err: any) {
             console.error("Auto-scan failed:", err);
             setIsScanning(false);
@@ -516,18 +526,6 @@ export default function DashboardPage() {
             >
               <Cpu className="w-4 h-4 text-[#D4380D]" />
               Remediation RAG Chat
-            </button>
-
-            <button
-              onClick={() => setActiveTab("knowledge")}
-              className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-semibold transition-all cursor-pointer ${
-                activeTab === "knowledge"
-                  ? "bg-stone-100 border-l-4 border-[#D4380D] text-stone-900 font-bold"
-                  : "text-stone-600 hover:text-stone-900 hover:bg-stone-50"
-              }`}
-            >
-              <BookOpen className="w-4 h-4 text-[#D4380D]" />
-              Security Standards KB
             </button>
           </nav>
         </div>
@@ -1119,50 +1117,6 @@ export default function DashboardPage() {
                   <Send className="w-4.5 h-4.5" />
                 </button>
               </form>
-            </div>
-          )}
-
-          {/* TAB 4: SECURITY STANDARDS KB */}
-          {activeTab === "knowledge" && (
-            <div className="max-w-4xl mx-auto space-y-6">
-              <div>
-                <h2 className="text-xl font-extrabold text-stone-900">Vulnerability Reference Base</h2>
-                <p className="text-xs text-stone-600">Review reference criteria loaded in the local vector DB to provide context for AI recommendations.</p>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="cyber-card p-5 rounded-lg bg-white border border-stone-200/80">
-                  <div className="flex items-center gap-2.5 mb-3">
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-orange-50 border border-orange-200 text-[#D4380D] uppercase tracking-widest font-mono">OWASP</span>
-                    <h3 className="font-bold text-stone-900 text-sm">SQL Injection (SQLi)</h3>
-                  </div>
-                  <p className="text-xs text-stone-600 leading-relaxed">Direct string concatenations into SQL formats. Remediate with parameterized queries and prepared interfaces.</p>
-                </div>
-
-                <div className="cyber-card p-5 rounded-lg bg-white border border-stone-200/80">
-                  <div className="flex items-center gap-2.5 mb-3">
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-orange-50 border border-orange-200 text-[#D4380D] uppercase tracking-widest font-mono">OWASP</span>
-                    <h3 className="font-bold text-stone-900 text-sm">Cross-Site Scripting (XSS)</h3>
-                  </div>
-                  <p className="text-xs text-stone-600 leading-relaxed">Reflecting query arguments or saving them to DOM locations without HTML escaping. Remediate by context escaping inputs.</p>
-                </div>
-
-                <div className="cyber-card p-5 rounded-lg bg-white border border-stone-200/80">
-                  <div className="flex items-center gap-2.5 mb-3">
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-orange-50 border border-orange-200 text-[#D4380D] uppercase tracking-widest font-mono">OWASP</span>
-                    <h3 className="font-bold text-stone-900 text-sm">Missing Security Headers</h3>
-                  </div>
-                  <p className="text-xs text-stone-600 leading-relaxed">Servers lacking HSTS, CSP, X-Frame-Options, or mime sniffing controls. Remediate by configuring proxy headers.</p>
-                </div>
-
-                <div className="cyber-card p-5 rounded-lg bg-white border border-stone-200/80">
-                  <div className="flex items-center gap-2.5 mb-3">
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-red-50 border border-red-200 text-red-700 uppercase tracking-widest font-mono">NVD CVE</span>
-                    <h3 className="font-bold text-stone-900 text-sm">CVE-2024-34351 SSRF</h3>
-                  </div>
-                  <p className="text-xs text-stone-600 leading-relaxed">Server action redirect inputs resulting in server side request forgery inside Next.js. Remediate by limiting redirect destinations.</p>
-                </div>
-              </div>
             </div>
           )}
         </div>
