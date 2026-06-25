@@ -115,7 +115,35 @@ function extractHost(targetUrl: string): string {
   }
 }
 
-function runNmapProcess(host: string, timeoutMs = 180_000): Promise<string> {
+async function runNmapProcess(host: string, timeoutMs = 180_000): Promise<string> {
+  const serviceUrl = process.env.NMAP_SERVICE_URL;
+
+  if (serviceUrl) {
+    try {
+      const response = await fetch(`${serviceUrl.replace(/\/$/, "")}/scan`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ host }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(`Nmap service returned status ${response.status}: ${errorText || response.statusText}`);
+      }
+
+      const data = (await response.json()) as { xml?: string; error?: string };
+      if (data.error) {
+        throw new Error(data.error);
+      }
+      return data.xml || "";
+    } catch (err) {
+      throw new Error(`External Nmap service failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   return new Promise((resolve, reject) => {
     const args = [
       "-Pn",                              // Skip host discovery — treat host as up
@@ -159,6 +187,7 @@ function runNmapProcess(host: string, timeoutMs = 180_000): Promise<string> {
     });
   });
 }
+
 
 function parseNmapXml(xml: string): ParsedPort[] {
   const ports: ParsedPort[] = [];

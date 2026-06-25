@@ -1,0 +1,12 @@
+{
+  "name": "vulnscanner-nmap-service",
+  "version": "1.0.0",
+  "description": "Microservice to run Nmap scans for VulnScanner",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
