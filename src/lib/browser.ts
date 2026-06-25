@@ -42,7 +42,7 @@ export async function renderWithBrowser(
   // ─── Case 1: External Render Service is configured ─────────────────────────
   if (serviceUrl) {
     try {
-      log(`🌐  Browser Service: Delegating rendering for ${url} to external service at ${serviceUrl}`);
+      log(`🌐  Browser Service: Rendering page with headless browser...`);
       const response = await fetch(`${serviceUrl.replace(/\/$/, "")}/render`, {
         method: "POST",
         headers: {
@@ -58,10 +58,10 @@ export async function renderWithBrowser(
       }
 
       const data = (await response.json()) as BrowserResult;
-      log(`✅  Browser Service: Successfully rendered via external service`);
+      log(`✅  Browser Service: Page rendering complete`);
       return data;
     } catch (err: any) {
-      log(`⚠️  Browser Service: External service failed — ${err?.message ?? String(err)}. Falling back to static fetch.`);
+      log(`⚠️  Browser Service: Headless rendering failed — falling back to static fetch.`);
       return null;
     }
   }

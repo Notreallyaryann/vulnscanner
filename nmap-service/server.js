@@ -19,6 +19,11 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "healthy" });
 });
 
+// Root path handler to satisfy Render's default health check
+app.get("/", (req, res) => {
+  res.status(200).send("Nmap Port Scanning Microservice is online.");
+});
+
 // Scan endpoint
 app.post("/scan", async (req, res) => {
   const { host } = req.body;

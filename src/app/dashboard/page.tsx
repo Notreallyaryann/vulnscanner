@@ -220,12 +220,22 @@ export default function DashboardPage() {
         setTimeout(async () => {
           try {
             setIsScanning(true);
-            const { createScanAction: csa, getScanDetailsAction: gsda } = await import("@/lib/actions");
+            const { getScanDetailsAction: gsda } = await import("@/lib/actions");
             let cleanUrl = autoDomain.trim();
             if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
               cleanUrl = "https://" + cleanUrl;
             }
-            const scanId = await csa(cleanUrl);
+            
+            const response = await fetch("/api/scan", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url: cleanUrl }),
+            });
+            if (!response.ok) {
+              throw new Error(await response.text());
+            }
+            const { scanId } = await response.json();
+
             setCurrentScanId(scanId);
             const tempScanDetails = await gsda(scanId);
             setSelectedScan(tempScanDetails);
@@ -333,7 +343,17 @@ export default function DashboardPage() {
 
     try {
       setIsScanning(true);
-      const scanId = await createScanAction(targetUrl);
+      
+      const response = await fetch("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: targetUrl }),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const { scanId } = await response.json();
+
       setCurrentScanId(scanId);
 
       // Instantly load temporary scan stats
@@ -354,6 +374,16 @@ export default function DashboardPage() {
     const details = await getScanDetailsAction(scanId);
     if (details) {
       setSelectedScan(details);
+      
+      const isActive = ["PENDING", "CRAWLING", "SCANNING", "ANALYZING"].includes(details.status);
+      if (isActive) {
+        setCurrentScanId(details.id);
+        setIsScanning(true);
+      } else {
+        setCurrentScanId(null);
+        setIsScanning(false);
+      }
+
       if (details.findings && details.findings.length > 0) {
         setSelectedFinding(details.findings[0] as Finding);
       } else {

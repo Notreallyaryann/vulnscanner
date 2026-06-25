@@ -28,10 +28,13 @@ export async function createScanAction(url: string): Promise<string> {
     },
   });
 
-  // Fire-and-forget background scan
-  runVulnerabilityScan(scan.id, cleanUrl).catch((err) => {
-    console.error(`Error executing background scan ${scan.id}:`, err);
-  });
+  // Fire-and-forget background scan scheduled on the macro-task queue
+  // This prevents Next.js from blocking the Server Action response.
+  setTimeout(() => {
+    runVulnerabilityScan(scan.id, cleanUrl).catch((err) => {
+      console.error(`Error executing background scan ${scan.id}:`, err);
+    });
+  }, 0);
 
   return scan.id;
 }

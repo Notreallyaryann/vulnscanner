@@ -2145,7 +2145,6 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
   };
 
   log(`🚀 [VulnScanner v2.0] Starting security audit for: ${targetUrl}`);
-  log(`🔗 Scan ID: ${scanId}`);
 
   try {
     await prisma.scan.update({ where: { id: scanId }, data: { status: "CRAWLING" } });
@@ -2878,7 +2877,12 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         },
       ];
 
+    let checkedCount = 0;
     for (const endpoint of sensitiveEndpoints) {
+      checkedCount++;
+      if (checkedCount % 15 === 0 || checkedCount === 1) {
+        log(`🔎  Phase 4: Probing endpoints (${checkedCount}/${sensitiveEndpoints.length})...`);
+      }
       try {
         const endpointUrl = new URL(endpoint.path, targetUrl).toString();
         const resp = await safeFetch(endpointUrl, 5000);
@@ -3252,6 +3256,14 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
     if (probeTargets.length > 0) {
       log(`⚡  Phase 8: Active injection probes — SQLi, XSS, command injection, path traversal on ${probeTargets.length} URL(s)...`);
+      for (const target of probeTargets) {
+        try {
+          const parsed = new URL(target);
+          log(`     ℹ️  Probing query parameters on ${parsed.pathname}${parsed.search}`);
+        } catch {
+          log(`     ℹ️  Probing query parameters on ${target.substring(0, 65)}`);
+        }
+      }
 
       // Run all probes concurrently per URL for speed
       const probeResults = await Promise.all(
@@ -3309,6 +3321,9 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     // Submit payloads directly to HTML form input fields via POST/GET
     if (discoveredForms.length > 0) {
       log(`📝  Phase 9: Form injection probing — SQLi, XSS, SSTI on ${discoveredForms.length} form(s) (${discoveredForms.reduce((a, f) => a + f.fields.length, 0)} fields)...`);
+      for (const form of discoveredForms) {
+        log(`     ℹ️  Auditing form [${form.method.toUpperCase()}] action: ${form.actionUrl || "(self)"} (fields: ${form.fields.join(", ")})`);
+      }
 
       const formProbeResults = await Promise.all(
         discoveredForms.flatMap((form) => [
@@ -3344,6 +3359,7 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
       if (jsBundleEndpoints.length > 0) {
         for (const endpoint of jsBundleEndpoints) {
           if (apiSqliFound) break;
+          log(`     ℹ️  Testing REST parameters on POST ${endpoint.path} (fields: ${endpoint.fields.join(", ")})`);
           const endpointUrl = new URL(endpoint.path, targetUrl).toString();
 
           for (const payload of SQLI_PAYLOADS) {
@@ -3536,7 +3552,15 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     cleanupScan(scanId);
   } catch (scanErr) {
     console.error(`❌ Scan [${scanId}] failed:`, scanErr);
-    log(`❌  Scan failed: ${scanErr instanceof Error ? scanErr.message : String(scanErr)}`);
+    let errorMsg = "An unexpected error occurred.";
+    if (scanErr instanceof Error) {
+      errorMsg = scanErr.message;
+    } else if (typeof scanErr === "object" && scanErr !== null) {
+      errorMsg = (scanErr as any).message || JSON.stringify(scanErr);
+    } else if (scanErr) {
+      errorMsg = String(scanErr);
+    }
+    log(`❌  Scan failed: ${errorMsg}`);
     cleanupScan(scanId);
     await prisma.scan
       .update({ where: { id: scanId }, data: { status: "FAILED" } })
