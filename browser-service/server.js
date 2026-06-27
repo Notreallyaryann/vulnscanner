@@ -65,7 +65,7 @@ app.post("/render", async (req, res) => {
     page.on("request", (request) => {
       const resourceType = request.resourceType();
       const urlStr = request.url();
-      if (resourceType === "fetch" || resourceType === "xhr" || urlStr.includes("/api/")) {
+      if (resourceType === "fetch" || resourceType === "xhr" || urlStr.includes("/api/") || urlStr.includes("/_next/data/")) {
         try {
           const reqUrl = new URL(urlStr);
           const baseParts = baseHostname.split(".");

@@ -1537,10 +1537,58 @@ async function probeJWTNone(targetUrl: string): Promise<PendingFinding | null> {
   return null;
 }
 
+// Helper to detect if an endpoint returns a soft-404 or a generic SPA fallback route
+const isSoft404OrSPARedirect = (endpointBody: string, homepageBody: string, filePath?: string): boolean => {
+  if (!homepageBody) return false;
+
+  const trimmedEp = endpointBody.trim();
+  const trimmedHome = homepageBody.trim();
+
+  // 1. Exact body comparison (hashing equivalent)
+  if (trimmedEp === trimmedHome) return true;
+
+  // 2. HTML Markup detection: if the expected resource is NOT an HTML page/route,
+  //    but the response starts with standard HTML document declarations, it's a fallback.
+  if (filePath) {
+    const isHtmlMarkup = trimmedEp.toLowerCase().startsWith("<!doctype html") || 
+                         trimmedEp.toLowerCase().startsWith("<html") ||
+                         trimmedEp.toLowerCase().startsWith("<!doctype");
+    const expectedHtml = filePath.endsWith(".html") || 
+                         filePath.endsWith(".htm") || 
+                         filePath.endsWith("/");
+    if (isHtmlMarkup && !expectedHtml) {
+      return true;
+    }
+  }
+
+  // 3. Page title heuristic
+  const getTitle = (html: string) => {
+    const m = html.match(/<title>([^<]+)<\/title>/i);
+    return m ? m[1].trim() : "";
+  };
+
+  const homeTitle = getTitle(homepageBody);
+  const epTitle = getTitle(endpointBody);
+
+  if (homeTitle && epTitle && homeTitle === epTitle) {
+    return true;
+  }
+
+  // 4. SPA Framework markers + close body length comparison
+  const lenDiff = Math.abs(endpointBody.length - homepageBody.length);
+  const threshold = homepageBody.length * 0.08; // 8% threshold
+  if (lenDiff < threshold) {
+    if (/__NEXT_DATA__|__nuxt|webpack|next\/static|react-root|#app|#root/i.test(endpointBody)) {
+      return true;
+    }
+  }
+  return false;
+};
+
 /**
  * Exposed Sensitive/Backup Files (Forgotten backups, environment files, git structure)
  */
-async function probeExposedBackupFiles(targetUrl: string): Promise<PendingFinding | null> {
+async function probeExposedBackupFiles(targetUrl: string, homepageHtml?: string): Promise<PendingFinding | null> {
   const sensitiveFiles = [
     { path: "/ftp/package.json.bak", type: "JSON Developer Backup", pattern: /dependencies|devDependencies|version|name/ },
     { path: "/ftp/coupons_2013.md.bak", type: "Sales MD Backup", pattern: /coupon|discount|off|%|sale/i },
@@ -1567,7 +1615,21 @@ async function probeExposedBackupFiles(targetUrl: string): Promise<PendingFindin
       }).catch(() => null);
 
       if (!resp || resp.status !== 200) continue;
+      
+      // Strict Content-Type filter: if the resource is NOT an HTML route/page,
+      // but is served with "text/html", reject it immediately (SPA fallback indicator).
+      const contentType = resp.headers.get("content-type") || "";
+      const isExpectedHtml = file.path.endsWith(".html") || file.path.endsWith(".htm") || file.path.endsWith("/");
+      if (!isExpectedHtml && contentType.includes("text/html")) {
+        continue;
+      }
+
       const text = await resp.text();
+
+      // Eliminate SPA soft-404 / route fallback false positives
+      if (homepageHtml && isSoft404OrSPARedirect(text, homepageHtml, file.path)) {
+        continue;
+      }
 
       if (file.pattern.test(text)) {
         return {
@@ -1588,7 +1650,7 @@ async function probeExposedBackupFiles(targetUrl: string): Promise<PendingFindin
  * Directory Listing / Index Exposure
  * Checks if web server exposes file directory indexes on common paths.
  */
-async function probeDirectoryListing(targetUrl: string): Promise<PendingFinding | null> {
+async function probeDirectoryListing(targetUrl: string, homepageHtml?: string): Promise<PendingFinding | null> {
   const DIRS = ["/uploads/", "/files/", "/backup/", "/static/", "/assets/", "/images/", "/logs/", "/tmp/", "/temp/", "/data/"];
   const INDEX_MARKERS = [/Index of \//i, /<title>Directory listing/i, /\[DIR\]/i, /Parent Directory/i, /Last modified.*Size/i];
   for (const dir of DIRS) {
@@ -1597,6 +1659,12 @@ async function probeDirectoryListing(targetUrl: string): Promise<PendingFinding 
       const resp = await safeFetch(url, 4000);
       if (!resp || resp.status !== 200) continue;
       const body = await resp.text();
+
+      // Eliminate SPA routing soft-404 redirects
+      if (homepageHtml && isSoft404OrSPARedirect(body, homepageHtml)) {
+        continue;
+      }
+
       const hit = INDEX_MARKERS.find(p => p.test(body));
       if (hit) {
         return {
@@ -2138,6 +2206,65 @@ async function probeIDORWithDualToken(baseUrl: string, jsBundleEndpoints: JsApiE
   return null;
 }
 
+async function runAsyncAIAnalysis(findingId: string, pending: PendingFinding) {
+  try {
+    const ragQuery = `${pending.type} ${pending.evidence || ""}`.slice(0, 300);
+    const context = await retrieveContext(ragQuery, 3);
+
+    const report = await generateFixReport({
+      findingType: pending.type,
+      url: pending.url,
+      parameter: pending.parameter,
+      evidence: pending.evidence,
+      cveId: pending.cveId,
+      ragContext: context,
+    });
+
+    const stepsJson = JSON.stringify(report.fixSteps);
+    const codeExampleJson = JSON.stringify(report.codeExample);
+
+    await prisma.finding.update({
+      where: { id: findingId },
+      data: {
+        title: report.title,
+        explanation: report.explanation,
+        fixSteps: stepsJson as any,
+        codeExample: codeExampleJson as any,
+      },
+    });
+  } catch (err) {
+    console.error(`❌ Failed to run async AI analysis for finding ${findingId}:`, err);
+  }
+}
+
+async function saveFindingInstantly(
+  scanId: string,
+  pending: PendingFinding,
+  backgroundAiPromises: Promise<any>[]
+) {
+  try {
+    const created = await prisma.finding.create({
+      data: {
+        scanId,
+        type: pending.type,
+        severity: pending.severity,
+        url: pending.url,
+        parameter: pending.parameter ?? null,
+        evidence: pending.evidence ?? null,
+        cvssScore: pending.cvssScore,
+        cveId: pending.cveId ?? null,
+        title: `Analyzing ${pending.type}...`,
+        explanation: "AI remediation report is being generated in the background...",
+      },
+    });
+
+    const aiPromise = runAsyncAIAnalysis(created.id, pending);
+    backgroundAiPromises.push(aiPromise);
+  } catch (err) {
+    console.error("❌ Failed to save finding instantly:", err);
+  }
+}
+
 export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
   const log = (msg: string) => {
     console.log(msg);
@@ -2155,1391 +2282,989 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     log(`🔌  Phase 0: Nmap port scan & service fingerprinting (runs in parallel)...`);
     const nmapPromise = runNmapScan(targetUrl, log);
 
-    // ── Fetch main page ────────────────────────────────────────────────────────
-    const mainResp = await safeFetch(targetUrl);
-    const headers: Record<string, string> = {};
-    let pageHtml = "";
-    let cookieHeaders: string[] = [];
-    let fetchSucceeded = false;
-
-    if (mainResp) {
-      mainResp.headers.forEach((val, key) => {
-        headers[key.toLowerCase()] = val;
-      });
-      // Collect ALL Set-Cookie headers (they come comma-joined from fetch)
-      const rawCookie = mainResp.headers.get("set-cookie") || "";
-      cookieHeaders = rawCookie ? rawCookie.split(/,(?=[^ ])/) : [];
-      pageHtml = await mainResp.text();
-      fetchSucceeded = true;
-      log(`✅ Connected to target — HTTP ${mainResp.status} | ${(pageHtml.length / 1024).toFixed(1)} KB received`);
-    } else {
-      log("⚠️  Could not reach target. Running header-only checks.");
-    }
-
-    log(`🛡️  Phase 1: Auditing security headers (CSP, HSTS, X-Frame-Options, CORS, referrer policy)...`);
-    await prisma.scan.update({ where: { id: scanId }, data: { status: "SCANNING" } });
-
     const findings: PendingFinding[] = [];
+    const backgroundAiPromises: Promise<any>[] = [];
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Collect nmap findings — await the parallel promise here
-    // ══════════════════════════════════════════════════════════════════════════
-    try {
-      const nmapFindings: NmapFinding[] = await nmapPromise;
-      for (const nf of nmapFindings) {
-        findings.push(nf as PendingFinding);
+    const originalPush = findings.push;
+    findings.push = function (...items: PendingFinding[]) {
+      for (const item of items) {
+        if (item) {
+          originalPush.call(this, item);
+          saveFindingInstantly(scanId, item, backgroundAiPromises).catch(() => {});
+        }
       }
-      log(`🗺️   Phase 0 complete — ${nmapFindings.length} network finding(s) merged into scan results`);
-    } catch (nmapErr) {
-      log(`⚠️   Phase 0 (nmap) encountered an error: ${nmapErr instanceof Error ? nmapErr.message : String(nmapErr)}`);
-    }
+      return this.length;
+    };
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // SECTION A: SECURITY HEADER CHECKS
-    // ══════════════════════════════════════════════════════════════════════════
+    const visitedUrls = new Set<string>();
+    const urlQueue: string[] = [targetUrl];
+    const MAX_PAGES_TO_SCAN = 10;
+    let homepageHtml = "";
 
-    // A1 – Missing X-Frame-Options / frame-ancestors (Clickjacking)
-    const csp = headers["content-security-policy"] || "";
-    if (fetchSucceeded && !headers["x-frame-options"] && !csp.includes("frame-ancestors")) {
-      findings.push({
-        type: "clickjacking",
-        severity: "MEDIUM",
-        url: targetUrl,
-        evidence:
-          "Neither 'X-Frame-Options' nor a 'frame-ancestors' CSP directive found. The site can be embedded in a third-party iframe to trick users into clicking hidden buttons.",
-        cvssScore: 5.4,
-        cveId: "CWE-1021",
-      });
-    }
+    while (urlQueue.length > 0 && visitedUrls.size < MAX_PAGES_TO_SCAN) {
+      const currentUrl = urlQueue.shift()!;
+      let normalizedUrl = currentUrl;
+      try {
+        const parsed = new URL(currentUrl);
+        parsed.hash = "";
+        normalizedUrl = parsed.toString();
+      } catch { /* skip */ }
 
-    // A2 – Missing Content-Security-Policy (enables XSS escalation)
-    if (fetchSucceeded && !csp) {
-      findings.push({
-        type: "missing-csp",
-        severity: "HIGH",
-        url: targetUrl,
-        evidence:
-          "No 'Content-Security-Policy' header found. Without CSP the browser executes inline scripts and loads assets from any origin, making XSS attacks trivially escalatable.",
-        cvssScore: 7.2,
-        cveId: "CWE-693",
-      });
-    }
+      if (visitedUrls.has(normalizedUrl)) continue;
+      visitedUrls.add(normalizedUrl);
 
-    // A3 – Missing HSTS (downgrades HTTPS → HTTP, enables MITM)
-    if (fetchSucceeded && targetUrl.startsWith("https") && !headers["strict-transport-security"]) {
-      findings.push({
-        type: "missing-hsts",
-        severity: "MEDIUM",
-        url: targetUrl,
-        evidence:
-          "Missing 'Strict-Transport-Security' header on HTTPS site. Attackers performing SSL stripping can force browsers to use plain HTTP, exposing session cookies and data.",
-        cvssScore: 6.1,
-        cveId: "CWE-319",
-      });
-    }
+      log(`📖 [Page ${visitedUrls.size}/${MAX_PAGES_TO_SCAN}] Crawling & scanning: ${normalizedUrl}`);
 
-    // A4 – Missing X-Content-Type-Options (MIME sniffing)
-    if (fetchSucceeded && !headers["x-content-type-options"]) {
-      findings.push({
-        type: "missing-x-content-type-options",
-        severity: "LOW",
-        url: targetUrl,
-        evidence:
-          "Missing 'X-Content-Type-Options: nosniff' header. Browsers may MIME-sniff uploaded files (e.g., execute a .jpg as JavaScript), enabling stored XSS via file uploads.",
-        cvssScore: 3.1,
-        cveId: "CWE-430",
-      });
-    }
+      // ── Fetch current page ────────────────────────────────────────────────────────
+      const mainResp = await safeFetch(normalizedUrl);
+      const headers: Record<string, string> = {};
+      let pageHtml = "";
+      let cookieHeaders: string[] = [];
+      let fetchSucceeded = false;
 
-    // A5 – Missing Referrer-Policy (leaks URLs to third parties)
-    if (fetchSucceeded && !headers["referrer-policy"]) {
-      findings.push({
-        type: "missing-referrer-policy",
-        severity: "INFO",
-        url: targetUrl,
-        evidence:
-          "No 'Referrer-Policy' header. Sensitive query parameters (tokens, IDs) in URLs may be sent to third-party sites linked from the page via the Referer header.",
-        cvssScore: 2.3,
-      });
-    }
+      if (mainResp) {
+        mainResp.headers.forEach((val, key) => {
+          headers[key.toLowerCase()] = val;
+        });
+        // Collect ALL Set-Cookie headers
+        const rawCookie = mainResp.headers.get("set-cookie") || "";
+        cookieHeaders = rawCookie ? rawCookie.split(/,(?=[^ ])/) : [];
+        pageHtml = await mainResp.text();
+        fetchSucceeded = true;
+        log(`✅ Connected to page — HTTP ${mainResp.status} | ${(pageHtml.length / 1024).toFixed(1)} KB received`);
+      } else {
+        log(`⚠️  Could not reach page ${normalizedUrl}. Running passive checks where possible.`);
+      }
 
-    // A6 – Missing Permissions-Policy
-    if (fetchSucceeded && !headers["permissions-policy"] && !headers["feature-policy"]) {
-      findings.push({
-        type: "missing-permissions-policy",
-        severity: "LOW",
-        url: targetUrl,
-        evidence:
-          "No 'Permissions-Policy' header. Sensitive browser features (camera, microphone, geolocation, payment) are unrestricted for all origins including third-party iframes.",
-        cvssScore: 2.7,
-      });
-    }
+      // ── SITE-GLOBAL CHECKS (Run ONLY once on the target homepage URL) ─────────────
+      if (normalizedUrl === targetUrl) {
+        homepageHtml = pageHtml;
+        log(`🛡️  Phase 1: Auditing security headers (CSP, HSTS, X-Frame-Options, CORS, referrer policy)...`);
+        await prisma.scan.update({ where: { id: scanId }, data: { status: "SCANNING" } });
 
-    // A7 – Server version disclosure (fingerprinting for CVE targeting)
-    const serverHeader = headers["server"] || "";
-    const xPoweredBy = headers["x-powered-by"] || "";
-    const leakedHeaders = [serverHeader, xPoweredBy].filter((h) => /[a-zA-Z]+\/[\d.]+|php|asp\.net|tomcat|jboss/i.test(h));
-    if (fetchSucceeded && leakedHeaders.length > 0) {
-      findings.push({
-        type: "server-version-disclosure",
-        severity: "LOW",
-        url: targetUrl,
-        evidence: `Server discloses technology/version in response headers: "${leakedHeaders.join(", ")}". Attackers use this to look up known CVEs for the exact version.`,
-        cvssScore: 3.7,
-        cveId: "CWE-200",
-      });
-    }
-
-    log(`🍪  Phase 2: Analyzing session cookies — HttpOnly, Secure, SameSite flags...`);
-    // ══════════════════════════════════════════════════════════════════════════
-    // SECTION B: COOKIE & SESSION SECURITY (Session Hijacking)
-    // ══════════════════════════════════════════════════════════════════════════
-
-    if (fetchSucceeded && cookieHeaders.length > 0) {
-      for (const cookie of cookieHeaders) {
-        const lower = cookie.toLowerCase();
-        const cookieName = cookie.split("=")[0]?.trim() || "session";
-
-        // B1 – Missing HttpOnly flag (XSS can steal the cookie)
-        if (!lower.includes("httponly")) {
-          findings.push({
-            type: "session-hijacking-no-httponly",
-            severity: "HIGH",
-            url: targetUrl,
-            parameter: cookieName,
-            evidence: `Cookie "${cookieName}" is missing the 'HttpOnly' flag. JavaScript on the page (including XSS payloads) can read this cookie via document.cookie and send it to an attacker's server.`,
-            cvssScore: 7.5,
-            cveId: "CWE-1004",
-          });
-          break;
+        // Await the parallel nmap promise here
+        try {
+          const nmapFindings: NmapFinding[] = await nmapPromise;
+          for (const nf of nmapFindings) {
+            findings.push(nf as PendingFinding);
+          }
+          log(`🗺️   Phase 0 complete — ${nmapFindings.length} network finding(s) merged into scan results`);
+        } catch (nmapErr) {
+          log(`⚠️   Phase 0 (nmap) encountered an error: ${nmapErr instanceof Error ? nmapErr.message : String(nmapErr)}`);
         }
 
-        // B2 – Missing Secure flag (cookie sent over HTTP)
-        if (!lower.includes("secure")) {
+        // A1 – Missing X-Frame-Options / frame-ancestors (Clickjacking)
+        const csp = headers["content-security-policy"] || "";
+        if (fetchSucceeded && !headers["x-frame-options"] && !csp.includes("frame-ancestors")) {
           findings.push({
-            type: "session-hijacking-no-secure",
+            type: "clickjacking",
             severity: "MEDIUM",
             url: targetUrl,
-            parameter: cookieName,
-            evidence: `Cookie "${cookieName}" is missing the 'Secure' flag. The browser will transmit this cookie over unencrypted HTTP connections, exposing it to network eavesdroppers.`,
-            cvssScore: 5.9,
-            cveId: "CWE-614",
-          });
-          break;
-        }
-
-        // B3 – Missing SameSite flag (CSRF via cookies)
-        if (!lower.includes("samesite")) {
-          findings.push({
-            type: "csrf-via-cookie-samesite",
-            severity: "MEDIUM",
-            url: targetUrl,
-            parameter: cookieName,
-            evidence: `Cookie "${cookieName}" has no 'SameSite' attribute. Cross-site requests (from a malicious page) will automatically include this cookie, enabling CSRF attacks.`,
-            cvssScore: 6.1,
-            cveId: "CWE-352",
-          });
-          break;
-        }
-      }
-    }
-
-    if (fetchSucceeded && pageHtml) {
-      // ══════════════════════════════════════════════════════════════════════
-      // SECTION D: XSS DETECTION — HTML page + JS bundle scanning
-      // ══════════════════════════════════════════════════════════════════════
-
-      // DOM XSS sink patterns to look for in both HTML and JS source
-      const DOM_XSS_SINKS = [
-        { pattern: /document\.write\s*\(/g,                  label: "document.write()" },
-        { pattern: /\.innerHTML\s*=/g,                        label: ".innerHTML assignment" },
-        { pattern: /\.outerHTML\s*=/g,                        label: ".outerHTML assignment" },
-        { pattern: /eval\s*\(/g,                              label: "eval()" },
-        { pattern: /setTimeout\s*\(\s*[`"']/g,                label: "setTimeout(string)" },
-        { pattern: /setInterval\s*\(\s*[`"']/g,               label: "setInterval(string)" },
-        { pattern: /new\s+Function\s*\(/g,                    label: "new Function()" },
-        { pattern: /location\.href\s*=\s*(?!["']https?)/g,   label: "location.href = user-controlled" },
-        { pattern: /location\.assign\s*\(/g,                  label: "location.assign()" },
-        { pattern: /location\.replace\s*\(/g,                 label: "location.replace()" },
-        { pattern: /dangerouslySetInnerHTML/g,                label: "dangerouslySetInnerHTML (React)" },
-        { pattern: /bypassSecurityTrustHtml/g,                label: "bypassSecurityTrustHtml (Angular)" },
-        { pattern: /\$sce\.trustAsHtml/g,                     label: "$sce.trustAsHtml (AngularJS)" },
-        { pattern: /v-html\s*=/g,                             label: "v-html directive (Vue)" },
-        { pattern: /insertAdjacentHTML\s*\(/g,                label: "insertAdjacentHTML()" },
-      ];
-
-      // D1 – Scan the main HTML page for XSS sinks
-      const htmlSinks: string[] = [];
-      const inlineScripts = [...pageHtml.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]).join("\n");
-      for (const { pattern, label } of DOM_XSS_SINKS) {
-        if (label.includes("dangerouslySetInnerHTML")) {
-          if (pattern.test(pageHtml) && /location\.search|window\.location|params|query|router/i.test(pageHtml)) htmlSinks.push(label);
-        } else if (label.includes("eval") || label.includes("document.write")) {
-          if (pattern.test(inlineScripts)) htmlSinks.push(label);
-        } else {
-          if (pattern.test(pageHtml)) htmlSinks.push(label);
-        }
-        pattern.lastIndex = 0; // reset stateful regex
-      }
-      if (htmlSinks.length > 0) {
-        findings.push({
-          type: "js-dangerous-sink",
-          severity: "HIGH",
-          url: targetUrl,
-          evidence: `DOM XSS sinks detected in page source: ${htmlSinks.join(", ")}. If user-controlled data flows into these APIs without sanitization, attackers can execute arbitrary JavaScript in victims' browsers. Common attack vectors include URL hash fragments (#), query parameters, or stored data rendered without encoding.`,
-          cvssScore: 7.5,
-          cveId: "CWE-79",
-        });
-      }
-
-      // D2 – Scan JS bundle files for XSS sinks (critical for SPAs)
-      // Angular/React apps render everything via JS — main.js contains all the dangerous patterns
-      const scriptSrcs: string[] = [];
-      for (const m of pageHtml.matchAll(/<script[^>]+src=["']([^"']+\.js[^"']*)['"]/gi)) {
-        try {
-          const u = new URL(m[1], targetUrl);
-          if (u.hostname === new URL(targetUrl).hostname) scriptSrcs.push(u.href);
-        } catch { /* skip */ }
-      }
-      // Also check common bundle paths
-      for (const p of ["/main.js", "/bundle.js", "/app.js", "/vendor.js"]) {
-        try { scriptSrcs.push(new URL(p, targetUrl).href); } catch { /* skip */ }
-      }
-
-      let jsSinkFound = false;
-      for (const jsUrl of [...new Set(scriptSrcs)].slice(0, 4)) {
-        if (jsSinkFound) break;
-        try {
-          const jsResp = await fetch(jsUrl, {
-            headers: FETCH_HEADERS,
-            signal: AbortSignal.timeout(8000),
-            // @ts-ignore
-            next: { revalidate: 0 },
-          }).catch(() => null);
-          if (!jsResp || !jsResp.ok) continue;
-          const jsCode = await jsResp.text();
-          if (jsCode.length > 3_000_000) continue; // skip files > 3MB
-
-          const jsSinks: string[] = [];
-          for (const { pattern, label } of DOM_XSS_SINKS) {
-            if (label.includes("dangerouslySetInnerHTML")) {
-              if (pattern.test(jsCode) && /location\.search|window\.location|params|query|router/i.test(jsCode)) {
-                 jsSinks.push(label);
-              }
-            } else if (label.includes("eval") || label.includes("document.write")) {
-              // skip eval and document.write in bundle files to avoid false positives with bundler runtimes
-            } else {
-              if (pattern.test(jsCode)) jsSinks.push(label);
-            }
-            pattern.lastIndex = 0;
-          }
-
-          if (jsSinks.length > 0) {
-            jsSinkFound = true;
-            findings.push({
-              type: "js-dangerous-sink",
-              severity: "HIGH",
-              url: jsUrl,
-              evidence: `DOM XSS sinks found in JavaScript bundle ${jsUrl.split("/").pop()}: ${jsSinks.join(", ")}. The scanner downloaded the app's JS bundle and found these dangerous patterns. If any of these receive unvalidated user input (from URL parameters, local storage, or API responses), attackers can inject and execute arbitrary JavaScript in any user's browser — enabling session theft, keylogging, and account takeover.`,
-              cvssScore: 7.5,
-              cveId: "CWE-79",
-            });
-          }
-        } catch { /* skip */ }
-      }
-
-      // ══════════════════════════════════════════════════════════════════════
-      // SECTION D3: CSRF DETECTION — SPA-aware (REST API + CORS-based)
-      // ══════════════════════════════════════════════════════════════════════
-      // Traditional CSRF checks look for missing <form> tokens.
-      // Modern SPAs use JWT Bearer tokens but can still be CSRF-vulnerable
-      // if: (1) they also set session cookies, AND (2) no SameSite=Strict cookie,
-      // AND (3) the server accepts simple cross-origin POST requests.
-
-      // C1 – HTML forms without CSRF tokens (traditional apps)
-      const formMatches2 = [...pageHtml.matchAll(/<form[^>]*method=["']?post["']?[^>]*>([\s\S]*?)<\/form>/gi)];
-      const csrfTokenPatterns = /csrf|_token|authenticity_token|__requestverificationtoken|nonce/i;
-      let htmlFormCsrfReported = false;
-      for (const form of formMatches2) {
-        const formBody = form[1] || "";
-        if (!csrfTokenPatterns.test(formBody) && !htmlFormCsrfReported) {
-          findings.push({
-            type: "csrf-missing-token",
-            severity: "HIGH",
-            url: targetUrl,
-            evidence: "A POST form was found on the page without a detectable CSRF token field. An attacker can trick authenticated users into submitting this form from a third-party site, performing actions on their behalf (e.g., change email, make purchase).",
-            cvssScore: 8.0,
-            cveId: "CWE-352",
-          });
-          htmlFormCsrfReported = true;
-          break;
-        }
-      }
-
-      // C2 – SPA CSRF: Test whether REST API endpoints accept state-changing
-      //     requests WITHOUT a custom header (X-Requested-With or CSRF token).
-      //     CORS preflight is skipped for "simple" POST requests with Content-Type: text/plain,
-      //     so if the server processes them, it's vulnerable to CSRF via form POST.
-      const SPA_CSRF_PATHS = [
-        "/rest/user/login", "/api/login", "/api/auth/login",
-        "/api/v1/auth/login", "/api/user", "/api/profile",
-        "/api/orders", "/api/basket", "/api/feedback",
-      ];
-      let spaCsrfFound = false;
-      for (const path of SPA_CSRF_PATHS) {
-        if (spaCsrfFound) break;
-        try {
-          const csrfUrl = new URL(path, targetUrl).toString();
-          // Send a "simple" cross-origin-style POST with text/plain content-type
-          // (browsers send these without a preflight, making it CSRF-exploitable)
-          const resp = await fetch(csrfUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "text/plain", // no preflight = CSRF window
-              "User-Agent": FETCH_HEADERS["User-Agent"],
-              // Deliberately NO X-Requested-With, NO Authorization header
-            },
-            body: "email=test@test.com&password=test",
-            signal: AbortSignal.timeout(5000),
-            // @ts-ignore
-            next: { revalidate: 0 },
-          }).catch(() => null);
-
-          if (resp && resp.status >= 200 && resp.status < 300) {
-            const bodyText = await resp.text().catch(() => "");
-            const corsOrigin = resp.headers.get("access-control-allow-origin") ?? "";
-            const corsCredentials = resp.headers.get("access-control-allow-credentials") ?? "";
-            spaCsrfFound = true;
-            
-            const isConfirmed = bodyText.includes("token") || bodyText.includes("success") || bodyText.includes("user") || bodyText.includes("id");
-            
-            findings.push({
-              type: "csrf-missing-token",
-              severity: isConfirmed ? "HIGH" : "INFO",
-              url: csrfUrl,
-              evidence: `CSRF vulnerability ${isConfirmed ? "detected" : "signal"} on REST API endpoint ${path}. The server accepted a POST request sent with Content-Type: text/plain (a "simple" cross-origin request that browsers send WITHOUT a CORS preflight) and returned HTTP ${resp.status}. CORS: Allow-Origin="${corsOrigin}", Allow-Credentials="${corsCredentials}". An attacker hosting a malicious page can silently POST to this endpoint using the victim's cookies.`,
-              cvssScore: isConfirmed ? 7.5 : 0.0,
-              cveId: "CWE-352",
-            });
-          }
-        } catch { /* skip */ }
-      }
-
-      // ══════════════════════════════════════════════════════════════════════
-      // SECTION E: SQL INJECTION INDICATORS (Error-based detection)
-      // ══════════════════════════════════════════════════════════════════════
-
-      // E1 – Database error messages visible in HTML response
-      const sqlErrorPatterns = [
-        /SQL syntax.*MySQL/i,
-        /Warning.*mysql_/i,
-        /MySQLSyntaxErrorException/i,
-        /valid MySQL result/i,
-        /PostgreSQL.*ERROR/i,
-        /PSQLException/i,
-        /ORA-\d{4,}/i, // Oracle errors
-        /Microsoft OLE DB.*SQL Server/i,
-        /Unclosed quotation mark after the character string/i,
-        /SQLiteException/i,
-        /org\.hibernate\.exception/i,
-        /You have an error in your SQL syntax/i,
-        /ODBC SQL Server Driver/i,
-        /Syntax error.*in query expression/i,
-      ];
-      const matchedSqlError = sqlErrorPatterns.find((p) => p.test(pageHtml));
-      if (matchedSqlError) {
-        findings.push({
-          type: "sql-injection-error-disclosure",
-          severity: "CRITICAL",
-          url: targetUrl,
-          evidence:
-            "The server is leaking raw SQL error messages in its HTTP response. This confirms the application is building SQL queries with user input and reveals database type, query structure, and table names — critical intelligence for an attacker.",
-          cvssScore: 9.8,
-          cveId: "CWE-89",
-        });
-      }
-
-      // E2 – Debug/stack trace exposure (also helps SQLi exploitation)
-      if (/at\s+[\w.]+\([\w./]+:\d+:\d+\)|Traceback \(most recent call last\)|Stack trace:/i.test(pageHtml)) {
-        findings.push({
-          type: "stack-trace-disclosure",
-          severity: "HIGH",
-          url: targetUrl,
-          evidence:
-            "A full stack trace or exception dump was found in the HTTP response. Stack traces reveal internal file paths, function names, and framework versions that attackers use to pinpoint exploitable code paths.",
-          cvssScore: 7.5,
-          cveId: "CWE-209",
-        });
-      }
-
-      // ══════════════════════════════════════════════════════════════════════
-      // SECTION F: SENSITIVE DATA EXPOSURE
-      // ══════════════════════════════════════════════════════════════════════
-
-      // F1 – API keys / secrets leaked in HTML source
-      const secretPatterns: Array<{ label: string; pattern: RegExp }> = [
-        { label: "AWS Access Key", pattern: /AKIA[0-9A-Z]{16}/ },
-        { label: "Generic API key", pattern: /api[_-]?key\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']/i },
-        { label: "Bearer token", pattern: /bearer\s+[A-Za-z0-9\-._~+/]+=*/i },
-        { label: "Private key header", pattern: /-----BEGIN (RSA |EC )?PRIVATE KEY-----/ },
-        { label: "Stripe secret key", pattern: /sk_(live|test)_[0-9a-zA-Z]{24}/ },
-        { label: "SendGrid API key", pattern: /SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/ },
-        { label: "Password in source", pattern: /password\s*[:=]\s*["'][^"']{6,}["']/i },
-      ];
-      for (const { label, pattern } of secretPatterns) {
-        if (pattern.test(pageHtml)) {
-          findings.push({
-            type: "sensitive-data-exposure",
-            severity: "CRITICAL",
-            url: targetUrl,
-            evidence: `Possible secret detected in HTML source: "${label}". Hardcoded credentials or API keys in client-facing HTML allow attackers to authenticate as the application, access third-party services, and escalate privileges.`,
-            cvssScore: 9.5,
-            cveId: "CWE-312",
-          });
-          break; // Report once
-        }
-      }
-
-      // F2 – Password field transmitted over HTTP (plaintext credential theft)
-      if (!targetUrl.startsWith("https://") && /<input[^>]+type=["']?password["']?/i.test(pageHtml)) {
-        findings.push({
-          type: "password-over-http",
-          severity: "CRITICAL",
-          url: targetUrl,
-          evidence:
-            "A password input field was found on a plain HTTP page. Credentials entered by users are transmitted in cleartext over the network and visible to anyone performing a passive network sniff.",
-          cvssScore: 9.1,
-          cveId: "CWE-319",
-        });
-      }
-
-      // F3 – Mixed content (HTTPS page loads HTTP resources)
-      if (targetUrl.startsWith("https://")) {
-        const httpRefs = (pageHtml.match(/(?:src|href|action)=["']http:\/\//gi) || []).length;
-        if (httpRefs > 0) {
-          findings.push({
-            type: "mixed-content",
-            severity: "MEDIUM",
-            url: targetUrl,
-            evidence: `Found ${httpRefs} reference(s) to insecure HTTP resources (src/href/action) on an HTTPS page. Mixed content lets attackers intercept and tamper with the insecure resources, potentially injecting malicious scripts.`,
+            evidence:
+              "Neither 'X-Frame-Options' nor a 'frame-ancestors' CSP directive found. The site can be embedded in a third-party iframe to trick users into clicking hidden buttons.",
             cvssScore: 5.4,
-            cveId: "CWE-311",
+            cveId: "CWE-1021",
           });
         }
-      }
-    }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // SECTION G: CORS MISCONFIGURATION
-    // ══════════════════════════════════════════════════════════════════════════
-
-    const corsOrigin = headers["access-control-allow-origin"] || "";
-    const corsCredentials = (headers["access-control-allow-credentials"] || "").toLowerCase();
-    if (fetchSucceeded) {
-      if (corsOrigin === "*" && corsCredentials === "true") {
-        findings.push({
-          type: "cors-credentials-wildcard",
-          severity: "CRITICAL",
-          url: targetUrl,
-          evidence:
-            "'Access-Control-Allow-Origin: *' combined with 'Access-Control-Allow-Credentials: true'. Any origin can make credentialed cross-origin requests, letting attackers read authenticated API responses from a victim's browser session.",
-          cvssScore: 9.0,
-          cveId: "CWE-942",
-        });
-      } else if (corsOrigin === "*") {
-        findings.push({
-          type: "cors-wildcard",
-          severity: "LOW",
-          url: targetUrl,
-          evidence:
-            "CORS wildcard ('Access-Control-Allow-Origin: *') is set. Any website can read JSON/API responses from this server — acceptable for public APIs but dangerous if responses contain user-specific data.",
-          cvssScore: 3.5,
-          cveId: "CWE-942",
-        });
-      }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // SECTION H: OPEN REDIRECT CHECK
-    // ══════════════════════════════════════════════════════════════════════════
-
-    if (fetchSucceeded) {
-      // H1 – Redirect parameters in links (passive detection)
-      const redirectParamPattern = /(?:href|action)=["'][^"']*[?&](?:redirect|url|next|return|goto|dest|destination|rurl|target)=(?:https?:\/\/|\/\/)/gi;
-      if (redirectParamPattern.test(pageHtml)) {
-        findings.push({
-          type: "open-redirect",
-          severity: "MEDIUM",
-          url: targetUrl,
-          evidence:
-            "A link or form action was found containing a redirect parameter (e.g., ?redirect=, ?next=, ?url=) that accepts an absolute URL. Attackers craft phishing links that start on your trusted domain then redirect victims to a malicious site.",
-          cvssScore: 6.1,
-          cveId: "CWE-601",
-        });
-      }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // SECTION I: ROBOTS.TXT SENSITIVE PATH DISCLOSURE
-    // ══════════════════════════════════════════════════════════════════════════
-
-    try {
-      const robotsUrl = new URL("/robots.txt", targetUrl).toString();
-      const robotsResp = await safeFetch(robotsUrl, 5000);
-      if (robotsResp && robotsResp.ok) {
-        const robotsTxt = await robotsResp.text();
-        const sensitiveWords = ["/admin", "/api", "/config", "/backup", "/private", "/internal", "/.env", "/db", "/database", "/secret", "/manage", "/phpmyadmin"];
-        const exposed = sensitiveWords.filter((p) => robotsTxt.toLowerCase().includes(p));
-        if (exposed.length > 0) {
+        // A2 – Missing Content-Security-Policy (enables XSS escalation)
+        if (fetchSucceeded && !csp) {
           findings.push({
-            type: "robots-txt-disclosure",
+            type: "missing-csp",
+            severity: "HIGH",
+            url: targetUrl,
+            evidence:
+              "No 'Content-Security-Policy' header found. Without CSP the browser executes inline scripts and loads assets from any origin, making XSS attacks trivially escalatable.",
+            cvssScore: 7.2,
+            cveId: "CWE-693",
+          });
+        }
+
+        // A3 – Missing HSTS (downgrades HTTPS → HTTP, enables MITM)
+        if (fetchSucceeded && targetUrl.startsWith("https") && !headers["strict-transport-security"]) {
+          findings.push({
+            type: "missing-hsts",
+            severity: "MEDIUM",
+            url: targetUrl,
+            evidence:
+              "Missing 'Strict-Transport-Security' header on HTTPS site. Attackers performing SSL stripping can force browsers to use plain HTTP, exposing session cookies and data.",
+            cvssScore: 6.1,
+            cveId: "CWE-319",
+          });
+        }
+
+        // A4 – Missing X-Content-Type-Options (MIME sniffing)
+        if (fetchSucceeded && !headers["x-content-type-options"]) {
+          findings.push({
+            type: "missing-x-content-type-options",
+            severity: "LOW",
+            url: targetUrl,
+            evidence:
+              "Missing 'X-Content-Type-Options: nosniff' header. Browsers may MIME-sniff uploaded files (e.g., execute a .jpg as JavaScript), enabling stored XSS via file uploads.",
+            cvssScore: 3.1,
+            cveId: "CWE-430",
+          });
+        }
+
+        // A5 – Missing Referrer-Policy (leaks URLs to third parties)
+        if (fetchSucceeded && !headers["referrer-policy"]) {
+          findings.push({
+            type: "missing-referrer-policy",
             severity: "INFO",
-            url: robotsUrl,
-            evidence: `robots.txt discloses sensitive paths: ${exposed.join(", ")}. Listing internal paths in robots.txt is a common misunderstanding — it actually advertises hidden endpoints to attackers rather than hiding them.`,
+            url: targetUrl,
+            evidence:
+              "No 'Referrer-Policy' header. Sensitive query parameters (tokens, IDs) in URLs may be sent to third-party sites linked from the page via the Referer header.",
             cvssScore: 2.3,
           });
         }
-      }
-    } catch {
-      /* non-critical */
-    }
 
-    log(`🔎  Phase 4: Probing ${55} sensitive endpoints (.env, .git, wp-admin, phpinfo, Spring actuators)...`);
-    // ══════════════════════════════════════════════════════════════════════════
-    // SECTION J: PROBE COMMON SENSITIVE ENDPOINTS
-    // ══════════════════════════════════════════════════════════════════════════
-
-    // Helper to detect if an endpoint returns a soft-404 or a generic SPA fallback route
-    const isSoft404OrSPARedirect = (endpointBody: string, homepageBody: string): boolean => {
-      if (!homepageBody) return false;
-
-      // Get the page title
-      const getTitle = (html: string) => {
-        const m = html.match(/<title>([^<]+)<\/title>/i);
-        return m ? m[1].trim() : "";
-      };
-
-      const homeTitle = getTitle(homepageBody);
-      const epTitle = getTitle(endpointBody);
-
-      // If titles are identical and not empty, it's a SPA fallback/redirect (e.g. "ChatGPT" or "Juice Shop")
-      if (homeTitle && epTitle && homeTitle === epTitle) {
-        return true;
-      }
-
-      // If the body length is extremely similar and both contain typical SPA signatures
-      const lenDiff = Math.abs(endpointBody.length - homepageBody.length);
-      const threshold = homepageBody.length * 0.08; // 8% threshold
-      if (lenDiff < threshold) {
-        if (/__NEXT_DATA__|__nuxt|webpack|next\/static|react-root|#app|#root/i.test(endpointBody)) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    // ── Content-verified endpoint probing ──────────────────────────────────
-    // Each entry has verify(body, contentType) that must return true before
-    // a finding is reported. Eliminates false positives from soft-404s,
-    // login redirects, and SPAs that return 200 for every route.
-    const sensitiveEndpoints: Array<{
-      path: string; label: string;
-      severity: "CRITICAL" | "HIGH" | "MEDIUM"; cvssScore: number;
-      verify: (body: string, ct: string) => boolean;
-    }> = [
-        {
-          path: "/.env", label: ".env file", severity: "CRITICAL", cvssScore: 9.8,
-          verify: (b) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD|JWT/i.test(b)
-        },
-        {
-          path: "/.env.local", label: ".env.local", severity: "CRITICAL", cvssScore: 9.8,
-          verify: (b) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD|JWT/i.test(b)
-        },
-        {
-          path: "/.env.production", label: ".env.production", severity: "CRITICAL", cvssScore: 9.8,
-          verify: (b) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD|JWT/i.test(b)
-        },
-        {
-          path: "/.env.backup", label: ".env.backup", severity: "CRITICAL", cvssScore: 9.8,
-          verify: (b) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD/i.test(b)
-        },
-        {
-          path: "/.git/HEAD", label: ".git repository (HEAD)", severity: "CRITICAL", cvssScore: 9.8,
-          verify: (b) => /^ref:\s+refs\/heads\//m.test(b) || /^[0-9a-f]{40}$/m.test(b.trim())
-        },
-        {
-          path: "/.git/config", label: ".git/config", severity: "CRITICAL", cvssScore: 9.8,
-          verify: (b) => /\[core\]/.test(b) || /\[remote/.test(b)
-        },
-        {
-          path: "/.svn/entries", label: ".svn repository", severity: "CRITICAL", cvssScore: 9.0,
-          verify: (b) => /^10$/m.test(b) || /svn\.apache\.org/i.test(b)
-        },
-        {
-          path: "/.htaccess", label: ".htaccess file", severity: "HIGH", cvssScore: 7.5,
-          verify: (b) => /RewriteEngine|AuthType|Require|Allow from|Deny from/i.test(b)
-        },
-        {
-          path: "/.htpasswd", label: ".htpasswd credentials", severity: "CRITICAL", cvssScore: 9.5,
-          verify: (b) => /^[^:]+:\$[^\s]+$/m.test(b) || /^[^:]+:[a-zA-Z0-9./]{13}$/m.test(b)
-        },
-        {
-          path: "/wp-admin", label: "WordPress admin", severity: "HIGH", cvssScore: 7.5,
-          verify: (b) => /wp-login|WordPress|wp-admin/i.test(b)
-        },
-        {
-          path: "/wp-login.php", label: "WordPress login", severity: "MEDIUM", cvssScore: 5.3,
-          verify: (b) => /user_login|user_pass|wp-login/i.test(b)
-        },
-        {
-          path: "/phpmyadmin", label: "phpMyAdmin", severity: "HIGH", cvssScore: 8.0,
-          verify: (b) => /phpMyAdmin|phpmyadmin|pma_/i.test(b)
-        },
-        {
-          path: "/pma", label: "phpMyAdmin (pma)", severity: "HIGH", cvssScore: 8.0,
-          verify: (b) => /phpMyAdmin|phpmyadmin|pma_/i.test(b)
-        },
-        {
-          path: "/phpinfo.php", label: "phpinfo()", severity: "HIGH", cvssScore: 7.5,
-          verify: (b) => /PHP Version|phpinfo\(\)|php\.ini/i.test(b)
-        },
-        {
-          path: "/info.php", label: "PHP info page", severity: "HIGH", cvssScore: 7.5,
-          verify: (b) => /PHP Version|phpinfo\(\)|php\.ini/i.test(b)
-        },
-        {
-          path: "/server-status", label: "Apache server-status", severity: "HIGH", cvssScore: 7.5,
-          verify: (b) => /Apache Server Status|requests currently being processed/i.test(b)
-        },
-        {
-          path: "/_profiler", label: "Symfony Profiler", severity: "HIGH", cvssScore: 7.5,
-          verify: (b) => /Symfony|sf-toolbar|profiler/i.test(b)
-        },
-        {
-          path: "/actuator/env", label: "Spring Boot /env", severity: "CRITICAL", cvssScore: 9.0,
-          verify: (b, ct) => ct.includes("application/json") && /"propertySources"|"activeProfiles"/i.test(b)
-        },
-        {
-          path: "/actuator/health", label: "Spring Boot /health", severity: "MEDIUM", cvssScore: 5.3,
-          verify: (b, ct) => ct.includes("application/json") && /"status"\s*:\s*"UP"/i.test(b)
-        },
-        {
-          path: "/metrics", label: "Metrics endpoint", severity: "MEDIUM", cvssScore: 5.3,
-          verify: (b) => /process_cpu_seconds|go_goroutines|http_requests_total/i.test(b)
-        },
-        {
-          path: "/config.yml", label: "config.yml", severity: "HIGH", cvssScore: 7.5,
-          verify: (b) => /^[a-z_]+:\s+.+/m.test(b) && /password|secret|key|database/i.test(b)
-        },
-        {
-          path: "/config.json", label: "config.json", severity: "HIGH", cvssScore: 7.5,
-          verify: (b, ct) => ct.includes("application/json") && /password|secret|apiKey|database/i.test(b)
-        },
-        {
-          path: "/database.yml", label: "database.yml", severity: "CRITICAL", cvssScore: 9.0,
-          verify: (b) => /adapter:|database:|username:|password:/i.test(b)
-        },
-        {
-          path: "/backup.zip", label: "Backup archive (.zip)", severity: "HIGH", cvssScore: 8.0,
-          verify: (_, ct) => ct.includes("application/zip") || ct.includes("octet-stream")
-        },
-        {
-          path: "/backup.tar.gz", label: "Backup archive (.tar.gz)", severity: "HIGH", cvssScore: 8.0,
-          verify: (_, ct) => ct.includes("gzip") || ct.includes("octet-stream")
-        },
-        {
-          path: "/db.sql", label: "SQL database dump", severity: "CRITICAL", cvssScore: 9.5,
-          verify: (b) => /CREATE TABLE|INSERT INTO|DROP TABLE/i.test(b)
-        },
-        {
-          path: "/dump.sql", label: "SQL dump", severity: "CRITICAL", cvssScore: 9.5,
-          verify: (b) => /CREATE TABLE|INSERT INTO|DROP TABLE/i.test(b)
-        },
-        {
-          path: "/api/v1/users", label: "User list API", severity: "HIGH", cvssScore: 8.5,
-          verify: (b, ct) => ct.includes("application/json") && /email|username|password/i.test(b)
-        },
-        {
-          path: "/api/users", label: "User list API", severity: "HIGH", cvssScore: 8.5,
-          verify: (b, ct) => ct.includes("application/json") && /email|username|password/i.test(b)
-        },
-        {
-          path: "/api/admin", label: "Admin API", severity: "HIGH", cvssScore: 8.0,
-          verify: (b, ct) => ct.includes("application/json") && b.length > 30
-        },
-        {
-          path: "/rest/user/whoami", label: "Identity disclosure", severity: "HIGH", cvssScore: 7.5,
-          verify: (b, ct) => ct.includes("application/json") && /email|id|role/i.test(b)
-        },
-        {
-          path: "/socket.io/", label: "Socket.IO endpoint", severity: "MEDIUM", cvssScore: 5.3,
-          verify: (b) => /socket\.io|websocket|polling/i.test(b)
-        },
-      ];
-
-    let checkedCount = 0;
-    for (const endpoint of sensitiveEndpoints) {
-      checkedCount++;
-      if (checkedCount % 15 === 0 || checkedCount === 1) {
-        log(`🔎  Phase 4: Probing endpoints (${checkedCount}/${sensitiveEndpoints.length})...`);
-      }
-      try {
-        const endpointUrl = new URL(endpoint.path, targetUrl).toString();
-        const resp = await safeFetch(endpointUrl, 5000);
-        if (!resp || resp.status !== 200) continue;
-        const body = await resp.text();
-        const ct = resp.headers.get("content-type") ?? "";
-
-        // Hard-reject obvious soft-404s
-        if (/<title>[^<]*(404|not found|page not found)[^<]*<\/title>/i.test(body)) continue;
-        if (body.length < 20) continue;
-
-        // Verify similarity with home page to eliminate false positives on SPAs (e.g. Next.js, React, Angular)
-        if (pageHtml && isSoft404OrSPARedirect(body, pageHtml)) {
-          continue;
+        // A6 – Missing Permissions-Policy
+        if (fetchSucceeded && !headers["permissions-policy"] && !headers["feature-policy"]) {
+          findings.push({
+            type: "missing-permissions-policy",
+            severity: "LOW",
+            url: targetUrl,
+            evidence:
+              "No 'Permissions-Policy' header. Sensitive browser features (camera, microphone, geolocation, payment) are unrestricted for all origins including third-party iframes.",
+            cvssScore: 2.7,
+          });
         }
 
-        // Only report when content fingerprint matches
-        if (!endpoint.verify(body, ct)) continue;
+        // A7 – Server version disclosure
+        const serverHeader = headers["server"] || "";
+        const xPoweredBy = headers["x-powered-by"] || "";
+        const leakedHeaders = [serverHeader, xPoweredBy].filter((h) => /[a-zA-Z]+\/[\d.]+|php|asp\.net|tomcat|jboss/i.test(h));
+        if (fetchSucceeded && leakedHeaders.length > 0) {
+          findings.push({
+            type: "server-version-disclosure",
+            severity: "LOW",
+            url: targetUrl,
+            evidence: `Server discloses technology/version in response headers: "${leakedHeaders.join(", ")}". Attackers use this to look up known CVEs for the exact version.`,
+            cvssScore: 3.7,
+            cveId: "CWE-200",
+          });
+        }
 
-        findings.push({
-          type: "sensitive-endpoint-exposed",
-          severity: endpoint.severity,
-          url: endpointUrl,
-          evidence: `"${endpoint.label}" at ${endpointUrl} confirmed exposed: HTTP 200 with matching content fingerprint (verified, not a soft-404 or redirect).`,
-          cvssScore: endpoint.cvssScore,
-          cveId: "CWE-538",
-        });
-      } catch { /* skip unreachable */ }
-    }
+        log(`🍪  Phase 2: Analyzing session cookies — HttpOnly, Secure, SameSite flags...`);
+        if (fetchSucceeded && cookieHeaders.length > 0) {
+          for (const cookie of cookieHeaders) {
+            const lower = cookie.toLowerCase();
+            const cookieName = cookie.split("=")[0]?.trim() || "session";
 
-    log(`🚦  Phase 5: Testing rate-limiting and DoS protection (burst probe of 10 requests)...`);
-    // SECTION K: RATE LIMITING / DoS / DDoS PROTECTION CHECK
-    // ══════════════════════════════════════════════════════════════════════════
+            // B1 – Missing HttpOnly flag
+            if (!lower.includes("httponly")) {
+              findings.push({
+                type: "session-hijacking-no-httponly",
+                severity: "HIGH",
+                url: targetUrl,
+                parameter: cookieName,
+                evidence: `Cookie "${cookieName}" is missing the 'HttpOnly' flag. JavaScript on the page can read this cookie and send it to an attacker's server.`,
+                cvssScore: 7.5,
+                cveId: "CWE-1004",
+              });
+              break;
+            }
 
-    if (fetchSucceeded) {
-      // K1 – Check if any rate-limit headers are present on the main response
-      const rateLimitHeaders = [
-        "x-ratelimit-limit",
-        "x-ratelimit-remaining",
-        "x-ratelimit-reset",
-        "ratelimit-limit",
-        "retry-after",
-        "x-rate-limit-limit",
-        "x-rate-limit-remaining",
-      ];
-      const hasRateLimitHeaders = rateLimitHeaders.some((h) => headers[h]);
+            // B2 – Missing Secure flag
+            if (!lower.includes("secure")) {
+              findings.push({
+                type: "session-hijacking-no-secure",
+                severity: "MEDIUM",
+                url: targetUrl,
+                parameter: cookieName,
+                evidence: `Cookie "${cookieName}" is missing the 'Secure' flag. The browser will transmit this cookie over unencrypted HTTP connections.`,
+                cvssScore: 5.9,
+                cveId: "CWE-614",
+              });
+              break;
+            }
 
-      // K2 – Send a small controlled burst (10 rapid requests) and check for 429
-      const BURST_COUNT = 10;
-      let got429 = false;
-      let got429AfterN = -1;
+            // B3 – Missing SameSite flag
+            if (!lower.includes("samesite")) {
+              findings.push({
+                type: "csrf-via-cookie-samesite",
+                severity: "MEDIUM",
+                url: targetUrl,
+                parameter: cookieName,
+                evidence: `Cookie "${cookieName}" has no 'SameSite' attribute. Cross-site requests will automatically include this cookie.`,
+                cvssScore: 6.1,
+                cveId: "CWE-352",
+              });
+              break;
+            }
+          }
+        }
 
-      try {
-        const burstRequests = Array.from({ length: BURST_COUNT }, () =>
-          fetch(targetUrl, {
-            method: "GET",
-            headers: FETCH_HEADERS,
-            signal: AbortSignal.timeout(5000),
-            // @ts-ignore
-            next: { revalidate: 0 },
-          }).catch(() => null)
-        );
+        // G1 – CORS Misconfiguration
+        const corsOrigin = headers["access-control-allow-origin"] || "";
+        const corsCredentials = (headers["access-control-allow-credentials"] || "").toLowerCase();
+        if (fetchSucceeded) {
+          if (corsOrigin === "*" && corsCredentials === "true") {
+            findings.push({
+              type: "cors-credentials-wildcard",
+              severity: "CRITICAL",
+              url: targetUrl,
+              evidence:
+                "'Access-Control-Allow-Origin: *' combined with 'Access-Control-Allow-Credentials: true' allows credentialed cross-origin requests.",
+              cvssScore: 9.0,
+              cveId: "CWE-942",
+            });
+          } else if (corsOrigin === "*") {
+            findings.push({
+              type: "cors-wildcard",
+              severity: "LOW",
+              url: targetUrl,
+              evidence:
+                "CORS wildcard ('Access-Control-Allow-Origin: *') is set.",
+              cvssScore: 3.5,
+              cveId: "CWE-942",
+            });
+          }
+        }
 
-        const burstResults = await Promise.all(burstRequests);
+        // I1 – robots.txt
+        try {
+          const robotsUrl = new URL("/robots.txt", targetUrl).toString();
+          const robotsResp = await safeFetch(robotsUrl, 5000);
+          if (robotsResp && robotsResp.ok) {
+            const robotsTxt = await robotsResp.text();
+            const sensitiveWords = ["/admin", "/api", "/config", "/backup", "/private", "/internal", "/.env", "/db", "/database", "/secret", "/manage", "/phpmyadmin"];
+            const exposed = sensitiveWords.filter((p) => robotsTxt.toLowerCase().includes(p));
+            if (exposed.length > 0) {
+              findings.push({
+                type: "robots-txt-disclosure",
+                severity: "INFO",
+                url: robotsUrl,
+                evidence: `robots.txt discloses sensitive paths: ${exposed.join(", ")}.`,
+                cvssScore: 2.3,
+              });
+            }
+          }
+        } catch { /* skip */ }
 
-        for (let i = 0; i < burstResults.length; i++) {
-          const r = burstResults[i];
-          if (r && r.status === 429) {
-            got429 = true;
-            got429AfterN = i + 1;
+        // J1 – Probing 55 Sensitive Endpoints (Phase 4)
+        log(`🔎  Phase 4: Probing sensitive endpoints (.env, .git, wp-admin, phpinfo, Spring actuators)...`);
+        const isSoft404OrSPARedirect = (endpointBody: string, homepageBody: string): boolean => {
+          if (!homepageBody) return false;
+          const getTitle = (html: string) => {
+            const m = html.match(/<title>([^<]+)<\/title>/i);
+            return m ? m[1].trim() : "";
+          };
+          const homeTitle = getTitle(homepageBody);
+          const epTitle = getTitle(endpointBody);
+          if (homeTitle && epTitle && homeTitle === epTitle) return true;
+          const lenDiff = Math.abs(endpointBody.length - homepageBody.length);
+          const threshold = homepageBody.length * 0.08;
+          if (lenDiff < threshold) {
+            if (/__NEXT_DATA__|__nuxt|webpack|next\/static|react-root|#app|#root/i.test(endpointBody)) return true;
+          }
+          return false;
+        };
+
+        const sensitiveEndpoints = [
+          { path: "/.env", label: ".env file", severity: "CRITICAL", cvssScore: 9.8, verify: (b: string) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD|JWT/i.test(b) },
+          { path: "/.env.local", label: ".env.local", severity: "CRITICAL", cvssScore: 9.8, verify: (b: string) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD|JWT/i.test(b) },
+          { path: "/.env.production", label: ".env.production", severity: "CRITICAL", cvssScore: 9.8, verify: (b: string) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD|JWT/i.test(b) },
+          { path: "/.env.backup", label: ".env.backup", severity: "CRITICAL", cvssScore: 9.8, verify: (b: string) => /^[A-Z_]+=.+/m.test(b) || /DATABASE_URL|API_KEY|SECRET|PASSWORD/i.test(b) },
+          { path: "/.git/HEAD", label: ".git repository (HEAD)", severity: "CRITICAL", cvssScore: 9.8, verify: (b: string) => /^ref:\s+refs\/heads\//m.test(b) || /^[0-9a-f]{40}$/m.test(b.trim()) },
+          { path: "/.git/config", label: ".git/config", severity: "CRITICAL", cvssScore: 9.8, verify: (b: string) => /\[core\]/.test(b) || /\[remote/.test(b) },
+          { path: "/.svn/entries", label: ".svn repository", severity: "CRITICAL", cvssScore: 9.0, verify: (b: string) => /^10$/m.test(b) || /svn\.apache\.org/i.test(b) },
+          { path: "/.htaccess", label: ".htaccess file", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /RewriteEngine|AuthType|Require|Allow from|Deny from/i.test(b) },
+          { path: "/.htpasswd", label: ".htpasswd credentials", severity: "CRITICAL", cvssScore: 9.5, verify: (b: string) => /^[^:]+:\$[^\s]+$/m.test(b) || /^[^:]+:[a-zA-Z0-9./]{13}$/m.test(b) },
+          { path: "/wp-admin", label: "WordPress admin", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /wp-login|WordPress|wp-admin/i.test(b) },
+          { path: "/wp-login.php", label: "WordPress login", severity: "MEDIUM", cvssScore: 5.3, verify: (b: string) => /user_login|user_pass|wp-login/i.test(b) },
+          { path: "/phpmyadmin", label: "phpMyAdmin", severity: "HIGH", cvssScore: 8.0, verify: (b: string) => /phpMyAdmin|phpmyadmin|pma_/i.test(b) },
+          { path: "/pma", label: "phpMyAdmin (pma)", severity: "HIGH", cvssScore: 8.0, verify: (b: string) => /phpMyAdmin|phpmyadmin|pma_/i.test(b) },
+          { path: "/phpinfo.php", label: "phpinfo()", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /PHP Version|phpinfo\(\)|php\.ini/i.test(b) },
+          { path: "/info.php", label: "PHP info page", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /PHP Version|phpinfo\(\)|php\.ini/i.test(b) },
+          { path: "/server-status", label: "Apache server-status", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /Apache Server Status|requests currently being processed/i.test(b) },
+          { path: "/_profiler", label: "Symfony Profiler", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /Symfony|sf-toolbar|profiler/i.test(b) },
+          { path: "/actuator/env", label: "Spring Boot /env", severity: "CRITICAL", cvssScore: 9.0, verify: (b: string, ct: string) => ct.includes("application/json") && /"propertySources"|"activeProfiles"/i.test(b) },
+          { path: "/actuator/health", label: "Spring Boot /health", severity: "MEDIUM", cvssScore: 5.3, verify: (b: string, ct: string) => ct.includes("application/json") && /"status"\s*:\s*"UP"/i.test(b) },
+          { path: "/metrics", label: "Metrics endpoint", severity: "MEDIUM", cvssScore: 5.3, verify: (b: string) => /process_cpu_seconds|go_goroutines|http_requests_total/i.test(b) },
+          { path: "/config.yml", label: "config.yml", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /^[a-z_]+:\s+.+/m.test(b) && /password|secret|key|database/i.test(b) },
+          { path: "/config.json", label: "config.json", severity: "HIGH", cvssScore: 7.5, verify: (b: string, ct: string) => ct.includes("application/json") && /password|secret|apiKey|database/i.test(b) },
+          { path: "/database.yml", label: "database.yml", severity: "CRITICAL", cvssScore: 9.0, verify: (b: string) => /adapter:|database:|username:|password:/i.test(b) },
+          { path: "/backup.zip", label: "Backup archive (.zip)", severity: "HIGH", cvssScore: 8.0, verify: (_: string, ct: string) => ct.includes("application/zip") || ct.includes("octet-stream") },
+          { path: "/backup.tar.gz", label: "Backup archive (.tar.gz)", severity: "HIGH", cvssScore: 8.0, verify: (_: string, ct: string) => ct.includes("gzip") || ct.includes("octet-stream") },
+          { path: "/db.sql", label: "SQL database dump", severity: "CRITICAL", cvssScore: 9.5, verify: (b: string) => /CREATE TABLE|INSERT INTO|DROP TABLE/i.test(b) },
+          { path: "/dump.sql", label: "SQL dump", severity: "CRITICAL", cvssScore: 9.5, verify: (b: string) => /CREATE TABLE|INSERT INTO|DROP TABLE/i.test(b) },
+          { path: "/api/v1/users", label: "User list API", severity: "HIGH", cvssScore: 8.5, verify: (b: string, ct: string) => ct.includes("application/json") && /email|username|password/i.test(b) },
+          { path: "/api/users", label: "User list API", severity: "HIGH", cvssScore: 8.5, verify: (b: string, ct: string) => ct.includes("application/json") && /email|username|password/i.test(b) },
+          { path: "/api/admin", label: "Admin API", severity: "HIGH", cvssScore: 8.0, verify: (b: string, ct: string) => ct.includes("application/json") && b.length > 30 },
+          { path: "/rest/user/whoami", label: "Identity disclosure", severity: "HIGH", cvssScore: 7.5, verify: (b: string, ct: string) => ct.includes("application/json") && /email|id|role/i.test(b) },
+          { path: "/socket.io/", label: "Socket.IO endpoint", severity: "MEDIUM", cvssScore: 5.3, verify: (b: string) => /socket\.io|websocket|polling/i.test(b) },
+        ];
+
+        let checkedCount = 0;
+        for (const endpoint of sensitiveEndpoints) {
+          checkedCount++;
+          if (checkedCount % 15 === 0 || checkedCount === 1) {
+            log(`🔎  Phase 4: Probing endpoints (${checkedCount}/${sensitiveEndpoints.length})...`);
+          }
+          try {
+            const endpointUrl = new URL(endpoint.path, targetUrl).toString();
+            const resp = await safeFetch(endpointUrl, 5000);
+            if (!resp || resp.status !== 200) continue;
+            const body = await resp.text();
+            const ct = resp.headers.get("content-type") ?? "";
+
+            if (/<title>[^<]*(404|not found|page not found)[^<]*<\/title>/i.test(body)) continue;
+            if (body.length < 20) continue;
+            if (pageHtml && isSoft404OrSPARedirect(body, pageHtml)) continue;
+            if (!endpoint.verify(body, ct)) continue;
+
+            findings.push({
+              type: "sensitive-endpoint-exposed",
+              severity: endpoint.severity as any,
+              url: endpointUrl,
+              evidence: `"${endpoint.label}" at ${endpointUrl} confirmed exposed: HTTP 200 with matching content fingerprint.`,
+              cvssScore: endpoint.cvssScore,
+              cveId: "CWE-538",
+            });
+          } catch { /* skip */ }
+        }
+
+        // K1 – Rate Limiting & DoS checks (Phase 5)
+        log(`🚦  Phase 5: Testing rate-limiting and DoS protection (burst probe of 10 requests)...`);
+        const rateLimitHeaders = ["x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset", "ratelimit-limit", "retry-after", "x-rate-limit-limit", "x-rate-limit-remaining"];
+        const hasRateLimitHeaders = rateLimitHeaders.some((h) => headers[h]);
+        const BURST_COUNT = 10;
+        let got429 = false;
+        let got429AfterN = -1;
+
+        try {
+          const burstRequests = Array.from({ length: BURST_COUNT }, () =>
+            fetch(targetUrl, {
+              method: "GET",
+              headers: FETCH_HEADERS,
+              signal: AbortSignal.timeout(5000),
+              // @ts-ignore
+              next: { revalidate: 0 },
+            }).catch(() => null)
+          );
+          const burstResults = await Promise.all(burstRequests);
+          for (let i = 0; i < burstResults.length; i++) {
+            const r = burstResults[i];
+            if (r && r.status === 429) {
+              got429 = true;
+              got429AfterN = i + 1;
+              break;
+            }
+          }
+        } catch { /* skip */ }
+
+        const wafHeaders = ["cf-ray", "x-sucuri-id", "x-cache", "x-amz-cf-id", "x-waf-event-info", "x-cdn"];
+        const hasWafOrCdn = wafHeaders.some((h) => headers[h]);
+
+        if (got429) {
+          findings.push({
+            type: "rate-limit-active",
+            severity: "INFO",
+            url: targetUrl,
+            evidence: `Rate limiting is active. The server responded with HTTP 429 after ${got429AfterN} rapid requests.`,
+            cvssScore: 0.0,
+          });
+        } else if (!hasRateLimitHeaders && !hasWafOrCdn) {
+          findings.push({
+            type: "missing-rate-limiting",
+            severity: "HIGH",
+            url: targetUrl,
+            evidence: `No rate limiting detected. ${BURST_COUNT} rapid consecutive requests succeeded without HTTP 429 or WAF blocks.`,
+            cvssScore: 7.5,
+            cveId: "CWE-770",
+          });
+        } else if (!hasRateLimitHeaders && hasWafOrCdn) {
+          findings.push({
+            type: "rate-limit-unverified",
+            severity: "MEDIUM",
+            url: targetUrl,
+            evidence: `WAF/CDN detected (${wafHeaders.filter((h) => headers[h]).join(", ")}) but no explicit rate-limit headers or 429 blocks triggered.`,
+            cvssScore: 4.3,
+            cveId: "CWE-770",
+          });
+        } else if (hasRateLimitHeaders && !got429) {
+          findings.push({
+            type: "rate-limit-headers-present",
+            severity: "INFO",
+            url: targetUrl,
+            evidence: `Rate-limit response headers detected (${rateLimitHeaders.filter((h) => headers[h]).join(", ")}). Burst probe did not trigger a 429.`,
+            cvssScore: 1.5,
+          });
+        }
+
+        // Sitemap check (L4)
+        try {
+          const sitemapUrl = new URL("/sitemap.xml", targetUrl).toString();
+          const sitemapResp = await safeFetch(sitemapUrl, 5000);
+          if (sitemapResp && sitemapResp.ok) {
+            const sitemapXml = await sitemapResp.text();
+            const sitemapUrls = parseSitemap(sitemapXml, targetUrl);
+            if (sitemapUrls.length > 0) {
+              for (const u of sitemapUrls) {
+                try {
+                  const cleanSitemapUrl = new URL(u);
+                  cleanSitemapUrl.hash = "";
+                  const sitemapStr = cleanSitemapUrl.toString();
+                  if (!visitedUrls.has(sitemapStr) && !urlQueue.includes(sitemapStr)) {
+                    urlQueue.push(sitemapStr);
+                  }
+                } catch { /* skip */ }
+              }
+              console.log(`🗺️  sitemap.xml: found ${sitemapUrls.length} additional URL(s)`);
+            }
+          }
+        } catch { /* skip */ }
+
+        // security.txt check (L5)
+        try {
+          const secTxtUrls = [
+            new URL("/.well-known/security.txt", targetUrl).toString(),
+            new URL("/security.txt", targetUrl).toString(),
+          ];
+          const hasSecurityTxt = (
+            await Promise.all(secTxtUrls.map((u) => safeFetch(u, 4000)))
+          ).some((r) => r && r.ok);
+          if (!hasSecurityTxt) {
+            findings.push({
+              type: "missing-security-txt",
+              severity: "INFO",
+              url: targetUrl,
+              evidence: "No security.txt file found at /.well-known/security.txt or /security.txt.",
+              cvssScore: 0.0,
+            });
+          }
+        } catch { /* skip */ }
+      }
+
+      // ── PAGE-SPECIFIC CHECKS (Run on EVERY page in the queue) ─────────────────────
+      let renderedHtml = pageHtml;
+      let runtimeFrameworks: string[] = [];
+      let browserLinks: string[] = [];
+      let browserApiEndpoints: string[] = [];
+
+      const browserResult = await renderWithBrowser(normalizedUrl, log);
+      if (browserResult) {
+        renderedHtml = browserResult.html;
+        runtimeFrameworks = browserResult.runtimeFrameworks;
+        browserLinks = browserResult.discoveredLinks;
+        browserApiEndpoints = browserResult.interceptedRequests || [];
+      }
+
+      if (fetchSucceeded || browserResult) {
+        // L1: Crawl links
+        const staticLinks = extractSameOriginLinks(renderedHtml, normalizedUrl);
+        const discoveredLinks = [...new Set([...staticLinks, ...browserLinks])].slice(0, 50);
+
+        // Queue newly discovered same-origin links
+        const targetHost = new URL(targetUrl).hostname;
+        for (const link of discoveredLinks) {
+          try {
+            const cleanLink = new URL(link, targetUrl);
+            cleanLink.hash = "";
+            const linkStr = cleanLink.toString();
+            if (cleanLink.hostname === targetHost && !visitedUrls.has(linkStr) && !urlQueue.includes(linkStr)) {
+              urlQueue.push(linkStr);
+            }
+          } catch { /* skip */ }
+        }
+
+        const staticApiEndpoints = extractApiEndpoints(renderedHtml, normalizedUrl);
+        const apiEndpoints = [...new Set([...staticApiEndpoints, ...browserApiEndpoints])];
+        const discoveredParamUrls = extractParamUrls(renderedHtml, normalizedUrl);
+        const discoveredForms = extractForms(renderedHtml, normalizedUrl);
+
+        log(`🕸️   Page audit complete — ${discoveredLinks.length} links, ${apiEndpoints.length} API refs, ${discoveredParamUrls.length} param URLs, ${discoveredForms.length} form(s)`);
+
+        // JS bundle analysis
+        log(`🔬  Scanning JS bundles for endpoints and secrets...`);
+        const jsBundleEndpoints = await extractJsBundleEndpoints(renderedHtml, normalizedUrl);
+        if (jsBundleEndpoints.length > 0) {
+          log(`🎯  JS analysis found ${jsBundleEndpoints.length} injectable POST endpoint(s): ${jsBundleEndpoints.map(e => e.path).join(", ")}`);
+        }
+
+        // Framework fingerprinting (L2)
+        const techs: string[] = [...runtimeFrameworks];
+        if (!techs.includes("Next.js") && /__NEXT_DATA__|_next\/static/.test(renderedHtml)) techs.push("Next.js");
+        if (!techs.includes("Nuxt.js") && /window\.__nuxt__|__NUXT__/.test(renderedHtml)) techs.push("Nuxt.js");
+        if (!techs.includes("Angular") && /ng-version=|angular\.js/i.test(renderedHtml)) techs.push("Angular");
+        if (!techs.includes("Vue.js") && /__VUE__|window\.__vue__/i.test(renderedHtml)) techs.push("Vue.js");
+        if (!techs.includes("React") && /react(?:\.production|\.development)?\.min\.js|__react_/i.test(renderedHtml)) techs.push("React");
+        if (!techs.includes("SvelteKit") && /__sveltekit|sveltekit-preload/i.test(renderedHtml)) techs.push("SvelteKit");
+        if (!techs.includes("Remix") && /__remix_server_manifest__|remix-island/i.test(renderedHtml)) techs.push("Remix");
+        if (!techs.includes("Gatsby") && /gatsby-chunk-mapping|gatsby-image/i.test(renderedHtml)) techs.push("Gatsby");
+        if (!techs.includes("Astro") && /astro-page|\/@astrojs\//i.test(renderedHtml)) techs.push("Astro");
+        if (/wp-content\/|wp-includes\//i.test(renderedHtml)) techs.push("WordPress");
+        if (/drupal\.settings|Drupal\./i.test(renderedHtml)) techs.push("Drupal");
+        if (/Joomla!/i.test(renderedHtml)) techs.push("Joomla");
+        if (/shopify\.com\/s\/files/i.test(renderedHtml)) techs.push("Shopify");
+        if (/jquery[.-]([\d.]+)(\.min)?\.js/i.test(renderedHtml)) techs.push("jQuery");
+        if (/csrfmiddlewaretoken/i.test(renderedHtml)) techs.push("Django");
+        if (/laravel_session|laravel\/framework/i.test(renderedHtml + (headers["set-cookie"] ?? ""))) techs.push("Laravel");
+        if (/\/api\/trpc\//i.test(renderedHtml)) techs.push("tRPC");
+        if (/\/@vite\/client|vite\.config/i.test(renderedHtml)) techs.push("Vite");
+        const poweredBy = headers["x-powered-by"] ?? "";
+        if (/express/i.test(poweredBy)) techs.push("Express.js");
+        if (/php/i.test(poweredBy)) techs.push("PHP");
+        if (/asp\.net/i.test(poweredBy)) techs.push("ASP.NET");
+        const uniqueTechs = [...new Set(techs)];
+        if (uniqueTechs.length > 0) {
+          findings.push({
+            type: "technology-fingerprinting",
+            severity: "INFO",
+            url: normalizedUrl,
+            evidence: `Detected technology stack: ${uniqueTechs.join(", ")}.`,
+            cvssScore: 2.0,
+            cveId: "CWE-200",
+          });
+        }
+
+        // DOM XSS sinks (D1-D2)
+        const DOM_XSS_SINKS = [
+          { pattern: /document\.write\s*\(/g, label: "document.write()" },
+          { pattern: /\.innerHTML\s*=/g, label: ".innerHTML assignment" },
+          { pattern: /\.outerHTML\s*=/g, label: ".outerHTML assignment" },
+          { pattern: /eval\s*\(/g, label: "eval()" },
+          { pattern: /setTimeout\s*\(\s*[`"']/g, label: "setTimeout(string)" },
+          { pattern: /setInterval\s*\(\s*[`"']/g, label: "setInterval(string)" },
+          { pattern: /new\s+Function\s*\(/g, label: "new Function()" },
+          { pattern: /location\.href\s*=\s*(?!["']https?)/g, label: "location.href = user-controlled" },
+          { pattern: /location\.assign\s*\(/g, label: "location.assign()" },
+          { pattern: /location\.replace\s*\(/g, label: "location.replace()" },
+          { pattern: /dangerouslySetInnerHTML/g, label: "dangerouslySetInnerHTML (React)" },
+          { pattern: /bypassSecurityTrustHtml/g, label: "bypassSecurityTrustHtml (Angular)" },
+          { pattern: /\$sce\.trustAsHtml/g, label: "$sce.trustAsHtml (AngularJS)" },
+          { pattern: /v-html\s*=/g, label: "v-html directive (Vue)" },
+          { pattern: /insertAdjacentHTML\s*\(/g, label: "insertAdjacentHTML()" },
+        ];
+        const htmlSinks: string[] = [];
+        const inlineScripts = [...renderedHtml.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]).join("\n");
+        for (const { pattern, label } of DOM_XSS_SINKS) {
+          if (label.includes("dangerouslySetInnerHTML")) {
+            if (pattern.test(renderedHtml) && /location\.search|window\.location|params|query|router/i.test(renderedHtml)) htmlSinks.push(label);
+          } else if (label.includes("eval") || label.includes("document.write")) {
+            if (pattern.test(inlineScripts)) htmlSinks.push(label);
+          } else {
+            if (pattern.test(renderedHtml)) htmlSinks.push(label);
+          }
+          pattern.lastIndex = 0;
+        }
+        if (htmlSinks.length > 0) {
+          findings.push({
+            type: "js-dangerous-sink",
+            severity: "HIGH",
+            url: normalizedUrl,
+            evidence: `DOM XSS sinks detected in page source: ${htmlSinks.join(", ")}.`,
+            cvssScore: 7.5,
+            cveId: "CWE-79",
+          });
+        }
+
+        // CSRF checks (C1-C2)
+        const formMatches2 = [...renderedHtml.matchAll(/<form[^>]*method=["']?post["']?[^>]*>([\s\S]*?)<\/form>/gi)];
+        const csrfTokenPatterns = /csrf|_token|authenticity_token|__requestverificationtoken|nonce/i;
+        let htmlFormCsrfReported = false;
+        for (const form of formMatches2) {
+          const formBody = form[1] || "";
+          if (!csrfTokenPatterns.test(formBody) && !htmlFormCsrfReported) {
+            findings.push({
+              type: "csrf-missing-token",
+              severity: "HIGH",
+              url: normalizedUrl,
+              evidence: "A POST form was found on the page without a CSRF token.",
+              cvssScore: 8.0,
+              cveId: "CWE-352",
+            });
+            htmlFormCsrfReported = true;
             break;
           }
         }
-      } catch {
-        /* burst probe failed – skip */
-      }
 
-      // K3 – Check for WAF / CDN protection indicators
-      const wafHeaders = ["cf-ray", "x-sucuri-id", "x-cache", "x-amz-cf-id", "x-waf-event-info", "x-cdn"];
-      const hasWafOrCdn = wafHeaders.some((h) => headers[h]);
-
-      if (got429) {
-        // ✅ Rate limiting IS working — report as INFO (good finding)
-        findings.push({
-          type: "rate-limit-active",
-          severity: "INFO",
-          url: targetUrl,
-          evidence: `Rate limiting is active. The server responded with HTTP 429 (Too Many Requests) after ${got429AfterN} rapid requests in the burst probe. DoS/DDoS protection is functioning correctly for this endpoint.`,
-          cvssScore: 0.0,
-        });
-      } else if (!hasRateLimitHeaders && !hasWafOrCdn) {
-        // ❌ No rate limiting detected at all — HIGH risk
-        findings.push({
-          type: "missing-rate-limiting",
-          severity: "HIGH",
-          url: targetUrl,
-          evidence: `No rate limiting detected. ${BURST_COUNT} rapid consecutive requests were sent and all received successful 2xx/3xx responses. No 'X-RateLimit-*', 'Retry-After', WAF headers (Cloudflare, Sucuri, AWS CloudFront), or HTTP 429 response was observed. The server appears vulnerable to DoS/DDoS attacks, credential stuffing, brute-force login, and API abuse.`,
-          cvssScore: 7.5,
-          cveId: "CWE-770",
-        });
-      } else if (!hasRateLimitHeaders && hasWafOrCdn) {
-        // ⚠️ WAF/CDN present but no explicit rate-limit headers — MEDIUM
-        findings.push({
-          type: "rate-limit-unverified",
-          severity: "MEDIUM",
-          url: targetUrl,
-          evidence: `A CDN or WAF proxy was detected (headers: ${wafHeaders.filter((h) => headers[h]).join(", ")}) but no explicit rate-limit response headers were present and the burst probe did not trigger a 429. Rate limiting may be configured at the CDN level but is not confirmed. Ensure rate limiting is explicitly enforced, especially on login, signup, and API endpoints.`,
-          cvssScore: 4.3,
-          cveId: "CWE-770",
-        });
-      } else if (hasRateLimitHeaders && !got429) {
-        // ⚠️ Headers present but limit wasn't hit — LOW (headers are a good sign)
-        findings.push({
-          type: "rate-limit-headers-present",
-          severity: "INFO",
-          url: targetUrl,
-          evidence: `Rate-limit response headers detected (${rateLimitHeaders.filter((h) => headers[h]).join(", ")}). The burst probe of ${BURST_COUNT} requests did not trigger a 429 — the limit is set higher than ${BURST_COUNT} req/window, or resets quickly. Verify the configured threshold is low enough to prevent brute-force and credential stuffing attacks.`,
-          cvssScore: 1.5,
-        });
-      }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // PHASE 2 – CRAWLING, FINGERPRINTING & ENDPOINT DISCOVERY
-    // ══════════════════════════════════════════════════════════════════════════
-
-    let discoveredParamUrls: string[] = [];
-    let discoveredLinks: string[] = [];
-    let discoveredForms: FormTarget[] = [];
-    let jsBundleEndpoints: JsApiEndpoint[] = [];
-
-    // ── Playwright browser rendering — PRIMARY DOM source ──────────────────
-    // The browser-rendered HTML is the authoritative source for all active probing.
-    // Raw `pageHtml` from fetch() is only used for passive header/cookie checks above.
-    let renderedHtml = pageHtml;
-    let runtimeFrameworks: string[] = [];
-    let browserLinks: string[] = [];
-    let browserApiEndpoints: string[] = [];
-
-    const browserResult = await renderWithBrowser(targetUrl, log);
-    if (browserResult) {
-      renderedHtml = browserResult.html;
-      runtimeFrameworks = browserResult.runtimeFrameworks;
-      browserLinks = browserResult.discoveredLinks;
-      browserApiEndpoints = browserResult.interceptedRequests || [];
-    }
-
-    if (fetchSucceeded || browserResult) {
-      // ── L1: Crawl same-origin links (merge static regex + Playwright SPA links) ─
-      const staticLinks = extractSameOriginLinks(renderedHtml, targetUrl);
-      discoveredLinks = [...new Set([...staticLinks, ...browserLinks])].slice(0, 50);
-      
-      const staticApiEndpoints = extractApiEndpoints(renderedHtml, targetUrl);
-      const apiEndpoints = [...new Set([...staticApiEndpoints, ...browserApiEndpoints])];
-      
-      discoveredParamUrls = extractParamUrls(renderedHtml, targetUrl);
-      discoveredForms = extractForms(renderedHtml, targetUrl);
-      log(`🕸️   Phase 6: Crawler complete — ${discoveredLinks.length} links, ${apiEndpoints.length} API refs (including ${browserApiEndpoints.length} intercepted runtime APIs), ${discoveredParamUrls.length} param URLs, ${discoveredForms.length} form(s)`);
-      if (discoveredForms.length > 0) log(`📝  Discovered ${discoveredForms.length} form(s) for injection testing`);
-      if (discoveredParamUrls.length > 0) log(`🔗  Discovered ${discoveredParamUrls.length} parameterised URL(s) for active probing`);
-
-      // ── L1b: JS Bundle endpoint extraction (SPA field discovery) ─────────
-      log(`🔬  Phase 6b: JS bundle analysis — scanning scripts for hidden POST endpoints...`);
-      jsBundleEndpoints = await extractJsBundleEndpoints(renderedHtml, targetUrl);
-      if (jsBundleEndpoints.length > 0) {
-        log(`🎯  JS analysis found ${jsBundleEndpoints.length} injectable POST endpoint(s): ${jsBundleEndpoints.map(e => e.path).join(", ")}`);
-      }
-
-      // ── L2: Tech fingerprinting — runtime Playwright signals + static patterns ─
-      // runtimeFrameworks from page.evaluate() catches pure SPAs with no static traces.
-      // Static patterns catch SSR frameworks and CDN-served libraries.
-      const techs: string[] = [...runtimeFrameworks];
-      if (!techs.includes("Next.js")   && /__NEXT_DATA__|_next\/static/.test(renderedHtml))                              techs.push("Next.js");
-      if (!techs.includes("Nuxt.js")   && /window\.__nuxt__|__NUXT__/.test(renderedHtml))                               techs.push("Nuxt.js");
-      if (!techs.includes("Angular")   && /ng-version=|angular\.js/i.test(renderedHtml))                                techs.push("Angular");
-      if (!techs.includes("Vue.js")    && /__VUE__|window\.__vue__/i.test(renderedHtml))                                techs.push("Vue.js");
-      if (!techs.includes("React")     && /react(?:\.production|\.development)?\.min\.js|__react_/i.test(renderedHtml)) techs.push("React");
-      if (!techs.includes("SvelteKit") && /__sveltekit|sveltekit-preload/i.test(renderedHtml))                          techs.push("SvelteKit");
-      if (!techs.includes("Remix")     && /__remix_server_manifest__|remix-island/i.test(renderedHtml))                 techs.push("Remix");
-      if (!techs.includes("Gatsby")    && /gatsby-chunk-mapping|gatsby-image/i.test(renderedHtml))                      techs.push("Gatsby");
-      if (!techs.includes("Astro")     && /astro-page|\/@astrojs\//i.test(renderedHtml))                               techs.push("Astro");
-      if (/wp-content\/|wp-includes\//i.test(renderedHtml))                                                             techs.push("WordPress");
-      if (/drupal\.settings|Drupal\./i.test(renderedHtml))                                                              techs.push("Drupal");
-      if (/Joomla!/i.test(renderedHtml))                                                                                 techs.push("Joomla");
-      if (/shopify\.com\/s\/files/i.test(renderedHtml))                                                                 techs.push("Shopify");
-      if (/jquery[.-]([\d.]+)(\.min)?\.js/i.test(renderedHtml))                                                         techs.push("jQuery");
-      if (/csrfmiddlewaretoken/i.test(renderedHtml))                                                                     techs.push("Django");
-      if (/laravel_session|laravel\/framework/i.test(renderedHtml + (headers["set-cookie"] ?? "")))                     techs.push("Laravel");
-      if (/\/api\/trpc\//i.test(renderedHtml))                                                                           techs.push("tRPC");
-      if (/\/@vite\/client|vite\.config/i.test(renderedHtml))                                                            techs.push("Vite");
-      const poweredBy = headers["x-powered-by"] ?? "";
-      if (/express/i.test(poweredBy))  techs.push("Express.js");
-      if (/php/i.test(poweredBy))      techs.push("PHP");
-      if (/asp\.net/i.test(poweredBy)) techs.push("ASP.NET");
-      const uniqueTechs = [...new Set(techs)];
-      if (uniqueTechs.length > 0) {
-        findings.push({
-          type: "technology-fingerprinting",
-          severity: "INFO",
-          url: targetUrl,
-          evidence: `Detected technology stack: ${uniqueTechs.join(", ")}. Detected via Playwright runtime evaluation + static HTML/header analysis. Fingerprinting exposes version-specific CVEs attackers can exploit.`,
-          cvssScore: 2.0,
-          cveId: "CWE-200",
-        });
-      }
-
-      // ── L3: IDOR signal detection ────────────────────────────────────────
-      // Flag discovered URLs or API refs that contain sequential numeric IDs
-      const idorPatterns = [
-        /\/api\/[^/\s]+\/\d+/i, /\/rest\/[^/\s]+\/\d+/i,
-        /\/users?\/\d+/i, /\/orders?\/\d+/i, /\/products?\/\d+/i,
-        /[?&](?:id|user_id|order_id|product_id|account_id)=\d+/i,
-      ];
-      const idorUrls = [...discoveredLinks, ...apiEndpoints, ...discoveredParamUrls]
-        .filter((u) => idorPatterns.some((p) => p.test(u)));
-      if (idorUrls.length > 0) {
-        findings.push({
-          type: "idor-numeric-id",
-          severity: "MEDIUM",
-          url: idorUrls[0],
-          evidence: `Discovered ${idorUrls.length} URL(s) using sequential numeric IDs (e.g. ${idorUrls[0]}). Sequential IDs are highly susceptible to Insecure Direct Object Reference (IDOR / BOLA) attacks — an attacker can enumerate adjacent IDs to access other users' data without authorisation.`,
-          cvssScore: 6.5,
-          cveId: "CWE-639",
-        });
-      }
-    }
-
-    // ── L4: Sitemap endpoint discovery ──────────────────────────────────────
-    try {
-      const sitemapUrl = new URL("/sitemap.xml", targetUrl).toString();
-      const sitemapResp = await safeFetch(sitemapUrl, 5000);
-      if (sitemapResp && sitemapResp.ok) {
-        const sitemapXml = await sitemapResp.text();
-        const sitemapUrls = parseSitemap(sitemapXml, targetUrl);
-        if (sitemapUrls.length > 0) {
-          // Merge new param URLs from sitemap
-          for (const u of sitemapUrls) {
-            if (/\?/.test(u)) discoveredParamUrls.push(u);
-          }
-          console.log(`🗺️  sitemap.xml: found ${sitemapUrls.length} additional URL(s)`);
-        }
-      }
-    } catch { /* non-critical */ }
-
-    // ── L5: security.txt check ──────────────────────────────────────────────
-    try {
-      const secTxtUrls = [
-        new URL("/.well-known/security.txt", targetUrl).toString(),
-        new URL("/security.txt", targetUrl).toString(),
-      ];
-      const hasSecurityTxt = (
-        await Promise.all(secTxtUrls.map((u) => safeFetch(u, 4000)))
-      ).some((r) => r && r.ok);
-      if (!hasSecurityTxt) {
-        findings.push({
-          type: "missing-security-txt",
-          severity: "INFO",
-          url: targetUrl,
-          evidence: "No security.txt file found at /.well-known/security.txt or /security.txt. RFC 9116 recommends this file to let researchers know how to report vulnerabilities responsibly.",
-          cvssScore: 0.0,
-        });
-      }
-    } catch { /* non-critical */ }
-
-    // ── L6: JWT analysis (cookies) ──────────────────────────────────────────
-    if (fetchSucceeded && cookieHeaders.length > 0) {
-      const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
-      for (const cookie of cookieHeaders) {
-        const name = cookie.split("=")[0]?.trim() ?? "token";
-        const value = cookie.split("=")[1]?.split(";")[0]?.trim() ?? "";
-        if (JWT_RE.test(value)) {
+        const SPA_CSRF_PATHS = ["/rest/user/login", "/api/login", "/api/auth/login", "/api/v1/auth/login", "/api/user", "/api/profile", "/api/orders", "/api/basket", "/api/feedback"];
+        let spaCsrfFound = false;
+        for (const path of SPA_CSRF_PATHS) {
+          if (spaCsrfFound) break;
           try {
-            const headerB64 = value.split(".")[0];
-            const pad = "=".repeat((4 - (headerB64.length % 4)) % 4);
-            const decoded = JSON.parse(Buffer.from(headerB64 + pad, "base64url").toString());
-            if (decoded.alg === "none" || decoded.alg === "None") {
+            const csrfUrl = new URL(path, normalizedUrl).toString();
+            const resp = await fetch(csrfUrl, {
+              method: "POST",
+              headers: { "Content-Type": "text/plain", "User-Agent": FETCH_HEADERS["User-Agent"] },
+              body: "email=test@test.com&password=test",
+              signal: AbortSignal.timeout(5000),
+              // @ts-ignore
+              next: { revalidate: 0 },
+            }).catch(() => null);
+
+            if (resp && resp.status >= 200 && resp.status < 300) {
+              const bodyText = await resp.text().catch(() => "");
+              const isConfirmed = bodyText.includes("token") || bodyText.includes("success") || bodyText.includes("user") || bodyText.includes("id");
+              spaCsrfFound = true;
               findings.push({
-                type: "jwt-alg-none",
-                severity: "CRITICAL",
-                url: targetUrl,
-                parameter: name,
-                evidence: `JWT in cookie "${name}" has alg:"none". This allows an attacker to forge arbitrary tokens by removing the signature, bypassing all authentication without knowing the secret key.`,
-                cvssScore: 9.8,
-                cveId: "CWE-345",
-              });
-            } else if (decoded.alg) {
-              findings.push({
-                type: "jwt-detected",
-                severity: "INFO",
-                url: targetUrl,
-                parameter: name,
-                evidence: `JWT token detected in cookie "${name}" using algorithm ${decoded.alg}. Ensure the signing secret has ≥256 bits of entropy and that the server rejects tokens with alg:none. Weak secrets can be brute-forced offline from any captured token.`,
-                cvssScore: 3.5,
-                cveId: "CWE-327",
+                type: "csrf-missing-token",
+                severity: isConfirmed ? "HIGH" : "INFO",
+                url: csrfUrl,
+                evidence: `CSRF vulnerability ${isConfirmed ? "detected" : "signal"} on REST API endpoint ${path}.`,
+                cvssScore: isConfirmed ? 7.5 : 0.0,
+                cveId: "CWE-352",
               });
             }
-          } catch { /* decode failed – not a valid JWT */ }
-          break; // report once
+          } catch { /* skip */ }
         }
-      }
-    }
 
-    // ── L7: GraphQL introspection ────────────────────────────────────────────
-    const gqlFinding = await checkGraphQLIntrospection(targetUrl);
-    if (gqlFinding) findings.push(gqlFinding);
-
-    // ── L8: NEXT_PUBLIC_ / env variable leak detection ───────────────────────
-    // Uses renderedHtml so we catch env vars injected at runtime by React/Next.js
-    if (renderedHtml) {
-      const envLeak = detectEnvLeaks(renderedHtml, targetUrl);
-      if (envLeak) findings.push(envLeak);
-    }
-
-    // ── L9: Session fixation / weak session token ────────────────────────────
-    if (fetchSucceeded && cookieHeaders.length > 0) {
-      const sessionFix = detectSessionFixation(cookieHeaders, targetUrl);
-      if (sessionFix) findings.push(sessionFix);
-    }
-
-    // ── L10: Subdomain takeover signals ──────────────────────────────────────
-    // Uses renderedHtml to catch JS-rendered external resource references
-    if (renderedHtml) {
-      const takeoverSignal = detectSubdomainTakeoverSignals(renderedHtml, targetUrl);
-      if (takeoverSignal) findings.push(takeoverSignal);
-    }
-
-    // ── L11: SSRF parameter detection ────────────────────────────────────────
-    // Uses renderedHtml to catch SSRF-prone params in client-side rendered URLs
-    if (renderedHtml) {
-      const ssrfFinding = detectSSRF(renderedHtml, discoveredParamUrls, targetUrl);
-      if (ssrfFinding) findings.push(ssrfFinding);
-    }
-
-    // ── L12: JS file secrets and dangerous sinks ─────────────────────────────
-    // Uses renderedHtml to catch dynamically-added <script> tags in SPAs
-    if (renderedHtml) {
-      log(`🔬  Phase 7: Scanning JS files for hardcoded secrets, API keys, and dangerous sinks...`);
-      const jsFindings = await analyzeJSFiles(renderedHtml, targetUrl);
-      findings.push(...jsFindings);
-    }
-
-    // ── L13: Broken auth (login form detection + default credential probe) ────
-    // Uses renderedHtml — catches React/Next.js/Angular login forms rendered by JS
-    if (renderedHtml) {
-      const loginForms = [...renderedHtml.matchAll(/<form[^>]*>([\s\S]*?)<\/form>/gi)];
-      for (const formMatch of loginForms.slice(0, 3)) {
-        const formBody = formMatch[1] || "";
-        const hasPasswordField = /type=["']?password["']?/i.test(formBody);
-        if (!hasPasswordField) continue;
-        const fullForm = formMatch[0];
-        const actionMatch = fullForm.match(/action=["']([^"']+)["']/i);
-        const formAction = actionMatch ? new URL(actionMatch[1], targetUrl).toString() : targetUrl;
-        const userFieldMatch = formBody.match(/name=["'](user(?:name)?|email|login|account)["']/i);
-        const passFieldMatch = formBody.match(/name=["'](pass(?:word)?|pwd|secret)["']/i);
-        const userField = userFieldMatch ? userFieldMatch[1] : "username";
-        const passField = passFieldMatch ? passFieldMatch[1] : "password";
-        const brokenAuthFinding = await probeBrokenAuth(formAction, userField, passField);
-        if (brokenAuthFinding) {
-          findings.push(brokenAuthFinding);
-          break;
+        // SQLi Error Disclosure (E1-E2)
+        const sqlErrorPatterns = [/SQL syntax.*MySQL/i, /Warning.*mysql_/i, /MySQLSyntaxErrorException/i, /valid MySQL result/i, /PostgreSQL.*ERROR/i, /PSQLException/i, /ORA-\d{4,}/i, /Microsoft OLE DB.*SQL Server/i, /Unclosed quotation mark/i, /SQLiteException/i, /org\.hibernate\.exception/i, /You have an error in your SQL syntax/i, /ODBC SQL Server Driver/i, /Syntax error.*in query expression/i];
+        const matchedSqlError = sqlErrorPatterns.find((p) => p.test(renderedHtml));
+        if (matchedSqlError) {
+          findings.push({
+            type: "sql-injection-error-disclosure",
+            severity: "CRITICAL",
+            url: normalizedUrl,
+            evidence: "The server is leaking raw SQL error messages in its HTTP response.",
+            cvssScore: 9.8,
+            cveId: "CWE-89",
+          });
         }
-      }
-    }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // PHASE 3 – ACTIVE PAYLOAD PROBING (safe, non-destructive)
-    // ══════════════════════════════════════════════════════════════════════════
-
-    // De-duplicate param URLs and cap total active probes
-    const probeTargets = [...new Set(discoveredParamUrls)].slice(0, 8);
-
-    if (probeTargets.length > 0) {
-      log(`⚡  Phase 8: Active injection probes — SQLi, XSS, command injection, path traversal on ${probeTargets.length} URL(s)...`);
-      for (const target of probeTargets) {
-        try {
-          const parsed = new URL(target);
-          log(`     ℹ️  Probing query parameters on ${parsed.pathname}${parsed.search}`);
-        } catch {
-          log(`     ℹ️  Probing query parameters on ${target.substring(0, 65)}`);
+        if (/at\s+[\w.]+\([\w./]+:\d+:\d+\)|Traceback \(most recent call last\)|Stack trace:/i.test(renderedHtml)) {
+          findings.push({
+            type: "stack-trace-disclosure",
+            severity: "HIGH",
+            url: normalizedUrl,
+            evidence: "A full stack trace was found in the HTTP response.",
+            cvssScore: 7.5,
+            cveId: "CWE-209",
+          });
         }
-      }
 
-      // Run all probes concurrently per URL for speed
-      const probeResults = await Promise.all(
-        probeTargets.flatMap((url) => [
-          probeReflectedXSS(url),
-          probeSQLiError(url),
-          probeCommandInjection(url),
-          probePathTraversal(url),
-        ])
-      );
-
-      let xssFound = false;
-      let sqliFound = false;
-      let cmdInjFound = false;
-      let lfiFound = false;
-      let deserFound = false;
-      let blindSsrfFound = false;
-      for (const result of probeResults) {
-        if (!result) continue;
-        if (result.type === "reflected-xss" && !xssFound) {
-          findings.push(result); xssFound = true;
-        } else if (result.type === "sql-injection-reflected" && !sqliFound) {
-          findings.push(result); sqliFound = true;
-        } else if (result.type === "command-injection" && !cmdInjFound) {
-          findings.push(result); cmdInjFound = true;
-        } else if (result.type === "path-traversal-lfi" && !lfiFound) {
-          findings.push(result); lfiFound = true;
-        } else if (result.type === "insecure-deserialization" && !deserFound) {
-          findings.push(result); deserFound = true;
-        } else if (result.type === "blind-ssrf-timing" && !blindSsrfFound) {
-          findings.push(result); blindSsrfFound = true;
-        }
-      }
-
-      // GAP FIX: Add deserialization and blind SSRF probes to active payload phase
-      if (probeTargets.length > 0 && !deserFound) {
-        log(`🔍  Phase 8b: Deserialization & Blind SSRF probing (CWE-502, CWE-918)...`);
-        const gapFixResults = await Promise.all(
-          probeTargets.flatMap((url) => [
-            probeInsecureDeserialization(url),
-            probeBlindSSRFWithTiming(url),
-          ])
-        );
-        for (const result of gapFixResults) {
-          if (result?.type === "insecure-deserialization" && !deserFound) {
-            findings.push(result); deserFound = true;
-          } else if (result?.type === "blind-ssrf-timing" && !blindSsrfFound) {
-            findings.push(result); blindSsrfFound = true;
+        // Secrets leak (F1-F3)
+        const secretPatterns = [
+          { label: "AWS Access Key", pattern: /AKIA[0-9A-Z]{16}/ },
+          { label: "Generic API key", pattern: /api[_-]?key\s*[:=]\s*["'][A-Za-z0-9_\-]{20,}["']/i },
+          { label: "Bearer token", pattern: /bearer\s+[A-Za-z0-9\-._~+/]+=*/i },
+          { label: "Private key header", pattern: /-----BEGIN (RSA |EC )?PRIVATE KEY-----/ },
+          { label: "Stripe secret key", pattern: /sk_(live|test)_[0-9a-zA-Z]{24}/ },
+          { label: "SendGrid API key", pattern: /SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/ },
+          { label: "Password in source", pattern: /password\s*[:=]\s*["'][^"']{6,}["']/i },
+        ];
+        for (const { label, pattern } of secretPatterns) {
+          if (pattern.test(renderedHtml)) {
+            findings.push({
+              type: "sensitive-data-exposure",
+              severity: "CRITICAL",
+              url: normalizedUrl,
+              evidence: `Possible secret detected in HTML source: "${label}".`,
+              cvssScore: 9.5,
+              cveId: "CWE-312",
+            });
+            break;
           }
         }
-      }
-    }
 
-    // ── PHASE 3b: FORM-BASED INJECTION PROBING ───────────────────────────────
-    // Submit payloads directly to HTML form input fields via POST/GET
-    if (discoveredForms.length > 0) {
-      log(`📝  Phase 9: Form injection probing — SQLi, XSS, SSTI on ${discoveredForms.length} form(s) (${discoveredForms.reduce((a, f) => a + f.fields.length, 0)} fields)...`);
-      for (const form of discoveredForms) {
-        log(`     ℹ️  Auditing form [${form.method.toUpperCase()}] action: ${form.actionUrl || "(self)"} (fields: ${form.fields.join(", ")})`);
-      }
-
-      const formProbeResults = await Promise.all(
-        discoveredForms.flatMap((form) => [
-          probeFormSQLi(form),
-          probeFormXSS(form),
-          probeFormSSTI(form),
-        ])
-      );
-
-      let formSqliFound = false;
-      let formXssFound = false;
-      let formSstiFound = false;
-      for (const result of formProbeResults) {
-        if (!result) continue;
-        if (result.type === "sql-injection-form" && !formSqliFound) {
-          findings.push(result); formSqliFound = true;
-        } else if (result.type === "reflected-xss-form" && !formXssFound) {
-          findings.push(result); formXssFound = true;
-        } else if (result.type === "ssti-injection-form" && !formSstiFound) {
-          findings.push(result); formSstiFound = true;
+        if (!normalizedUrl.startsWith("https://") && /<input[^>]+type=["']?password["']?/i.test(renderedHtml)) {
+          findings.push({
+            type: "password-over-http",
+            severity: "CRITICAL",
+            url: normalizedUrl,
+            evidence: "A password input field was found on a plain HTTP page.",
+            cvssScore: 9.1,
+            cveId: "CWE-319",
+          });
         }
-      }
-    }
-    // ── PHASE 3b-2: REST/JSON API SQL INJECTION PROBING ──────────────────────
-    // First: probe endpoints and fields discovered from the JS bundle (SPA-aware)
-    // Then: fallback to common REST auth path list (probeRestApiSQLi)
-    {
-      log(`🔐  Phase 9b: REST/JSON API SQLi — probing ${jsBundleEndpoints.length} JS-discovered endpoint(s) + common auth paths...`);
 
-      let apiSqliFound = false;
+        if (normalizedUrl.startsWith("https://")) {
+          const httpRefs = (renderedHtml.match(/(?:src|href|action)=["']http:\/\//gi) || []).length;
+          if (httpRefs > 0) {
+            findings.push({
+              type: "mixed-content",
+              severity: "MEDIUM",
+              url: normalizedUrl,
+              evidence: `Found ${httpRefs} reference(s) to insecure HTTP resources on an HTTPS page.`,
+              cvssScore: 5.4,
+              cveId: "CWE-311",
+            });
+          }
+        }
 
-      // Priority: test what we found in the actual JS source
-      if (jsBundleEndpoints.length > 0) {
-        for (const endpoint of jsBundleEndpoints) {
-          if (apiSqliFound) break;
-          log(`     ℹ️  Testing REST parameters on POST ${endpoint.path} (fields: ${endpoint.fields.join(", ")})`);
-          const endpointUrl = new URL(endpoint.path, targetUrl).toString();
+        // Open Redirect param check (H1)
+        const redirectParamPattern = /(?:href|action)=["'][^"']*[?&](?:redirect|url|next|return|goto|dest|destination|rurl|target)=(?:https?:\/\/|\/\/)/gi;
+        if (redirectParamPattern.test(renderedHtml)) {
+          findings.push({
+            type: "open-redirect",
+            severity: "MEDIUM",
+            url: normalizedUrl,
+            evidence: "A link or form action was found containing a redirect parameter.",
+            cvssScore: 6.1,
+            cveId: "CWE-601",
+          });
+        }
 
-          for (const payload of SQLI_PAYLOADS) {
-            if (apiSqliFound) break;
-            // Build JSON body with payload in each discovered field
-            for (const field of endpoint.fields) {
-              if (apiSqliFound) break;
-              const body: Record<string, string> = {};
-              for (const f of endpoint.fields) body[f] = f === field ? payload : "test";
+        // IDOR numeric ID detection (L3)
+        const idorPatterns = [/\/api\/[^/\s]+\/\d+/i, /\/rest\/[^/\s]+\/\d+/i, /\/users?\/\d+/i, /\/orders?\/\d+/i, /\/products?\/\d+/i, /[?&](?:id|user_id|order_id|product_id|account_id)=\d+/i];
+        const idorUrls = [...discoveredLinks, ...apiEndpoints, ...discoveredParamUrls].filter((u) => idorPatterns.some((p) => p.test(u)));
+        if (idorUrls.length > 0) {
+          findings.push({
+            type: "idor-numeric-id",
+            severity: "MEDIUM",
+            url: idorUrls[0],
+            evidence: `Discovered sequential numeric IDs in URLs (e.g. ${idorUrls[0]}).`,
+            cvssScore: 6.5,
+            cveId: "CWE-639",
+          });
+        }
 
+        // JWT token analysis (L6)
+        if (cookieHeaders.length > 0) {
+          const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
+          for (const cookie of cookieHeaders) {
+            const name = cookie.split("=")[0]?.trim() ?? "token";
+            const value = cookie.split("=")[1]?.split(";")[0]?.trim() ?? "";
+            if (JWT_RE.test(value)) {
               try {
-                const resp = await fetch(endpointUrl, {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "User-Agent": FETCH_HEADERS["User-Agent"],
-                    "Accept": "application/json",
-                  },
-                  body: JSON.stringify(body),
-                  signal: AbortSignal.timeout(7000),
-
-                  next: { revalidate: 0 },
-                }).catch(() => null);
-
-                if (!resp) continue;
-                const text = await resp.text();
-
-                // DB error signature in body
-                const hitPattern = SQL_ERROR_PATTERNS_ACTIVE.find((p) => p.test(text));
-                if (hitPattern) {
+                const headerB64 = value.split(".")[0];
+                const pad = "=".repeat((4 - (headerB64.length % 4)) % 4);
+                const decoded = JSON.parse(Buffer.from(headerB64 + pad, "base64url").toString());
+                if (decoded.alg === "none" || decoded.alg === "None") {
                   findings.push({
-                    type: "sql-injection-reflected",
+                    type: "jwt-alg-none",
                     severity: "CRITICAL",
-                    url: endpointUrl,
-                    parameter: field,
-                    evidence: `SQL Injection confirmed via JS-discovered REST endpoint. The scanner read the app's JavaScript bundle, found the POST endpoint "${endpoint.path}" with input field "${field}", and confirmed a database error when submitting payload "${payload}". The backend constructs SQL queries from unsanitized JSON input. An attacker can dump the database, bypass authentication, or achieve full database takeover.`,
+                    url: normalizedUrl,
+                    parameter: name,
+                    evidence: `JWT in cookie "${name}" has alg:"none".`,
                     cvssScore: 9.8,
-                    cveId: "CWE-89",
+                    cveId: "CWE-345",
                   });
-                  apiSqliFound = true;
-                  log(`🚨  SQL Injection confirmed at ${endpointUrl} (field: ${field}, payload: ${payload})`);
-                  break;
-                }
-
-                // Auth bypass: payload returns 200 with a token (boolean-based SQLi)
-                if (resp.status === 200 &&
-                  (text.includes("token") || text.includes("authentication") || text.includes("Bearer")) &&
-                  (payload.includes("OR") || payload.includes("1=1") || payload.includes("--"))) {
+                } else if (decoded.alg) {
                   findings.push({
-                    type: "sql-injection-reflected",
-                    severity: "CRITICAL",
-                    url: endpointUrl,
-                    parameter: field,
-                    evidence: `SQL Injection (Authentication Bypass) confirmed via JS-discovered endpoint. The scanner found field "${field}" in the app's JS bundle, submitted payload "${payload}" as a JSON POST to ${endpointUrl}, and received HTTP 200 with an auth token — confirming the SQL WHERE clause was bypassed. An attacker can log in as any user (including admin) without valid credentials.`,
-                    cvssScore: 9.8,
-                    cveId: "CWE-89",
+                    type: "jwt-detected",
+                    severity: "INFO",
+                    url: normalizedUrl,
+                    parameter: name,
+                    evidence: `JWT token detected in cookie "${name}" using algorithm ${decoded.alg}.`,
+                    cvssScore: 3.5,
+                    cveId: "CWE-327",
                   });
-                  apiSqliFound = true;
-                  log(`🚨  SQL Auth Bypass confirmed at ${endpointUrl} (field: ${field})`);
-                  break;
                 }
-              } catch { /* next */ }
+              } catch { /* skip */ }
+              break;
             }
           }
         }
-      }
 
-      // Fallback: probe common REST auth paths if JS analysis didn't find anything
-      if (!apiSqliFound) {
-        const restSqliResult = await probeRestApiSQLi(targetUrl);
-        if (restSqliResult) {
-          findings.push(restSqliResult);
-          log(`🚨  SQL Injection (REST API fallback) confirmed at ${restSqliResult.url}`);
+        // Subdomain Takeover signals (L10)
+        const takeoverSignal = detectSubdomainTakeoverSignals(renderedHtml, normalizedUrl);
+        if (takeoverSignal) findings.push(takeoverSignal);
+
+        // SSRF parameters (L11)
+        const ssrfFinding = detectSSRF(renderedHtml, discoveredParamUrls, normalizedUrl);
+        if (ssrfFinding) findings.push(ssrfFinding);
+
+        // JS files analysis (L12)
+        log(`🔬  Scanning JS files for secrets and sinks...`);
+        const jsFindings = await analyzeJSFiles(renderedHtml, normalizedUrl);
+        findings.push(...jsFindings);
+
+        // Broken Auth default creds (L13)
+        const loginForms = [...renderedHtml.matchAll(/<form[^>]*>([\s\S]*?)<\/form>/gi)];
+        for (const formMatch of loginForms.slice(0, 3)) {
+          const formBody = formMatch[1] || "";
+          if (!/type=["']?password["']?/i.test(formBody)) continue;
+          const fullForm = formMatch[0];
+          const actionMatch = fullForm.match(/action=["']([^"']+)["']/i);
+          const formAction = actionMatch ? new URL(actionMatch[1], normalizedUrl).toString() : normalizedUrl;
+          const userFieldMatch = formBody.match(/name=["'](user(?:name)?|email|login|account)["']/i);
+          const passFieldMatch = formBody.match(/name=["'](pass(?:word)?|pwd|secret)["']/i);
+          const userField = userFieldMatch ? userFieldMatch[1] : "username";
+          const passField = passFieldMatch ? passFieldMatch[1] : "password";
+          const brokenAuthFinding = await probeBrokenAuth(formAction, userField, passField);
+          if (brokenAuthFinding) {
+            findings.push(brokenAuthFinding);
+            break;
+          }
+        }
+
+        // Active injection probing (Phase 8)
+        const probeTargets = [...new Set(discoveredParamUrls)].slice(0, 8);
+        if (probeTargets.length > 0) {
+          log(`⚡  Active injection probes (SQLi, XSS, CmdInj, PathTraversal) on ${probeTargets.length} URL(s)...`);
+          const probeResults = await Promise.all(
+            probeTargets.flatMap((url) => [
+              probeReflectedXSS(url),
+              probeSQLiError(url),
+              probeCommandInjection(url),
+              probePathTraversal(url),
+            ])
+          );
+
+          let xssFound = false; let sqliFound = false;
+          let cmdInjFound = false; let lfiFound = false;
+          let deserFound = false; let blindSsrfFound = false;
+
+          for (const result of probeResults) {
+            if (!result) continue;
+            if (result.type === "reflected-xss" && !xssFound) { findings.push(result); xssFound = true; }
+            else if (result.type === "sql-injection-reflected" && !sqliFound) { findings.push(result); sqliFound = true; }
+            else if (result.type === "command-injection" && !cmdInjFound) { findings.push(result); cmdInjFound = true; }
+            else if (result.type === "path-traversal-lfi" && !lfiFound) { findings.push(result); lfiFound = true; }
+          }
+
+          // Deserialization & Blind SSRF probes
+          const gapFixResults = await Promise.all(
+            probeTargets.flatMap((url) => [
+              probeInsecureDeserialization(url),
+              probeBlindSSRFWithTiming(url),
+            ])
+          );
+          for (const result of gapFixResults) {
+            if (result?.type === "insecure-deserialization" && !deserFound) { findings.push(result); deserFound = true; }
+            else if (result?.type === "blind-ssrf-timing" && !blindSsrfFound) { findings.push(result); blindSsrfFound = true; }
+          }
+        }
+
+        // Form-based injection probing (Phase 9)
+        if (discoveredForms.length > 0) {
+          log(`📝  Form injection probing on ${discoveredForms.length} form(s)...`);
+          const formProbeResults = await Promise.all(
+            discoveredForms.flatMap((form) => [
+              probeFormSQLi(form),
+              probeFormXSS(form),
+              probeFormSSTI(form),
+            ])
+          );
+
+          let formSqliFound = false; let formXssFound = false; let formSstiFound = false;
+          for (const result of formProbeResults) {
+            if (!result) continue;
+            if (result.type === "sql-injection-form" && !formSqliFound) { findings.push(result); formSqliFound = true; }
+            else if (result.type === "reflected-xss-form" && !formXssFound) { findings.push(result); formXssFound = true; }
+            else if (result.type === "ssti-injection-form" && !formSstiFound) { findings.push(result); formSstiFound = true; }
+          }
+        }
+
+        // REST/JSON API SQLi probing (Phase 9b)
+        log(`🔐  Probing REST/JSON API SQLi...`);
+        let apiSqliFound = false;
+        if (jsBundleEndpoints.length > 0) {
+          for (const endpoint of jsBundleEndpoints) {
+            if (apiSqliFound) break;
+            const endpointUrl = new URL(endpoint.path, targetUrl).toString();
+            for (const payload of SQLI_PAYLOADS) {
+              if (apiSqliFound) break;
+              for (const field of endpoint.fields) {
+                if (apiSqliFound) break;
+                const body: Record<string, string> = {};
+                for (const f of endpoint.fields) body[f] = f === field ? payload : "test";
+
+                try {
+                  const resp = await fetch(endpointUrl, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"], "Accept": "application/json" },
+                    body: JSON.stringify(body),
+                    signal: AbortSignal.timeout(7000),
+                    // @ts-ignore
+                    next: { revalidate: 0 },
+                  }).catch(() => null);
+
+                  if (!resp) continue;
+                  const text = await resp.text();
+
+                  const hitPattern = SQL_ERROR_PATTERNS_ACTIVE.find((p) => p.test(text));
+                  if (hitPattern) {
+                    findings.push({
+                      type: "sql-injection-reflected",
+                      severity: "CRITICAL",
+                      url: endpointUrl,
+                      parameter: field,
+                      evidence: `SQL Injection confirmed via JS-discovered REST endpoint. Field: ${field}, Payload: ${payload}.`,
+                      cvssScore: 9.8,
+                      cveId: "CWE-89",
+                    });
+                    apiSqliFound = true;
+                    break;
+                  }
+
+                  if (resp.status === 200 && (text.includes("token") || text.includes("authentication") || text.includes("Bearer")) && (payload.includes("OR") || payload.includes("1=1") || payload.includes("--"))) {
+                    findings.push({
+                      type: "sql-injection-reflected",
+                      severity: "CRITICAL",
+                      url: endpointUrl,
+                      parameter: field,
+                      evidence: `SQL Injection Auth Bypass confirmed via JS-discovered REST endpoint. Field: ${field}.`,
+                      cvssScore: 9.8,
+                      cveId: "CWE-89",
+                    });
+                    apiSqliFound = true;
+                    break;
+                  }
+                } catch { /* skip */ }
+              }
+            }
+          }
+        }
+
+        if (!apiSqliFound) {
+          const restSqliResult = await probeRestApiSQLi(normalizedUrl);
+          if (restSqliResult) findings.push(restSqliResult);
+        }
+
+        // Advanced probes (SSTI, blind timing SQLi, prototype pollution) (Phase 10)
+        if (probeTargets.length > 0) {
+          log(`🧪  Advanced probes (SSTI, Blind Timing SQLi, Prototype Pollution, HTML injection)...`);
+          const advancedResults = await Promise.all(
+            probeTargets.flatMap((url) => [
+              probeSSTI(url),
+              probeBlindSQLiTiming(url),
+              probePrototypePollution(url),
+              probeHTMLInjection(url),
+            ])
+          );
+          let sstiFound = false; let blindSqliFound = false;
+          let protoFound = false; let htmlInjFound = false;
+          for (const result of advancedResults) {
+            if (!result) continue;
+            if (result.type === "ssti-injection" && !sstiFound) { findings.push(result); sstiFound = true; }
+            else if (result.type === "sql-injection-blind-timing" && !blindSqliFound) { findings.push(result); blindSqliFound = true; }
+            else if (result.type === "prototype-pollution" && !protoFound) { findings.push(result); protoFound = true; }
+            else if (result.type === "html-injection" && !htmlInjFound) { findings.push(result); htmlInjFound = true; }
+          }
+        }
+
+        // Infrastructure probes on current page's APIs
+        const apiEndpointsForMethods = extractApiEndpoints(renderedHtml, normalizedUrl);
+        const infraResults = await Promise.all([
+          probeHostHeaderInjection(normalizedUrl),
+          probeCORSReflection(normalizedUrl),
+          probeDangerousHTTPMethods(normalizedUrl, apiEndpointsForMethods),
+          probeXXE(normalizedUrl),
+          probeDirectoryListing(normalizedUrl, homepageHtml),
+          probeHTTPSRedirect(normalizedUrl),
+          probeUnauthenticatedAPIAccess(normalizedUrl),
+          probeDebugModeExposure(normalizedUrl),
+          probeNoSQLi(normalizedUrl, jsBundleEndpoints),
+          probeJWTNone(normalizedUrl),
+          probeExposedBackupFiles(normalizedUrl, homepageHtml),
+          probeActiveOpenRedirect(renderedHtml, normalizedUrl),
+          probeIDORWithDualToken(normalizedUrl, jsBundleEndpoints),
+        ]);
+        for (const result of infraResults) {
+          if (result) findings.push(result);
         }
       }
     }
 
-
-    if (probeTargets.length > 0) {
-      log(`🧪  Phase 10: Advanced probes — SSTI, blind timing SQLi, prototype pollution, HTML injection...`);
-      const advancedResults = await Promise.all(
-        probeTargets.flatMap((url) => [
-          probeSSTI(url),
-          probeBlindSQLiTiming(url),
-          probePrototypePollution(url),
-          probeHTMLInjection(url),
-        ])
-      );
-      let sstiFound = false; let blindSqliFound = false;
-      let protoFound = false; let htmlInjFound = false;
-      for (const result of advancedResults) {
-        if (!result) continue;
-        if ((result.type === "ssti-injection") && !sstiFound) { findings.push(result); sstiFound = true; }
-        else if (result.type === "sql-injection-blind-timing" && !blindSqliFound) { findings.push(result); blindSqliFound = true; }
-        else if (result.type === "prototype-pollution" && !protoFound) { findings.push(result); protoFound = true; }
-        else if (result.type === "html-injection" && !htmlInjFound) { findings.push(result); htmlInjFound = true; }
-      }
-    }
-
-    // ── PHASE 3d: INFRASTRUCTURE & PROTOCOL CHECKS ───────────────────────────
-    log(`🌐  Phase 11: Infrastructure checks — CORS reflection, Host header injection, XXE, HTTP methods, debug exposure...`);
-    // Use renderedHtml so we catch API endpoints injected by client-side routing (React Router, etc.)
-    const apiEndpointsForMethods = renderedHtml
-      ? extractApiEndpoints(renderedHtml, targetUrl)
-      : [];
-
-    const infraResults = await Promise.all([
-      probeHostHeaderInjection(targetUrl),
-      probeCORSReflection(targetUrl),
-      probeDangerousHTTPMethods(targetUrl, apiEndpointsForMethods),
-      probeXXE(targetUrl),
-      probeDirectoryListing(targetUrl),
-      probeHTTPSRedirect(targetUrl),
-      probeUnauthenticatedAPIAccess(targetUrl),
-      probeDebugModeExposure(targetUrl),
-      probeNoSQLi(targetUrl, jsBundleEndpoints),
-      probeJWTNone(targetUrl),
-      probeExposedBackupFiles(targetUrl),
-      renderedHtml ? probeActiveOpenRedirect(renderedHtml, targetUrl) : Promise.resolve(null),
-      probeIDORWithDualToken(targetUrl, jsBundleEndpoints),
-    ]);
-
-    // Add SCA findings (array of findings, not single finding)
+    // Run SCA (Software Composition Analysis) at the end
+    log(`🌐  Running Software Composition Analysis...`);
     const scaFindings = await probeSoftwareCompositionAnalysis(targetUrl);
-    const allInfraResults = infraResults.concat(scaFindings);
-
-    for (const result of allInfraResults) {
+    for (const result of scaFindings) {
       if (result) findings.push(result);
     }
 
-    log(`✅  Probing complete — ${findings.length} finding(s) identified across all phases`);
-    log(`🤖  Phase 12: Running AI/RAG analysis on each finding (Cerebras LLM + OWASP knowledge base)...`);
-
-
     // ══════════════════════════════════════════════════════════════════════════
-    // ANALYZING PHASE – RAG + Cerebras AI per finding
+    // ANALYZING PHASE – Awaiting Background AI Reports
     // ══════════════════════════════════════════════════════════════════════════
-
-    await prisma.scan.update({ where: { id: scanId }, data: { status: "ANALYZING" } });
-    log(`📊  Persisting ${findings.length} finding(s) to database with AI remediation reports...`);
-
-    for (let i = 0; i < findings.length; i++) {
-      const pending = findings[i];
-      log(`🔍  Analyzing [${i + 1}/${findings.length}]: ${pending.type} (${pending.severity}) — ${pending.url.substring(0, 60)}`);
-      try {
-        const ragQuery = `${pending.type} ${pending.evidence || ""}`.slice(0, 300);
-        const context = await retrieveContext(ragQuery, 3);
-
-        const report = await generateFixReport({
-          findingType: pending.type,
-          url: pending.url,
-          parameter: pending.parameter,
-          evidence: pending.evidence,
-          cveId: pending.cveId,
-          ragContext: context,
-        });
-
-        const stepsJson = JSON.stringify(report.fixSteps);
-        const codeExampleJson = JSON.stringify(report.codeExample);
-
-        await prisma.finding.create({
-          data: {
-            scanId,
-            type: pending.type,
-            severity: pending.severity,
-            url: pending.url,
-            parameter: pending.parameter ?? null,
-            evidence: pending.evidence ?? null,
-            cvssScore: pending.cvssScore,
-            cveId: pending.cveId ?? null,
-            title: report.title,
-            explanation: report.explanation,
-            fixSteps: stepsJson as any,
-            codeExample: codeExampleJson as any,
-          },
-        });
-      } catch (err) {
-        console.error(`❌ Failed to process finding [${pending.type}]:`, err);
-        log(`⚠️   Warning: AI analysis failed for ${pending.type} — saved raw finding`);
-      }
+    if (backgroundAiPromises.length > 0) {
+      await prisma.scan.update({ where: { id: scanId }, data: { status: "ANALYZING" } });
+      log(`📊  Awaiting ${backgroundAiPromises.length} background AI remediation report(s) to finish...`);
+      await Promise.allSettled(backgroundAiPromises);
     }
 
     await prisma.scan.update({
