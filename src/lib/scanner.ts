@@ -2576,6 +2576,34 @@ async function saveFindingInstantly(
   }
 }
 
+function getDeduplicationKey(item: PendingFinding): string {
+  const type = item.type.toLowerCase();
+  const param = (item.parameter || "").toLowerCase();
+  
+  let normalizedUrl = item.url.toLowerCase();
+  try {
+    const parsed = new URL(item.url);
+    // Replace numeric/UUID path segments to normalize resource URLs
+    const segments = parsed.pathname.split("/").map(seg => {
+      if (/^\d+$/.test(seg)) {
+        return ":id";
+      }
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) {
+        return ":id";
+      }
+      return seg;
+    });
+    parsed.pathname = segments.join("/");
+    parsed.search = "";
+    parsed.hash = "";
+    normalizedUrl = parsed.toString();
+  } catch {
+    // fallback
+  }
+
+  return `${type}:${normalizedUrl}:${param}`;
+}
+
 export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
   const log = (msg: string) => {
     console.log(msg);
@@ -2595,11 +2623,17 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
     const findings: PendingFinding[] = [];
     const backgroundAiPromises: Promise<any>[] = [];
+    const seenKeys = new Set<string>();
 
     const originalPush = findings.push;
     findings.push = function (...items: PendingFinding[]) {
       for (const item of items) {
         if (item) {
+          const key = getDeduplicationKey(item);
+          if (seenKeys.has(key)) {
+            continue;
+          }
+          seenKeys.add(key);
           originalPush.call(this, item);
           saveFindingInstantly(scanId, item, backgroundAiPromises).catch(() => {});
         }
