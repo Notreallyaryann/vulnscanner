@@ -5,6 +5,7 @@ import {
   Shield, 
   Terminal, 
   Globe, 
+  Mail,
   CheckCircle2, 
   AlertTriangle, 
   ArrowRight, 
@@ -68,6 +69,7 @@ export default function LandingPage() {
   
   // State variables
   const [domain, setDomain] = useState("");
+  const [email, setEmail] = useState("");
   const [isScanning, setIsScanning] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [currentProgress, setCurrentProgress] = useState(0);
@@ -84,7 +86,12 @@ export default function LandingPage() {
     if (!domain.trim()) return;
 
     setIsScanning(true);
-    router.push(`/dashboard?domain=${encodeURIComponent(domain)}`);
+    const queryParams = new URLSearchParams();
+    queryParams.set("domain", domain.trim());
+    if (email.trim()) {
+      queryParams.set("email", email.trim());
+    }
+    router.push(`/dashboard?${queryParams.toString()}`);
   };
 
   const toggleFaq = (index: number) => {
@@ -134,23 +141,35 @@ export default function LandingPage() {
           The automated security testing platform built for fast-moving startups and developers. Test headers, scan endpoints, and receive instant copy-paste RAG fix recommendations.
         </p>
 
-        {/* Domain Input Form */}
+         {/* Domain & Email Input Form */}
         {!isScanning ? (
-          <form onSubmit={handleStartScan} className="w-full max-w-lg flex flex-col sm:flex-row gap-3 bg-[#FFFFFF] p-2 rounded-2xl border border-[#E5E5EA] shadow-md mb-8">
-            <div className="flex-1 flex items-center px-3 gap-2">
-              <Globe className="w-4.5 h-4.5 text-[#86868B]" />
-              <input
-                type="text"
-                placeholder="yourdomain.com"
-                value={domain}
-                onChange={(e) => setDomain(e.target.value)}
-                required
-                className="w-full bg-transparent text-sm py-2.5 outline-none font-medium placeholder:text-[#C5C5C7]"
-              />
+          <form onSubmit={handleStartScan} className="w-full max-w-xl bg-[#FFFFFF] p-4 rounded-2xl border border-[#E5E5EA] shadow-md mb-8 space-y-4 text-left">
+            <div className="flex flex-col md:flex-row gap-3">
+              <div className="flex-1 flex items-center px-3 gap-2 bg-[#FBFBFC] border border-[#E5E5EA] rounded-xl focus-within:border-[#D4380D] transition-colors">
+                <Globe className="w-4.5 h-4.5 text-[#86868B]" />
+                <input
+                  type="text"
+                  placeholder="yourdomain.com"
+                  value={domain}
+                  onChange={(e) => setDomain(e.target.value)}
+                  required
+                  className="w-full bg-transparent text-sm py-2.5 outline-none font-medium placeholder:text-[#C5C5C7]"
+                />
+              </div>
+              <div className="flex-1 flex items-center px-3 gap-2 bg-[#FBFBFC] border border-[#E5E5EA] rounded-xl focus-within:border-[#D4380D] transition-colors">
+                <Mail className="w-4.5 h-4.5 text-[#86868B]" />
+                <input
+                  type="email"
+                  placeholder="email@example.com (optional)"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="w-full bg-transparent text-sm py-2.5 outline-none font-medium placeholder:text-[#C5C5C7]"
+                />
+              </div>
             </div>
             <button
               type="submit"
-              className="px-6 py-3 rounded-xl bg-[#D4380D] hover:bg-[#b02f0a] text-white text-sm font-bold shadow-md shadow-[#D4380D]/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full py-3 rounded-xl bg-[#D4380D] hover:bg-[#b02f0a] text-white text-sm font-bold shadow-md shadow-[#D4380D]/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
             >
               Scan Domain
               <ArrowRight className="w-4 h-4" />

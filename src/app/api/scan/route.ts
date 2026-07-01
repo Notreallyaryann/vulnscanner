@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   try {
-    const { url } = await req.json();
+    const { url, email } = await req.json();
 
     if (!url) {
       return new NextResponse("URL is required", { status: 400 });
@@ -27,6 +27,7 @@ export async function POST(req: NextRequest) {
     const scan = await prisma.scan.create({
       data: {
         targetUrl: cleanUrl,
+        email: email ? String(email).trim() : null,
         status: "PENDING",
       },
     });

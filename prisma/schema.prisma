@@ -13,6 +13,7 @@ datasource db {
 model Scan {
   id          String     @id @default(cuid())
   targetUrl   String
+  email       String?
   status      ScanStatus @default(PENDING)
   createdAt   DateTime   @default(now())
   completedAt DateTime?

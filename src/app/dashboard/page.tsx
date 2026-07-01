@@ -5,6 +5,7 @@ import {
   Shield, 
   Terminal, 
   Globe, 
+  Mail,
   AlertTriangle, 
   CheckCircle, 
   Activity, 
@@ -173,6 +174,7 @@ export default function DashboardPage() {
 
   // Scanner Input States
   const [targetUrl, setTargetUrl] = useState("");
+  const [email, setEmail] = useState("");
   const [isScanning, setIsScanning] = useState(false);
   const [currentScanId, setCurrentScanId] = useState<string | null>(null);
 
@@ -211,11 +213,15 @@ export default function DashboardPage() {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       const autoDomain = params.get("domain");
+      const autoEmail = params.get("email");
       if (autoDomain) {
         scanInitiated.current = true;
         // Clean the URL param immediately to prevent re-triggering on any remount
         window.history.replaceState({}, "", "/dashboard");
         setTargetUrl(autoDomain);
+        if (autoEmail) {
+          setEmail(autoEmail);
+        }
         // Auto-trigger the scan after state is set
         setTimeout(async () => {
           try {
@@ -229,7 +235,7 @@ export default function DashboardPage() {
             const response = await fetch("/api/scan", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ url: cleanUrl }),
+              body: JSON.stringify({ url: cleanUrl, email: autoEmail || undefined }),
             });
             if (!response.ok) {
               throw new Error(await response.text());
@@ -347,7 +353,7 @@ export default function DashboardPage() {
       const response = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: targetUrl }),
+        body: JSON.stringify({ url: targetUrl, email: email ? email.trim() : undefined }),
       });
       if (!response.ok) {
         throw new Error(await response.text());
@@ -362,6 +368,7 @@ export default function DashboardPage() {
       setSelectedFinding(null);
       
       setTargetUrl("");
+      setEmail("");
       loadScans();
     } catch (err: any) {
       alert(err.message || "Failed to trigger scan.");
@@ -582,23 +589,36 @@ export default function DashboardPage() {
                     <p className="text-xs text-stone-600 mb-6">20+ real attack probes — SQLi, XSS, SSTI, XXE, CORS, host header, prototype pollution, blind timing injection — plus AI-powered RAG remediation.</p>
                   </div>
 
-                  <form onSubmit={handleLaunchScan} className="flex gap-3">
-                    <div className="relative flex-1">
-                      <Globe className="absolute left-3 top-3.5 w-4 h-4 text-stone-400" />
-                      <input
-                        type="text"
-                        value={targetUrl}
-                        onChange={(e) => setTargetUrl(e.target.value)}
-                        placeholder="e.g. example.com or https://yoursite.com"
-                        required
-                        disabled={isScanning}
-                        className="w-full bg-[#FAF8F5] border border-stone-200 hover:border-stone-300 focus:border-[#D4380D] focus:ring-1 focus:ring-[#D4380D] text-stone-900 rounded-lg pl-10 pr-4 py-2.5 text-sm outline-none transition-all placeholder:text-stone-450"
-                      />
+                   <form onSubmit={handleLaunchScan} className="space-y-3">
+                    <div className="flex flex-col sm:flex-row gap-3">
+                      <div className="relative flex-1">
+                        <Globe className="absolute left-3 top-3 w-4 h-4 text-stone-400" />
+                        <input
+                          type="text"
+                          value={targetUrl}
+                          onChange={(e) => setTargetUrl(e.target.value)}
+                          placeholder="e.g. example.com or https://yoursite.com"
+                          required
+                          disabled={isScanning}
+                          className="w-full bg-[#FAF8F5] border border-stone-200 hover:border-stone-300 focus:border-[#D4380D] focus:ring-1 focus:ring-[#D4380D] text-stone-900 rounded-lg pl-10 pr-4 py-2 text-sm outline-none transition-all placeholder:text-stone-450"
+                        />
+                      </div>
+                      <div className="relative flex-1">
+                        <Mail className="absolute left-3 top-3 w-4 h-4 text-stone-400" />
+                        <input
+                          type="email"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="email@example.com (optional report)"
+                          disabled={isScanning}
+                          className="w-full bg-[#FAF8F5] border border-stone-200 hover:border-stone-300 focus:border-[#D4380D] focus:ring-1 focus:ring-[#D4380D] text-stone-900 rounded-lg pl-10 pr-4 py-2 text-sm outline-none transition-all placeholder:text-stone-450"
+                        />
+                      </div>
                     </div>
                     <button
                       type="submit"
                       disabled={isScanning}
-                      className="px-6 py-2.5 rounded-lg text-sm font-semibold bg-[#D4380D] hover:bg-[#B5300A] text-white transition-all shadow-md flex items-center gap-2 disabled:opacity-50 cursor-pointer"
+                      className="w-full py-2.5 rounded-lg text-sm font-semibold bg-[#D4380D] hover:bg-[#B5300A] text-white transition-all shadow-md flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
                     >
                       {isScanning ? (
                         <>

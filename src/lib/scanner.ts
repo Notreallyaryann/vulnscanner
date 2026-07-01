@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { retrieveContext } from "./rag";
 import { generateFixReport } from "./cerebras";
 import { emitLog, cleanupScan } from "./scan-logger";
+import { sendScanReportEmail } from "./mail";
 import { renderWithBrowser } from "./browser";
 import { runNmapScan, type NmapFinding } from "./nmap";
 // FIX #1: AST parsing
@@ -3612,7 +3613,7 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
       await Promise.allSettled(backgroundAiPromises);
     }
 
-    await prisma.scan.update({
+    const updatedScan = await prisma.scan.update({
       where: { id: scanId },
       data: { status: "COMPLETED", completedAt: new Date() },
     });
@@ -3620,6 +3621,13 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     log(`🎉  Scan complete — ${findings.length} finding(s) saved with AI remediation reports!`);
     log(`📋  View results in the Audits Dashboard. Export JSON available on the findings screen.`);
     cleanupScan(scanId);
+
+    if (updatedScan.email) {
+      log(`📨  Sending JSON report to ${updatedScan.email}...`);
+      sendScanReportEmail(scanId, updatedScan.email).catch((e) => {
+        console.error("Failed to send report email:", e);
+      });
+    }
   } catch (scanErr) {
     console.error(`❌ Scan [${scanId}] failed:`, scanErr);
     let errorMsg = "An unexpected error occurred.";
@@ -3632,8 +3640,19 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     }
     log(`❌  Scan failed: ${errorMsg}`);
     cleanupScan(scanId);
-    await prisma.scan
-      .update({ where: { id: scanId }, data: { status: "FAILED" } })
-      .catch((e) => console.error("Failed to set FAILED status:", e));
+    try {
+      const updatedScan = await prisma.scan.update({
+        where: { id: scanId },
+        data: { status: "FAILED" }
+      });
+      if (updatedScan.email) {
+        log(`📨  Sending failure notification email to ${updatedScan.email}...`);
+        sendScanReportEmail(scanId, updatedScan.email).catch((e) => {
+          console.error("Failed to send report email after failure:", e);
+        });
+      }
+    } catch (e) {
+      console.error("Failed to set FAILED status:", e);
+    }
   }
 }
