@@ -83,7 +83,7 @@ export async function sendScanReportEmail(scanId: string, email: string) {
     const info = await mailTransporter.sendMail({
       from: fromAddress,
       to: email,
-      subject: `🛡️ VulnScanner Audit Report: ${scan.targetUrl}`,
+      subject: ` VulnScanner Audit Report: ${scan.targetUrl}`,
       text: `Hello,\n\nYour security audit for ${scan.targetUrl} has completed with status: ${scan.status}.\n\nTotal Findings: ${report.summary.totalFindings} (Critical: ${report.summary.critical}, High: ${report.summary.high}, Medium: ${report.summary.medium}, Low: ${report.summary.low})\n\nPlease find the detailed JSON audit report attached to this email.\n\nBest regards,\nThe VulnScanner Team`,
       html: `
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e5e5ea; border-radius: 8px;">
