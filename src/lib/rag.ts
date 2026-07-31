@@ -22,41 +22,54 @@ export async function retrieveContext(
   queryText: string,
   topK: number = 5
 ): Promise<string> {
-  const embedding = await generateEmbedding(queryText);
-  const vectorString = `[${embedding.join(",")}]`;
+  try {
+    const embedding = await generateEmbedding(queryText);
+    // Build vector string from floats — safe to interpolate (all values are numbers,
+    // not user-supplied strings), but we still use the tagged-template form for
+    // the text parameters to be consistent and future-proof.
+    const vectorStr = `[${embedding.join(",")}]`;
 
-  // pgvector cosine similarity query via Prisma raw SQL
-  // The <=> operator = cosine distance (lower = more similar)
-  const chunks = await prisma.$queryRawUnsafe<KnowledgeChunkResult[]>(`
-    SELECT title, content, source
-    FROM "KnowledgeChunk"
-    ORDER BY embedding::text::vector <=> '[${embedding.join(",")}]'::vector
-    LIMIT ${topK}
-  `);
+    // pgvector cosine similarity via Prisma tagged-template raw SQL.
+    // $queryRaw safely parameterises ${vectorStr} as a $1 placeholder.
+    const chunks = await prisma.$queryRaw<KnowledgeChunkResult[]>`
+      SELECT title, content, source
+      FROM "KnowledgeChunk"
+      ORDER BY embedding::vector <=> ${vectorStr}::vector
+      LIMIT ${topK}
+    `;
 
-  if (chunks.length === 0) {
-    return "No relevant context found in knowledge base.";
+    if (chunks.length === 0) {
+      return "No relevant context found in knowledge base.";
+    }
+
+    // Format chunks into a single context string for the LLM prompt.
+    // Each chunk content is capped at 400 chars; total context capped at 1500 chars
+    // to prevent the downstream Cerebras prompt from exceeding the token limit.
+    const MAX_CHUNK_CHARS = 400;
+    const MAX_TOTAL_CHARS = 1500;
+
+    const combined = chunks
+      .map((c) => {
+        const truncated =
+          c.content.length > MAX_CHUNK_CHARS
+            ? c.content.slice(0, MAX_CHUNK_CHARS) + "…"
+            : c.content;
+        return `[${c.source.toUpperCase()}] ${c.title}\n${truncated}`;
+      })
+      .join("\n\n---\n\n");
+
+    return combined.length > MAX_TOTAL_CHARS
+      ? combined.slice(0, MAX_TOTAL_CHARS) + "…"
+      : combined;
+  } catch (error: any) {
+    // Handle pgvector not installed or other database errors
+    if (error.code === '42704' || error.message?.includes('type "vector" does not exist')) {
+      console.warn('⚠️  pgvector extension not installed. RAG context retrieval disabled.');
+      return "pgvector extension not available. Using general OWASP guidelines instead.";
+    }
+    console.error('Error in retrieveContext:', error);
+    return "Error retrieving context from knowledge base. Using general guidelines instead.";
   }
-
-  // Format chunks into a single context string for the LLM prompt.
-  // Each chunk content is capped at 400 chars; total context capped at 1500 chars
-  // to prevent the downstream Cerebras prompt from exceeding the token limit.
-  const MAX_CHUNK_CHARS = 400;
-  const MAX_TOTAL_CHARS = 1500;
-
-  const combined = chunks
-    .map((c) => {
-      const truncated =
-        c.content.length > MAX_CHUNK_CHARS
-          ? c.content.slice(0, MAX_CHUNK_CHARS) + "…"
-          : c.content;
-      return `[${c.source.toUpperCase()}] ${c.title}\n${truncated}`;
-    })
-    .join("\n\n---\n\n");
-
-  return combined.length > MAX_TOTAL_CHARS
-    ? combined.slice(0, MAX_TOTAL_CHARS) + "…"
-    : combined;
 }
 
 /**
@@ -67,26 +80,36 @@ export async function searchPastFindings(
   queryText: string,
   topK: number = 10
 ) {
-  const embedding = await generateEmbedding(queryText);
-  const vectorString = `[${embedding.join(",")}]`;
+  try {
+    const embedding = await generateEmbedding(queryText);
+    const vectorStr = `[${embedding.join(",")}]`;
 
-  const findings = await prisma.$queryRawUnsafe<PastFindingResult[]>(`
-    SELECT 
-      f.id,
-      f.type,
-      f.severity,
-      f.url,
-      f.title,
-      f."scanId" as scan_id,
-      f."createdAt" as created_at,
-      f.embedding::text::vector <=> '[${embedding.join(",")}]'::vector as distance
-    FROM "Finding" f
-    JOIN "Scan" s ON s.id = f."scanId"
-    ORDER BY distance ASC
-    LIMIT ${topK}
-  `);
+    const findings = await prisma.$queryRaw<PastFindingResult[]>`
+      SELECT
+        f.id,
+        f.type,
+        f.severity,
+        f.url,
+        f.title,
+        f."scanId" as scan_id,
+        f."createdAt" as created_at,
+        f.embedding::vector <=> ${vectorStr}::vector as distance
+      FROM "Finding" f
+      JOIN "Scan" s ON s.id = f."scanId"
+      ORDER BY distance ASC
+      LIMIT ${topK}
+    `;
 
-  return findings;
+    return findings;
+  } catch (error: any) {
+    // Handle pgvector not installed or other database errors
+    if (error.code === '42704' || error.message?.includes('type "vector" does not exist')) {
+      console.warn('⚠️  pgvector extension not installed. Semantic search disabled.');
+      return [];
+    }
+    console.error('Error in searchPastFindings:', error);
+    return [];
+  }
 }
 
 
@@ -95,20 +118,33 @@ export async function storeKnowledgeChunk(params: {
   title: string;
   content: string;
 }) {
-  const embedding = await generateEmbedding(
-    `${params.title} ${params.content}`
-  );
-  const vectorString = `[${embedding.join(",")}]`;
+  try {
+    const embedding = await generateEmbedding(
+      `${params.title} ${params.content}`
+    );
+    const vectorStr = `[${embedding.join(",")}]`;
 
-  await prisma.$executeRawUnsafe(`
-    INSERT INTO "KnowledgeChunk" (id, source, title, content, embedding, "createdAt")
-    VALUES (
-      gen_random_uuid()::text,
-      '${params.source}',
-      '${params.title.replace(/'/g, "''")}',
-      '${params.content.replace(/'/g, "''")}',
-      '[${embedding.join(",")}]'::vector,
-      NOW()
-    )
-  `);
+    // Use Prisma's tagged-template $executeRaw so that source, title, and content
+    // are sent as safe $N parameterised values — never interpolated into SQL.
+    // This eliminates the SQL injection vulnerability that the manual quote-escape
+    // approach had (e.g., Unicode quote variants, multi-byte encoding bypasses).
+    await prisma.$executeRaw`
+      INSERT INTO "KnowledgeChunk" (id, source, title, content, embedding, "createdAt")
+      VALUES (
+        gen_random_uuid()::text,
+        ${params.source},
+        ${params.title},
+        ${params.content},
+        ${vectorStr}::vector,
+        NOW()
+      )
+    `;
+  } catch (error: any) {
+    // Handle pgvector not installed or other database errors
+    if (error.code === '42704' || error.message?.includes('type "vector" does not exist')) {
+      console.warn('⚠️  pgvector extension not installed. Knowledge chunk storage disabled.');
+      return;
+    }
+    console.error('Error in storeKnowledgeChunk:', error);
+  }
 }

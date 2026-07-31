@@ -32,6 +32,10 @@ model Finding {
   evidence    String?
   cvssScore   Float?
   cveId       String?
+  // ── False-positive reduction ────────────────────────────────────────────
+  confidence      Float    @default(0.85) // 0.0-1.0: how verified the finding is
+  validationSteps Json?                   // proof trail of confirmation steps
+  isVerified      Boolean  @default(false) // true = multi-step confirmed
   // RAG-generated fix
   title       String?
   explanation String?

@@ -9,13 +9,15 @@ const nextConfig: NextConfig = {
   },
 
 
-  experimental: {
-    serverComponentsExternalPackages: [
-      '@xenova/transformers',
-      'onnxruntime-node',
-      'sharp',
-    ],
-  },
+  // Next.js 15: serverExternalPackages replaces experimental.serverComponentsExternalPackages
+  serverExternalPackages: [
+    '@xenova/transformers',
+    'onnxruntime-node',
+    'sharp',
+    'tough-cookie',
+    '@apidevtools/swagger-parser',
+    'jsonwebtoken',
+  ],
 
   turbopack: {
     resolveAlias: {

@@ -4,7 +4,7 @@ const { chromium } = require("playwright");
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3002;
 
 // ─── Chromium launch args safe for Docker and server environments ─────────────
 const CHROMIUM_ARGS = [
@@ -103,7 +103,7 @@ app.post("/render", async (req, res) => {
     // Stage 3: Let deferred JS finish
     await page.waitForFunction(() => document.readyState === "complete", {
       timeout: 3000,
-    }).catch(() => {});
+    }).catch(() => { });
 
     // Stage 4: Extract rendered HTML
     const html = await page.content();
@@ -113,31 +113,108 @@ app.post("/render", async (req, res) => {
       .evaluate(() => {
         const detected = [];
         const w = window;
-        if (w.__NEXT_DATA__ || w.next) detected.push("Next.js");
-        if (w.__nuxt__ || w.$nuxt || w.__NUXT__) detected.push("Nuxt.js");
-        if (w.angular || document.querySelector("[ng-version]")) detected.push("Angular");
-        if (w.__VUE__ || w.Vue) detected.push("Vue.js");
-        if (w.React || w.__REACT_DEVTOOLS_GLOBAL_HOOK__) detected.push("React");
+
+        // Next.js
+        if (w.__NEXT_DATA__ || w.next || w.__NEXT_P || document.querySelector("script[src*='/_next/']") || document.querySelector("next-route-announcer, [data-next-page]")) {
+          detected.push("Next.js");
+        }
+
+        // Nuxt.js
+        if (w.__nuxt__ || w.$nuxt || w.__NUXT__ || document.querySelector("script[src*='/_nuxt/']")) {
+          detected.push("Nuxt.js");
+        }
+
+        // Angular (v1, v2-v18+)
+        if (w.angular || w.ng || w.getAllAngularRootElements ||
+          document.querySelector("[ng-version], [ng-app], [ng-server-context], [ng-component], app-root, router-outlet, [ng-reflect-model], [_nghost-c0], [_ngcontent-c0]") ||
+          document.querySelector("script[src*='angular'], script[src*='main-es'], script[src*='polyfills']")) {
+          detected.push("Angular");
+        }
+
+        // Vue.js
+        if (w.__VUE__ || w.Vue || w.__vue__ || document.querySelector("[data-v-], [v-cloak], [v-is]") || document.querySelector("script[src*='vue']")) {
+          detected.push("Vue.js");
+        }
+
+        // React (including React 17/18/19 DOM fiber inspection)
+        const hasReactFiber = () => {
+          try {
+            const els = [document.body, document.getElementById("root"), document.getElementById("__next"), document.querySelector("main"), document.querySelector("div")].filter(Boolean);
+            return els.some(el => el && Object.keys(el).some(k => k.startsWith("__react") || k.startsWith("_react")));
+          } catch { return false; }
+        };
+        if (w.React || w.__REACT_DEVTOOLS_GLOBAL_HOOK__ || document.querySelector("[data-reactroot], [data-reactid], [data-react-checksum]") || hasReactFiber() || document.querySelector("script[src*='react']")) {
+          detected.push("React");
+        }
+
+        // Python Frameworks (Django / FastAPI)
+        if (document.querySelector("input[name='csrfmiddlewaretoken']") || document.cookie.includes("csrftoken") || document.querySelector("a[href*='/admin/login']")) {
+          detected.push("Django");
+        }
+        if (document.querySelector("a[href*='/docs'], a[href*='/redoc'], a[href*='/openapi.json']")) {
+          detected.push("FastAPI");
+        }
+
+        // Remix
         if (w.__remix_server_manifest__ || w.__remixContext) detected.push("Remix");
+
+        // Gatsby
         if (w.__gatsby) detected.push("Gatsby");
-        if (w.__sveltekit_dev || document.querySelector("[data-sveltekit-preload-data]"))
+
+        // Svelte / SvelteKit
+        if (w.__svelte || w.__sveltekit_dev || document.querySelector("[data-sveltekit-preload-data], [class*='svelte-']") || document.querySelector("script[src*='_app/immutable']")) {
           detected.push("SvelteKit");
-        if (document.querySelector("astro-page") || w.__astro_hmr)
-          detected.push("Astro");
+        }
+
+        // Astro
+        if (document.querySelector("astro-page") || w.__astro_hmr) detected.push("Astro");
+
+        // HTMX, Alpine, Ember, Backbone, jQuery
         if (w.htmx) detected.push("HTMX");
         if (w.Alpine) detected.push("Alpine.js");
         if (w.Ember) detected.push("Ember.js");
         if (w.Backbone) detected.push("Backbone.js");
         if (w.jQuery || w.$?.fn?.jquery) detected.push("jQuery");
-        return detected;
+
+        // PHP / Laravel
+        if (document.querySelector("input[name='_token']") || document.cookie.includes("laravel_session")) {
+          detected.push("Laravel");
+        }
+
+        // Spring / Java
+        if (document.cookie.includes("JSESSIONID")) detected.push("Spring");
+
+        // ASP.NET
+        if (document.querySelector("input[name='__VIEWSTATE']") || document.cookie.includes("ASP.NET")) detected.push("ASP.NET");
+
+        return Array.from(new Set(detected));
       })
       .catch(() => []);
 
     // Stage 6: Extract client-side discovered links for SPA route coverage
     const discoveredLinks = await page
       .evaluate((baseHost) => {
-        return Array.from(document.querySelectorAll("a[href]"))
-          .map((a) => a.href)
+        const links = new Set();
+        document.querySelectorAll("a[href], [routerlink], [to], [data-href], [ng-reflect-router-link]").forEach((el) => {
+          const val = el.getAttribute("href") || el.getAttribute("routerlink") || el.getAttribute("to") || el.getAttribute("data-href") || el.getAttribute("ng-reflect-router-link");
+          if (!val) return;
+          const clean = val.replace(/^\[|\]|['"]/g, "").trim();
+          if (!clean || clean.startsWith("javascript:") || clean.startsWith("mailto:")) return;
+          try {
+            if (clean.startsWith("http://") || clean.startsWith("https://")) {
+              links.add(clean);
+            } else if (clean.startsWith("#/")) {
+              links.add(new URL(clean, window.location.origin).href);
+            } else if (clean.startsWith("/")) {
+              links.add(new URL(clean, window.location.origin).href);
+            } else {
+              links.add(new URL("/#/" + clean, window.location.origin).href);
+              links.add(new URL("/" + clean, window.location.origin).href);
+            }
+          } catch { }
+        });
+
+        return Array.from(links)
           .filter((href) => {
             try {
               const u = new URL(href);
@@ -165,7 +242,7 @@ app.post("/render", async (req, res) => {
     res.status(500).json({ error: error.message || "Rendering failed" });
   } finally {
     if (browser) {
-      await browser.close().catch(() => {});
+      await browser.close().catch(() => { });
     }
   }
 });

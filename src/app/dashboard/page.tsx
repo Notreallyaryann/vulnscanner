@@ -103,7 +103,8 @@ const OWASP_MAP: Record<string, { code: string; name: string; color: string }> =
   "open-port-info":               { code: "A05", name: "Security Misconfiguration", color: "#64748b" },
   "service-version-disclosure":   { code: "A06", name: "Outdated Components", color: "#6366f1" },
   "default-service-exposed":      { code: "A05", name: "Security Misconfiguration", color: "#a855f7" },
-  "cdn-edge-masking":             { code: "A05", name: "Security Misconfiguration", color: "#0ea5e9" },
+  // API Surface Inventory
+  "api-endpoint-discovered":      { code: "API", name: "API Endpoint Discovered", color: "#3b82f6" },
 };
 
 function getOWASP(findingType: string) {
@@ -177,6 +178,7 @@ export default function DashboardPage() {
   const [email, setEmail] = useState("");
   const [isScanning, setIsScanning] = useState(false);
   const [currentScanId, setCurrentScanId] = useState<string | null>(null);
+  const [isStopping, setIsStopping] = useState(false);
 
   // Live scan log terminal
   const [scanLogs, setScanLogs] = useState<string[]>([]);
@@ -188,6 +190,7 @@ export default function DashboardPage() {
   const [scans, setScans] = useState<ScanSummary[]>([]);
   const [selectedScan, setSelectedScan] = useState<any | null>(null);
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
+  const [findingCategoryFilter, setFindingCategoryFilter] = useState<"all" | "api" | "vulnerabilities">("all");
 
   // RAG Chat States
   const [chatInput, setChatInput] = useState("");
@@ -374,6 +377,30 @@ export default function DashboardPage() {
       alert(err.message || "Failed to trigger scan.");
       setIsScanning(false);
       setCurrentScanId(null);
+    }
+  };
+
+  const handleStopScan = async () => {
+    const scanId = selectedScan?.id || currentScanId;
+    if (!scanId) return;
+
+    if (!confirm("Are you sure you want to stop the current scan?")) return;
+
+    setIsStopping(true);
+    try {
+      const response = await fetch(`/api/scan/${scanId}/stop`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || "Failed to stop the scan.");
+      }
+      setScanLogs((prev) => [...prev, "🛑 Stop requested. Cancelling on next phase boundary..."]);
+      loadScans();
+    } catch (err: any) {
+      alert(err.message || "Failed to request scan cancellation.");
+    } finally {
+      setIsStopping(false);
     }
   };
 
@@ -669,6 +696,27 @@ export default function DashboardPage() {
                         </p>
                       )}
 
+                      {["PENDING", "CRAWLING", "SCANNING", "ANALYZING"].includes(selectedScan.status) && (
+                        <button
+                          type="button"
+                          onClick={handleStopScan}
+                          disabled={isStopping}
+                          className="w-full py-2 rounded-lg text-xs font-bold bg-red-50 border border-red-200 text-red-700 hover:bg-red-650 hover:text-white transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          {isStopping ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              Stopping...
+                            </>
+                          ) : (
+                            <>
+                              <X className="w-3.5 h-3.5" />
+                              Stop Scan
+                            </>
+                          )}
+                        </button>
+                      )}
+
                       {/* Integrated logs on the dashboard directly */}
                       {scanLogs.length > 0 && (
                         <div className="mt-3 pt-3 border-t border-stone-200/80 space-y-1.5 max-h-[220px] overflow-y-auto font-mono text-[11px]">
@@ -740,6 +788,34 @@ export default function DashboardPage() {
                       </div>
                     );
                   })()}
+
+                  {/* API Surface Summary Card */}
+                  {selectedScan.findings && selectedScan.findings.some((f: Finding) => f.type === "api-endpoint-discovered") && (
+                    <div className="xl:col-span-12 p-4 bg-blue-50/70 border border-blue-200/80 rounded-xl flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2.5 bg-blue-600 text-white rounded-lg">
+                          <Server className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h4 className="text-sm font-bold text-blue-950">Discovered API Surface</h4>
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-200 text-blue-900">
+                              {selectedScan.findings.filter((f: Finding) => f.type === "api-endpoint-discovered").length} Endpoints Active
+                            </span>
+                          </div>
+                          <p className="text-xs text-blue-800/80">
+                            Endpoints extracted via JS bundle scraping, OpenAPI specs, and network interception. Click "API" filter below to inspect endpoints & parameters.
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setFindingCategoryFilter("api")}
+                        className="px-3.5 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-all flex items-center gap-1.5 shrink-0"
+                      >
+                        <Server className="w-3.5 h-3.5" /> View API Surface
+                      </button>
+                    </div>
+                  )}
                   
                   {/* Left Column: Alerts List */}
                   <div className="xl:col-span-4 space-y-3">
@@ -748,6 +824,35 @@ export default function DashboardPage() {
                       <span className="px-2 py-0.5 text-xs rounded bg-red-50 border border-red-200 text-red-700 font-mono font-bold">
                         {selectedScan.findings?.length || 0} Issues
                       </span>
+                    </div>
+
+                    {/* Filter Category Toggle Buttons */}
+                    <div className="flex items-center gap-1 bg-stone-100 p-1 rounded-lg text-[11px] font-medium border border-stone-200">
+                      <button
+                        onClick={() => setFindingCategoryFilter("all")}
+                        className={`flex-1 py-1 px-2 rounded-md transition-all ${
+                          findingCategoryFilter === "all" ? "bg-white text-stone-900 shadow-sm font-bold" : "text-stone-500 hover:text-stone-800"
+                        }`}
+                      >
+                        All ({selectedScan.findings?.length || 0})
+                      </button>
+                      <button
+                        onClick={() => setFindingCategoryFilter("vulnerabilities")}
+                        className={`flex-1 py-1 px-2 rounded-md transition-all ${
+                          findingCategoryFilter === "vulnerabilities" ? "bg-white text-stone-900 shadow-sm font-bold" : "text-stone-500 hover:text-stone-800"
+                        }`}
+                      >
+                        Vulns ({selectedScan.findings?.filter((f: Finding) => f.type !== "api-endpoint-discovered").length || 0})
+                      </button>
+                      <button
+                        onClick={() => setFindingCategoryFilter("api")}
+                        className={`flex-1 py-1 px-2 rounded-md transition-all flex items-center justify-center gap-1 ${
+                          findingCategoryFilter === "api" ? "bg-blue-600 text-white shadow-sm font-bold" : "text-blue-600 hover:bg-blue-50"
+                        }`}
+                      >
+                        <Server className="w-3 h-3" />
+                        API ({selectedScan.findings?.filter((f: Finding) => f.type === "api-endpoint-discovered" || /api|rest|graphql|openapi|json/i.test(f.type)).length || 0})
+                      </button>
                     </div>
 
                     {/* Severity Stats Bar */}
@@ -784,7 +889,17 @@ export default function DashboardPage() {
 
                     <div className="space-y-2.5 max-h-[540px] overflow-y-auto pr-1">
                       {selectedScan.findings && selectedScan.findings.length > 0 ? (
-                        selectedScan.findings.map((f: Finding) => {
+                        selectedScan.findings
+                          .filter((f: Finding) => {
+                            if (findingCategoryFilter === "api") {
+                              return f.type === "api-endpoint-discovered" || /api|rest|graphql|openapi|json|nosqli/i.test(f.type);
+                            }
+                            if (findingCategoryFilter === "vulnerabilities") {
+                              return f.type !== "api-endpoint-discovered";
+                            }
+                            return true;
+                          })
+                          .map((f: Finding) => {
                           const owasp = getOWASP(f.type);
                           return (
                           <div

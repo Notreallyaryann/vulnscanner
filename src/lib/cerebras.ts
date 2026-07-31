@@ -197,23 +197,69 @@ function getMockFixReport(params: {
         };
     }
 
-    // Default fallback for other header issues (HSTS, MIME sniffing)
+    if (type.includes("ssti")) {
+        return {
+            title: "Server-Side Template Injection (SSTI)",
+            explanation: "The application evaluates user-supplied input inside a server-side template engine without sanitization. An attacker can execute arbitrary code on the server by crafting template directives.",
+            attackSimulation: "1. The attacker injects template syntax (e.g., {{7*7}}) into input parameters.\n2. The server evaluates the expression and returns the output (49).\n3. The attacker escalates to remote code execution.",
+            fixSteps: [
+                "Avoid passing user input directly into template render engines.",
+                "Use safe context variables and strict output encoding."
+            ],
+            codeExample: {
+                language: "javascript",
+                vulnerable: "// VULNERABLE: Rendering raw user input as template string\nnunjucks.renderString(req.query.name);",
+                fixed: "// FIXED: Pass input as context variable to pre-compiled template\nnunjucks.render('hello.html', { name: req.query.name });"
+            },
+            references: [
+                "https://owasp.org/www-community/attacks/Command_Injection",
+                "https://cwe.mitre.org/data/definitions/1336.html"
+            ]
+        };
+    }
+
+    if (type.includes("file-upload")) {
+        return {
+            title: "Insecure File Upload Vulnerability",
+            explanation: "The file upload handler does not properly restrict or sanitize uploaded files, potentially allowing attackers to upload webshells or arbitrary files.",
+            attackSimulation: "1. Attacker uploads a file with an executable extension or path traversal sequence.\n2. The server stores or executes the payload.",
+            fixSteps: [
+                "Validate file extension, MIME type, and magic bytes server-side.",
+                "Store uploaded files outside web root or on isolated storage buckets (S3)."
+            ],
+            codeExample: {
+                language: "typescript",
+                vulnerable: "// VULNERABLE: Unvalidated file upload",
+                fixed: "// FIXED: Validate allowed extensions and sanitize file names"
+            },
+            references: [
+                "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload",
+                "https://cwe.mitre.org/data/definitions/434.html"
+            ]
+        };
+    }
+
+    // Default fallback with human-readable title
+    const humanTitle = params.findingType
+        .replace(/[-_]+/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+
     return {
-        title: `Missing Security Header: ${params.findingType}`,
-        explanation: `The application response is missing a crucial security header (${params.findingType}). Security headers protect browsers from clickjacking, MIME sniffing, protocol downgrades, and other browser-side attacks.`,
-        attackSimulation: `1. An attacker intercepts connection packets or tricks a user into accessing the application via HTTP instead of HTTPS.\n2. Since HSTS/MIME protection headers are absent, the browser behaves unsafely, executing downgraded scripts.`,
+        title: humanTitle,
+        explanation: `Security finding detected: ${humanTitle} at ${params.url}.`,
+        attackSimulation: `1. An attacker targets ${params.url} with crafted requests to exploit ${humanTitle}.`,
         fixSteps: [
-            `Add the '${params.findingType}' header with safe default values to all server responses.`,
-            "Verify all HTTP traffic is automatically redirected to HTTPS."
+            `Review and secure the implementation for ${humanTitle} on ${params.url}.`,
+            "Apply least privilege and strict input validation server-side."
         ],
         codeExample: {
             language: "typescript",
-            vulnerable: "// VULNERABLE: Server responses lack standard security headers.",
-            fixed: `// FIXED: Set complete security headers in next.config.ts\nexport default {\n  async headers() {\n    return [\n      {\n        source: '/(.*)',\n        headers: [\n          { key: 'Strict-Transport-Security', value: 'max-age=63072000; includeSubDomains; preload' },\n          { key: 'X-Content-Type-Options', value: 'nosniff' }\n        ]\n      }\n    ];\n  }\n};`
+            vulnerable: "// VULNERABLE: Unvalidated or insecure code logic",
+            fixed: "// FIXED: Apply security controls and input validation"
         },
         references: [
-            "https://owasp.org/www-project-secure-headers/",
-            "https://cwe.mitre.org/data/definitions/693.html"
+            "https://owasp.org/www-project-top-ten/",
+            "https://cwe.mitre.org/"
         ]
     };
 }
@@ -277,8 +323,9 @@ Respond with a JSON object containing exactly these fields:
     try {
         response = await cerebrasRequest({
             model: MODEL,
-            max_tokens: 800,
+            max_tokens: 2500, // Increased to prevent truncation of complex JSON output
             temperature: 0.2,
+            response_format: { type: "json_object" },
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userPrompt },

