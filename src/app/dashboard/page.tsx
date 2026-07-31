@@ -176,6 +176,9 @@ export default function DashboardPage() {
   // Scanner Input States
   const [targetUrl, setTargetUrl] = useState("");
   const [email, setEmail] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [showAuthFields, setShowAuthFields] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [currentScanId, setCurrentScanId] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
@@ -215,16 +218,28 @@ export default function DashboardPage() {
     
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
+      const paramScanId = params.get("scanId");
+      if (paramScanId) {
+        window.history.replaceState({}, "", "/dashboard");
+        handleSelectScan(paramScanId);
+        return;
+      }
+
       const autoDomain = params.get("domain");
       const autoEmail = params.get("email");
+      const autoAuthEmail = params.get("authEmail");
+      const autoAuthPassword = params.get("authPassword");
       if (autoDomain) {
         scanInitiated.current = true;
         // Clean the URL param immediately to prevent re-triggering on any remount
         window.history.replaceState({}, "", "/dashboard");
         setTargetUrl(autoDomain);
-        if (autoEmail) {
-          setEmail(autoEmail);
+        if (autoEmail) setEmail(autoEmail);
+        if (autoAuthEmail) {
+          setAuthEmail(autoAuthEmail);
+          setShowAuthFields(true);
         }
+        if (autoAuthPassword) setAuthPassword(autoAuthPassword);
         // Auto-trigger the scan after state is set
         setTimeout(async () => {
           try {
@@ -238,7 +253,12 @@ export default function DashboardPage() {
             const response = await fetch("/api/scan", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ url: cleanUrl, email: autoEmail || undefined }),
+              body: JSON.stringify({
+                url: cleanUrl,
+                email: autoEmail || undefined,
+                authEmail: autoAuthEmail || undefined,
+                authPassword: autoAuthPassword || undefined,
+              }),
             });
             if (!response.ok) {
               throw new Error(await response.text());
@@ -356,7 +376,12 @@ export default function DashboardPage() {
       const response = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: targetUrl, email: email ? email.trim() : undefined }),
+        body: JSON.stringify({
+          url: targetUrl,
+          email: email ? email.trim() : undefined,
+          authEmail: authEmail ? authEmail.trim() : undefined,
+          authPassword: authPassword ? authPassword : undefined,
+        }),
       });
       if (!response.ok) {
         throw new Error(await response.text());
@@ -372,6 +397,8 @@ export default function DashboardPage() {
       
       setTargetUrl("");
       setEmail("");
+      setAuthEmail("");
+      setAuthPassword("");
       loadScans();
     } catch (err: any) {
       alert(err.message || "Failed to trigger scan.");
@@ -641,6 +668,47 @@ export default function DashboardPage() {
                           className="w-full bg-[#FAF8F5] border border-stone-200 hover:border-stone-300 focus:border-[#D4380D] focus:ring-1 focus:ring-[#D4380D] text-stone-900 rounded-lg pl-10 pr-4 py-2 text-sm outline-none transition-all placeholder:text-stone-450"
                         />
                       </div>
+                    </div>
+
+                    <div className="border border-stone-200/70 rounded-lg p-3 bg-stone-50/50">
+                      <button
+                        type="button"
+                        onClick={() => setShowAuthFields(!showAuthFields)}
+                        className="text-xs font-bold text-stone-700 hover:text-[#D4380D] flex items-center justify-between w-full cursor-pointer"
+                      >
+                        <span className="flex items-center gap-1.5">
+                          <Lock className="w-3.5 h-3.5 text-[#D4380D]" />
+                          Target Authentication (Optional - User Credentials)
+                        </span>
+                        <span className="text-[10px] text-stone-500 font-normal">{showAuthFields ? "Hide" : "+ Add Email & Password"}</span>
+                      </button>
+
+                      {showAuthFields && (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3 pt-3 border-t border-stone-200/60">
+                          <div>
+                            <label className="text-[11px] font-semibold text-stone-600 mb-1 block">Target Auth Email / Username</label>
+                            <input
+                              type="text"
+                              value={authEmail}
+                              onChange={(e) => setAuthEmail(e.target.value)}
+                              placeholder="e.g. user@targetapp.com"
+                              disabled={isScanning}
+                              className="w-full bg-white border border-stone-200 focus:border-[#D4380D] text-stone-900 rounded-md px-3 py-1.5 text-xs outline-none"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[11px] font-semibold text-stone-600 mb-1 block">Target Auth Password</label>
+                            <input
+                              type="password"
+                              value={authPassword}
+                              onChange={(e) => setAuthPassword(e.target.value)}
+                              placeholder="••••••••••••"
+                              disabled={isScanning}
+                              className="w-full bg-white border border-stone-200 focus:border-[#D4380D] text-stone-900 rounded-md px-3 py-1.5 text-xs outline-none"
+                            />
+                          </div>
+                        </div>
+                      )}
                     </div>
                     <button
                       type="submit"

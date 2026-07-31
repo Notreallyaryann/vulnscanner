@@ -9,7 +9,7 @@ import { answerFromContext } from "./cerebras";
  * Initiates a new vulnerability scan.
  * Creates the DB record and fires the scanner engine asynchronously.
  */
-export async function createScanAction(url: string): Promise<string> {
+export async function createScanAction(url: string, authEmail?: string, authPassword?: string): Promise<string> {
   let cleanUrl = url.trim();
   if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
     cleanUrl = "https://" + cleanUrl;
@@ -21,17 +21,27 @@ export async function createScanAction(url: string): Promise<string> {
     throw new Error("Invalid URL format. Please provide a valid address (e.g. example.com).");
   }
 
+  const cleanAuthEmail = authEmail ? String(authEmail).trim() : null;
+  const cleanAuthPassword = authPassword ? String(authPassword) : null;
+
   const scan = await prisma.scan.create({
     data: {
       targetUrl: cleanUrl,
+      authEmail: cleanAuthEmail,
+      authPassword: cleanAuthPassword,
       status: "PENDING",
     },
   });
 
+  const customAuth = (cleanAuthEmail || cleanAuthPassword) ? {
+    email: cleanAuthEmail || undefined,
+    password: cleanAuthPassword || undefined,
+  } : undefined;
+
   // Fire-and-forget background scan scheduled on the macro-task queue
   // This prevents Next.js from blocking the Server Action response.
   setTimeout(() => {
-    runVulnerabilityScan(scan.id, cleanUrl).catch((err) => {
+    runVulnerabilityScan(scan.id, cleanUrl, customAuth).catch((err) => {
       console.error(`Error executing background scan ${scan.id}:`, err);
     });
   }, 0);

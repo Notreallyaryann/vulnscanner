@@ -11,12 +11,14 @@ datasource db {
 
 
 model Scan {
-  id          String     @id @default(cuid())
-  targetUrl   String
-  email       String?
-  status      ScanStatus @default(PENDING)
-  createdAt   DateTime   @default(now())
-  completedAt DateTime?
+  id           String     @id @default(cuid())
+  targetUrl    String
+  email        String?
+  authEmail    String?
+  authPassword String?
+  status       ScanStatus @default(PENDING)
+  createdAt    DateTime   @default(now())
+  completedAt  DateTime?
 
   findings    Finding[]
 }

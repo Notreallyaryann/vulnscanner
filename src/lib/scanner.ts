@@ -207,7 +207,12 @@ async function attemptAutoRegister(targetUrl: string, log: (m: string) => void):
   }
 }
 
-async function attemptAutoLogin(targetUrl: string, log: (m: string) => void, session: AuthSession): Promise<void> {
+async function attemptAutoLogin(
+  targetUrl: string,
+  log: (m: string) => void,
+  session: AuthSession,
+  customAuth?: { email?: string; password?: string }
+): Promise<void> {
   const REST_LOGIN_PATHS = [
     "/rest/user/login", "/api/auth/login", "/api/login",
     "/api/v1/auth/login", "/auth/login", "/login", "/admin/login",
@@ -215,24 +220,112 @@ async function attemptAutoLogin(targetUrl: string, log: (m: string) => void, ses
     "/api/auth/callback/credentials",
   ];
   const TEST_ACCOUNTS = [
-    { email: "scanner_test_1@vulnscan.internal", username: "scannertest1", password: "VulnScan@Test1!" },
-    { email: "scanner_test_2@vulnscan.internal", username: "scannertest2", password: "VulnScan@Test2!" },
-    { email: "admin@juice-sh.op", username: "admin", password: "admin123" },
-    { email: "test@test.com", username: "test", password: "test" },
-    { email: "user@example.com", username: "user", password: "password" },
+    { email: "scanner_test_1@vulnscan.internal", username: "scannertest1", password: "VulnScan@Test1!", isUserProvided: false },
+    { email: "scanner_test_2@vulnscan.internal", username: "scannertest2", password: "VulnScan@Test2!", isUserProvided: false },
+    { email: "admin@juice-sh.op", username: "admin", password: "admin123", isUserProvided: false },
+    { email: "test@test.com", username: "test", password: "test", isUserProvided: false },
+    { email: "user@example.com", username: "user", password: "password", isUserProvided: false },
   ];
+
+  const accountsToTry = [];
+  if (customAuth?.email && customAuth?.password) {
+    accountsToTry.push({
+      email: customAuth.email,
+      username: customAuth.email.includes("@") ? customAuth.email.split("@")[0] : customAuth.email,
+      password: customAuth.password,
+      isUserProvided: true,
+    });
+    log(`🔑  Target credentials provided by user: ${customAuth.email}. Prioritizing custom login...`);
+  }
+  accountsToTry.push(...TEST_ACCOUNTS);
 
   log("🔑  Attempting authenticated session acquisition...");
 
-  // Register scanner test accounts first so they exist on fresh targets
+  // Register scanner test accounts first so they exist on fresh targets (if custom auth is not supplied or fails)
   await attemptAutoRegister(targetUrl, log);
 
+  // ── Step 1: HTML Login Form Discovery & Submission ────────────────────────
+  const loginPagesToProbe = [
+    targetUrl,
+    safeUrlJoin(targetUrl, "/login"),
+    safeUrlJoin(targetUrl, "/signin"),
+    safeUrlJoin(targetUrl, "/auth/login"),
+  ].filter(Boolean) as string[];
+
+  for (const loginPageUrl of loginPagesToProbe) {
+    if (session.bearerToken || session.cookies) break;
+    try {
+      const pageResp = await safeFetch(loginPageUrl, 5000);
+      if (!pageResp || pageResp.status !== 200) continue;
+      const html = await pageResp.text();
+      const $ = cheerio.load(html);
+
+      const forms = $("form").get();
+      for (const formEl of forms) {
+        if (session.bearerToken || session.cookies) break;
+        const formActionRaw = $(formEl).attr("action") || loginPageUrl;
+        const formAction = safeUrlJoin(loginPageUrl, formActionRaw) || loginPageUrl;
+
+        const pwdInput = $(formEl).find("input[type='password'], input[name*='pass'], input[id*='pass']").first();
+        if (!pwdInput.length) continue;
+        const pwdName = pwdInput.attr("name") || pwdInput.attr("id") || "password";
+
+        const userInput = $(formEl).find("input[type='email'], input[type='text'], input[name*='email'], input[name*='user'], input[name*='login']").first();
+        const userName = userInput.attr("name") || userInput.attr("id") || "email";
+
+        for (const creds of accountsToTry) {
+          try {
+            const formBody = new URLSearchParams({ [userName]: creds.email, [pwdName]: creds.password }).toString();
+            const resp = await fetch(formAction, {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": FETCH_HEADERS["User-Agent"] },
+              body: formBody,
+              signal: AbortSignal.timeout(6000),
+              // @ts-ignore
+              next: { revalidate: 0 },
+            }).catch(() => null);
+
+            if (!resp) continue;
+            const text = await resp.text().catch(() => "");
+            let json: any = null;
+            try { json = JSON.parse(text); } catch { /* ignore */ }
+
+            const token = json?.token || json?.data?.token || json?.access_token || json?.accessToken || json?.jwt;
+            const userId = String(json?.data?.id || json?.id || json?.user?.id || json?.userId || "");
+            const rawCookie = resp.headers.get("set-cookie") || "";
+
+            if (token || rawCookie || resp.status === 302 || resp.status === 301) {
+              if (token) session.bearerToken = token;
+              if (rawCookie) {
+                try {
+                  const jar = new CookieJar();
+                  const cookieStrings = rawCookie.split(/,(?=[^ ])/);
+                  for (const cs of cookieStrings) {
+                    await jar.setCookie(cs.trim(), formAction).catch(() => {});
+                  }
+                  session.cookies = await jar.getCookieString(formAction);
+                } catch {
+                  session.cookies = rawCookie.split(";")[0];
+                }
+              }
+              if (userId) session.userId = userId;
+              const sourceLabel = creds.isUserProvided ? "user-provided credentials" : `account ${creds.email}`;
+              log(`✅  Auth session acquired via HTML form at ${formAction} using ${sourceLabel}`);
+              break;
+            }
+          } catch { /* try next */ }
+        }
+      }
+    } catch { /* try next login page */ }
+  }
+
+  // ── Step 2: REST Endpoint Probe (Fallback & Secondary Session Acquisition) ─
   for (const path of REST_LOGIN_PATHS) {
     const url = safeUrlJoin(targetUrl, path);
     if (!url) continue;
 
-    let sessionsFilled = 0;
-    for (const creds of TEST_ACCOUNTS) {
+    let sessionsFilled = (session.bearerToken || session.cookies) ? 1 : 0;
+    for (const creds of accountsToTry) {
       if (sessionsFilled >= 2) break;
       try {
         // Build payload variations: JSON body & Form-urlencoded body (for Django/FastAPI/OAuth2)
@@ -277,6 +370,7 @@ async function attemptAutoLogin(targetUrl: string, log: (m: string) => void, ses
           const rawCookie = resp.headers.get("set-cookie") || "";
 
           if (token || rawCookie) {
+            const credLabel = creds.isUserProvided ? `user credentials (${creds.email})` : creds.email;
             if (sessionsFilled === 0) {
               if (token) session.bearerToken = token;
               if (rawCookie) {
@@ -293,7 +387,7 @@ async function attemptAutoLogin(targetUrl: string, log: (m: string) => void, ses
               }
               if (userId) session.userId = userId;
               sessionsFilled++;
-              log(`✅  Auth session 1 acquired (${creds.email}) via ${path}`);
+              log(`✅  Auth session 1 acquired (${credLabel}) via ${path}`);
               break;
             } else if (sessionsFilled === 1) {
               if (token) session.bearerToken2 = token;
@@ -311,7 +405,7 @@ async function attemptAutoLogin(targetUrl: string, log: (m: string) => void, ses
               }
               if (userId) session.userId2 = userId;
               sessionsFilled++;
-              log(`✅  Auth session 2 acquired (${creds.email}) — for IDOR dual-token probing`);
+              log(`✅  Auth session 2 acquired (${credLabel}) — for IDOR dual-token probing`);
               break;
             }
           }
@@ -4562,7 +4656,11 @@ async function discoverOpenApiEndpoints(baseUrl: string, log: (m: string) => voi
   return results;
 }
 
-export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
+export async function runVulnerabilityScan(
+  scanId: string,
+  targetUrl: string,
+  customAuth?: { email?: string; password?: string }
+) {
   const log = (msg: string) => {
     console.log(msg);
     emitLog(scanId, msg);
@@ -4587,7 +4685,7 @@ export async function runVulnerabilityScan(scanId: string, targetUrl: string) {
 
     // Attempt to acquire an authenticated session before the crawl begins
     log(`🔐  Phase 0b: Attempting auto-login to acquire authenticated session...`);
-    await attemptAutoLogin(targetUrl, log, session);
+    await attemptAutoLogin(targetUrl, log, session, customAuth);
 
     // Also run TLS analysis in parallel with nmap
     log(`🔒  Phase 0c: TLS/SSL certificate inspection...`);

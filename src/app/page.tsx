@@ -17,9 +17,14 @@ import {
   Sparkles, 
   Check, 
   X,
-  Code
+  Code,
+  RefreshCw,
+  ExternalLink,
+  Clock,
+  AlertCircle
 } from "lucide-react";
 import { useRouter } from "next/navigation";
+import { getScansAction } from "@/lib/actions";
 
 // FAQ Accordion Interface
 interface FaqItem {
@@ -70,16 +75,39 @@ export default function LandingPage() {
   // State variables
   const [domain, setDomain] = useState("");
   const [email, setEmail] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [showAuthFields, setShowAuthFields] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [currentProgress, setCurrentProgress] = useState(0);
   const [openFaq, setOpenFaq] = useState<number | null>(null);
+
+  // Recent scans state
+  const [scans, setScans] = useState<any[]>([]);
+  const [isLoadingScans, setIsLoadingScans] = useState(true);
 
   // Vulnerable vs Fixed Code snippet toggle
   const [selectedLanguage, setSelectedLanguage] = useState<"js" | "python">("js");
 
   // Use a ref for the interval step counter to avoid stale closure
   const stepRef = useRef(0);
+
+  const loadScans = async () => {
+    setIsLoadingScans(true);
+    try {
+      const list = await getScansAction();
+      setScans(list);
+    } catch (err) {
+      console.error("Failed to load scans on landing page:", err);
+    } finally {
+      setIsLoadingScans(false);
+    }
+  };
+
+  useEffect(() => {
+    loadScans();
+  }, []);
 
   const handleStartScan = (e: React.FormEvent) => {
     e.preventDefault();
@@ -90,6 +118,12 @@ export default function LandingPage() {
     queryParams.set("domain", domain.trim());
     if (email.trim()) {
       queryParams.set("email", email.trim());
+    }
+    if (authEmail.trim()) {
+      queryParams.set("authEmail", authEmail.trim());
+    }
+    if (authPassword) {
+      queryParams.set("authPassword", authPassword);
     }
     router.push(`/dashboard?${queryParams.toString()}`);
   };
@@ -111,6 +145,7 @@ export default function LandingPage() {
         </div>
         
         <nav className="hidden md:flex items-center gap-8 text-sm font-semibold text-[#86868B]">
+          <a href="#recent-scans" className="hover:text-[#D4380D] transition-colors">Recent Audits</a>
           <a href="#features" className="hover:text-[#D4380D] transition-colors">Product</a>
           <a href="#code" className="hover:text-[#D4380D] transition-colors">Remediation</a>
           <a href="#capabilities" className="hover:text-[#D4380D] transition-colors">Capabilities</a>
@@ -138,7 +173,7 @@ export default function LandingPage() {
         </h1>
         
         <p className="text-lg text-[#86868B] max-w-2xl mb-10 leading-relaxed">
-          The automated security testing platform built for fast-moving startups and developers. Test headers, scan endpoints, and receive instant copy-paste RAG fix recommendations.
+          The automated security testing platform built for fast-moving startups and developers. Test headers, scan authenticated user sessions, and receive instant copy-paste RAG fix recommendations.
         </p>
 
          {/* Domain & Email Input Form */}
@@ -167,6 +202,47 @@ export default function LandingPage() {
                 />
               </div>
             </div>
+
+            {/* Target Authentication (Optional - Authenticated Session Option) */}
+            <div className="border border-[#E5E5EA] rounded-xl p-3 bg-[#FBFBFC]">
+              <button
+                type="button"
+                onClick={() => setShowAuthFields(!showAuthFields)}
+                className="text-xs font-bold text-[#1D1D1F] hover:text-[#D4380D] flex items-center justify-between w-full cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5">
+                  <Lock className="w-3.5 h-3.5 text-[#D4380D]" />
+                  Authenticated Session Scan (Optional - Target Login Credentials)
+                </span>
+                <span className="text-[10px] text-[#86868B] font-semibold">{showAuthFields ? "Hide" : "+ Add Email & Password"}</span>
+              </button>
+
+              {showAuthFields && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3 pt-3 border-t border-[#E5E5EA]">
+                  <div>
+                    <label className="text-[11px] font-semibold text-[#86868B] mb-1 block">Target Auth Email / Username</label>
+                    <input
+                      type="text"
+                      value={authEmail}
+                      onChange={(e) => setAuthEmail(e.target.value)}
+                      placeholder="user@targetapp.com"
+                      className="w-full bg-white border border-[#E5E5EA] focus:border-[#D4380D] text-[#1D1D1F] rounded-lg px-3 py-2 text-xs outline-none font-medium"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-semibold text-[#86868B] mb-1 block">Target Auth Password</label>
+                    <input
+                      type="password"
+                      value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                      placeholder="••••••••••••"
+                      className="w-full bg-white border border-[#E5E5EA] focus:border-[#D4380D] text-[#1D1D1F] rounded-lg px-3 py-2 text-xs outline-none font-medium"
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
             <button
               type="submit"
               className="w-full py-3 rounded-xl bg-[#D4380D] hover:bg-[#b02f0a] text-white text-sm font-bold shadow-md shadow-[#D4380D]/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
@@ -217,6 +293,111 @@ export default function LandingPage() {
           <span className="flex items-center gap-1.5"><Lock className="w-4 h-4 text-[#D4380D]" /> OWASP Compliance</span>
           <span className="flex items-center gap-1.5"><Activity className="w-4 h-4 text-[#D4380D]" /> Real-time Audits</span>
           <span className="flex items-center gap-1.5"><Cpu className="w-4 h-4 text-[#D4380D]" /> AI Remediation</span>
+        </div>
+      </section>
+
+      {/* 🚀 RECENT SECURITY AUDITS SECTION */}
+      <section id="recent-scans" className="py-16 bg-[#FFFFFF] border-t border-[#E5E5EA] px-6">
+        <div className="max-w-6xl mx-auto">
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4">
+            <div>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#D4380D]/5 border border-[#D4380D]/15 text-[#D4380D] text-[10px] font-bold uppercase tracking-wider mb-2">
+                <Activity className="w-3.5 h-3.5" /> Security Audit Log
+              </div>
+              <h2 className="text-2xl sm:text-3xl font-extrabold text-[#1D1D1F] tracking-tight">
+                Recent Security Audits
+              </h2>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                onClick={loadScans}
+                className="p-2 rounded-xl bg-[#FBFBFC] border border-[#E5E5EA] text-[#86868B] hover:text-[#1D1D1F] transition-all cursor-pointer"
+                title="Refresh Recent Scans"
+              >
+                <RefreshCw className={`w-4 h-4 ${isLoadingScans ? "animate-spin" : ""}`} />
+              </button>
+              <button
+                onClick={() => router.push("/dashboard")}
+                className="px-4 py-2 rounded-xl bg-[#1D1D1F] hover:bg-[#D4380D] text-white text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+              >
+                View Dashboard
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {isLoadingScans ? (
+            <div className="py-12 text-center text-[#86868B] text-sm font-medium flex items-center justify-center gap-2">
+              <RefreshCw className="w-4 h-4 animate-spin text-[#D4380D]" /> Loading recent security audits...
+            </div>
+          ) : scans.length === 0 ? (
+            <div className="p-8 rounded-2xl bg-[#FBFBFC] border border-[#E5E5EA] text-center">
+              <Shield className="w-10 h-10 text-[#86868B]/40 mx-auto mb-3" />
+              <p className="text-sm font-bold text-[#1D1D1F] mb-1">No security scans executed yet</p>
+              <p className="text-xs text-[#86868B]">Enter a domain above to trigger your first vulnerability audit.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {scans.slice(0, 6).map((scan) => {
+                const isCompleted = scan.status === "COMPLETED";
+                const isRunning = ["PENDING", "CRAWLING", "SCANNING", "ANALYZING"].includes(scan.status);
+                const findingsCount = scan._count?.findings ?? scan.findings?.length ?? 0;
+                
+                return (
+                  <div
+                    key={scan.id}
+                    className="p-5 rounded-2xl bg-[#FBFBFC] border border-[#E5E5EA] hover:border-[#D4380D]/40 transition-all flex flex-col justify-between group shadow-sm hover:shadow-md"
+                  >
+                    <div>
+                      <div className="flex justify-between items-start gap-2 mb-3">
+                        <span className="font-mono text-xs font-bold text-[#1D1D1F] truncate group-hover:text-[#D4380D] transition-colors" title={scan.targetUrl}>
+                          {scan.targetUrl}
+                        </span>
+
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider shrink-0 ${
+                          isCompleted
+                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            : isRunning
+                            ? "bg-orange-50 text-[#D4380D] border border-orange-200 animate-pulse"
+                            : "bg-red-50 text-red-700 border border-red-200"
+                        }`}>
+                          {scan.status}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-xs text-[#86868B] mb-4">
+                        <Clock className="w-3.5 h-3.5" />
+                        <span>{new Date(scan.createdAt).toLocaleDateString()} at {new Date(scan.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        {scan.authEmail && (
+                          <span className="ml-auto px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 border border-purple-200 text-[10px] font-bold">
+                            Auth Active
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="pt-4 border-t border-[#E5E5EA] flex justify-between items-center">
+                      <div className="flex items-center gap-1.5">
+                        <AlertTriangle className={`w-4 h-4 ${findingsCount > 0 ? "text-[#D4380D]" : "text-emerald-600"}`} />
+                        <span className="text-xs font-bold text-[#1D1D1F]">
+                          {findingsCount} {findingsCount === 1 ? "Vulnerability" : "Vulnerabilities"}
+                        </span>
+                      </div>
+
+                      <button
+                        onClick={() => router.push(`/dashboard?scanId=${scan.id}`)}
+                        className="text-xs font-bold text-[#D4380D] hover:underline flex items-center gap-1 cursor-pointer"
+                      >
+                        Inspect
+                        <ExternalLink className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </section>
 

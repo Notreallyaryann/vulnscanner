@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   try {
-    const { url, email } = await req.json();
+    const { url, email, authEmail, authPassword } = await req.json();
 
     if (!url) {
       return new NextResponse("URL is required", { status: 400 });
@@ -23,19 +23,28 @@ export async function POST(req: NextRequest) {
       return new NextResponse("Invalid URL format", { status: 400 });
     }
 
+    const cleanAuthEmail = authEmail ? String(authEmail).trim() : null;
+    const cleanAuthPassword = authPassword ? String(authPassword) : null;
+
     // Create the scan record
     const scan = await prisma.scan.create({
       data: {
         targetUrl: cleanUrl,
         email: email ? String(email).trim() : null,
+        authEmail: cleanAuthEmail,
+        authPassword: cleanAuthPassword,
         status: "PENDING",
       },
     });
 
+    const customAuth = (cleanAuthEmail || cleanAuthPassword) ? {
+      email: cleanAuthEmail || undefined,
+      password: cleanAuthPassword || undefined,
+    } : undefined;
+
     // Fire the scan in the background on the Node event loop.
-    // Unlike Server Actions, Route Handlers do not block the client response when returning a NextResponse.
     setTimeout(() => {
-      runVulnerabilityScan(scan.id, cleanUrl).catch((err) => {
+      runVulnerabilityScan(scan.id, cleanUrl, customAuth).catch((err) => {
         console.error(`Error executing background scan ${scan.id}:`, err);
       });
     }, 0);
