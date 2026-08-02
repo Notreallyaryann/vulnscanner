@@ -1852,30 +1852,32 @@ function detectSubdomainTakeoverSignals(html: string, targetUrl: string): Pendin
  * Covers: Jinja2, Twig, Freemarker, Pebble, Thymeleaf, Mako, ERB, Handlebars.
  */
 const SSTI_PROBES = [
-  { payload: "{{7*7}}", marker: "49", engines: "Jinja2/Twig/Pebble/Handlebars" },
-  { payload: "${7*7}", marker: "49", engines: "Freemarker/Java EL/Groovy" },
-  { payload: "<%= 7*7 %>", marker: "49", engines: "ERB/EJS/ASP" },
-  { payload: "#{7*7}", marker: "49", engines: "Ruby Slim/Haml" },
-  { payload: "*{7*7}", marker: "49", engines: "Spring SpEL" },
-  { payload: "{{7*'7'}}", marker: "7777777", engines: "Jinja2 (string multiply)" },
+  { payload: "{{913*829}}", marker: "756877", engines: "Jinja2/Twig/Pebble/Handlebars" },
+  { payload: "${913*829}", marker: "756877", engines: "Freemarker/Java EL/Groovy" },
+  { payload: "<%= 913*829 %>", marker: "756877", engines: "ERB/EJS/ASP" },
+  { payload: "#{913*829}", marker: "756877", engines: "Ruby Slim/Haml" },
+  { payload: "*{913*829}", marker: "756877", engines: "Spring SpEL" },
 ];
 
 async function probeSSTI(paramUrl: string): Promise<PendingFinding | null> {
-  // FP-FIX: A single match of "{{7*7}}" → "49" can be coincidental (the number 49
-  // appears in many pages naturally). Require 3 of 4 distinct math expressions to
-  // all evaluate before reporting. This eliminates coincidental number matches.
   const MATH_CONFIRM_PROBES = [
-    { p: "{{7*7}}", e: "49" },
-    { p: "{{7*8}}", e: "56" },
-    { p: "{{100*2}}", e: "200" },
-    { p: "{{1+1}}", e: "2" },
+    { p: "{{987*654}}", e: "645498" },
+    { p: "{{4321*8765}}", e: "37873565" },
   ];
   try {
     const u = new URL(paramUrl);
     const params = [...u.searchParams.keys()];
+
+    // Baseline fetch to check if marker numbers exist naturally in response
+    const baselineResp = await safeFetch(u.toString(), 5000);
+    const baselineText = baselineResp ? await baselineResp.text() : "";
+
     for (const param of params) {
       for (const { payload, marker, engines } of SSTI_PROBES) {
         try {
+          // If baseline text already contains marker, skip to prevent false positives
+          if (baselineText.includes(marker)) continue;
+
           const testUrl = new URL(u.toString());
           testUrl.searchParams.set(param, payload);
           const resp = await safeFetch(testUrl.toString(), 5000);
@@ -1883,11 +1885,12 @@ async function probeSSTI(paramUrl: string): Promise<PendingFinding | null> {
           const body = await resp.text();
           if (!body.includes(marker) || body.includes(payload)) continue;
 
-          // Confirmation phase: require 3 of 4 different math expressions to evaluate
+          // Confirmation phase: require BOTH high-entropy math expressions to evaluate
           const validationSteps: string[] = [`Initial: "${payload}" → "${marker}" (${engines})`];
           let mathHits = 0;
           for (const { p, e } of MATH_CONFIRM_PROBES) {
             try {
+              if (baselineText.includes(e)) continue; // skip if e is in baseline
               const cu = new URL(u.toString());
               cu.searchParams.set(param, p);
               const cr = await safeFetch(cu.toString(), 4000);
@@ -1899,14 +1902,14 @@ async function probeSSTI(paramUrl: string): Promise<PendingFinding | null> {
               }
             } catch { /* next */ }
           }
-          if (mathHits < 3) continue; // Not enough confirmation — skip
+          if (mathHits < 2) continue; // Require 2/2 confirmation hits with high-entropy products
 
           return {
             type: "ssti-injection",
             severity: "CRITICAL",
             url: testUrl.toString(),
             parameter: param,
-            evidence: `Server-Side Template Injection (SSTI) confirmed. Expression "${payload}" evaluated to "${marker}" AND ${mathHits}/4 independent math expressions also evaluated — ruling out coincidental number matches. Engine(s): ${engines}. An attacker can escalate to RCE via the template engine's object access features.`,
+            evidence: `Server-Side Template Injection (SSTI) confirmed. Expression "${payload}" evaluated to "${marker}" AND ${mathHits}/2 independent high-entropy math expressions also evaluated. Engine(s): ${engines}. An attacker can escalate to RCE via template engine object access.`,
             cvssScore: 9.8,
             cveId: "CWE-94",
             confidence: CONFIDENCE.EXEC_VERIFIED,
@@ -1921,9 +1924,22 @@ async function probeSSTI(paramUrl: string): Promise<PendingFinding | null> {
 }
 
 async function probeFormSSTI(form: FormTarget): Promise<PendingFinding | null> {
+  // Baseline fetch to ensure math markers do not exist in default form response
+  const baselineResp = form.method === "POST"
+    ? await fetch(form.actionUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": FETCH_HEADERS["User-Agent"] },
+      body: new URLSearchParams(form.fields.map(f => [f, "test"])).toString(),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => null)
+    : await safeFetch(form.actionUrl, 5000);
+  const baselineText = baselineResp ? await baselineResp.text() : "";
+
   for (const field of form.fields) {
     for (const { payload, marker, engines } of SSTI_PROBES) {
       try {
+        if (baselineText.includes(marker)) continue;
+
         const formData = new URLSearchParams();
         for (const f of form.fields) formData.set(f, f === field ? payload : "test");
         const method = form.method === "POST";
@@ -1941,11 +1957,11 @@ async function probeFormSSTI(form: FormTarget): Promise<PendingFinding | null> {
         const body = await resp.text();
         if (!body.includes(marker) || body.includes(payload)) continue;
 
-        // FP-FIX: confirm with at least 1 additional math expression
         let mathHits = 0;
-        const confirmExprs = [{ p: "{{7*8}}", e: "56" }, { p: "{{100*2}}", e: "200" }];
+        const confirmExprs = [{ p: "{{987*654}}", e: "645498" }, { p: "{{4321*8765}}", e: "37873565" }];
         for (const { p, e } of confirmExprs) {
           try {
+            if (baselineText.includes(e)) continue;
             const fd2 = new URLSearchParams();
             for (const f of form.fields) fd2.set(f, f === field ? p : "test");
             const r2 = method
@@ -1963,14 +1979,14 @@ async function probeFormSSTI(form: FormTarget): Promise<PendingFinding | null> {
             if (b2.includes(e) && !b2.includes(p)) mathHits++;
           } catch { /* next */ }
         }
-        if (mathHits < 1) continue; // Need ≥1 additional confirmation
+        if (mathHits < 2) continue; // Require 2/2 confirmation hits
 
         return {
           type: "ssti-injection-form",
           severity: "CRITICAL",
           url: form.actionUrl,
           parameter: field,
-          evidence: `SSTI confirmed via form field (multi-math verified). Expression "${payload}" → "${marker}" in field "${field}", and ${mathHits}/2 additional math expressions also evaluated. Engine(s): ${engines}. RCE achievable via template engine object access.`,
+          evidence: `SSTI confirmed via form field (multi-math verified). Expression "${payload}" → "${marker}" in field "${field}", and ${mathHits}/2 additional high-entropy math expressions also evaluated. Engine(s): ${engines}. RCE achievable via template engine object access.`,
           cvssScore: 9.8,
           cveId: "CWE-94",
           confidence: CONFIDENCE.EXEC_VERIFIED,
@@ -4933,20 +4949,6 @@ export async function runVulnerabilityScan(
 
     const visitedUrls = new Set<string>();
     const urlQueue: string[] = [targetUrl];
-    // Seed common SPA routes for Angular / React / Vue hash routing (e.g. Juice Shop)
-    try {
-      const baseOrigin = new URL(targetUrl).origin;
-      const COMMON_SPA_HASH_ROUTES = [
-        "/#/search", "/#/login", "/#/register", "/#/basket",
-        "/#/administration", "/#/score-card", "/#/privacy-security/privacy-policy",
-        "/#/recycle", "/#/contact", "/#/about", "/#/photo-wall",
-        "/#/user/change-password", "/#/tokens", "/#/privacy-security/data-export",
-      ];
-      for (const route of COMMON_SPA_HASH_ROUTES) {
-        const full = `${baseOrigin}${route}`;
-        if (!urlQueue.includes(full)) urlQueue.push(full);
-      }
-    } catch { /* skip */ }
     const MAX_PAGES_TO_SCAN = 35;
     let homepageHtml = "";
 
@@ -5565,11 +5567,11 @@ export async function runVulnerabilityScan(
               severity: "INFO",
               url: fullApiUrl,
               parameter: fieldsStr !== "n/a" ? fieldsStr : undefined,
-              evidence: `Discovered active API endpoint surface route: ${apiRoute} (Parameters/Fields: ${fieldsStr}). Extracted from JS bundles, network interception, or OpenAPI specifications.`,
+              evidence: `API Surface Asset Discovered: ${apiRoute} (Parameters/Fields: ${fieldsStr}). Route mapped during static JS analysis or network interception for vulnerability probing.`,
               cvssScore: 0.0,
               cveId: "CWE-200",
               confidence: CONFIDENCE.DETERMINISTIC,
-              validationSteps: [`API route "${apiRoute}" identified during surface mapping`],
+              validationSteps: [`API route "${apiRoute}" mapped during application attack surface discovery`],
               isVerified: true,
             });
           }

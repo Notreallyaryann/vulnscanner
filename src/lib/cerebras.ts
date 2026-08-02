@@ -239,6 +239,26 @@ function getMockFixReport(params: {
         };
     }
 
+    if (type.includes("api-endpoint-discovered")) {
+        return {
+            title: "API Surface Route Mapped",
+            explanation: `An API endpoint route (${params.url}) was discovered during static JS asset analysis or network interception and added to the attack surface map for scanning.`,
+            attackSimulation: "Automated mapping of API endpoints performed during security auditing to enumerate reachable endpoints.",
+            fixSteps: [
+                "Ensure authentication and authorization controls are enforced on sensitive backend routes.",
+                "Apply rate limiting and access controls on public API endpoints."
+            ],
+            codeExample: {
+                language: "typescript",
+                vulnerable: "// Publicly reachable API route",
+                fixed: "// Secure API route with authentication middleware"
+            },
+            references: [
+                "https://owasp.org/www-project-api-security/"
+            ]
+        };
+    }
+
     // Default fallback with human-readable title
     const humanTitle = params.findingType
         .replace(/[-_]+/g, ' ')
