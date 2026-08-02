@@ -8,11 +8,8 @@ import { runNmapScan, type NmapFinding } from "./nmap";
 import { registerScanController, cleanupScanController } from "./scan-controller";
 import { acquireBrowser, releaseBrowser, destroyBrowser } from "./browser-pool";
 import * as tls from "tls";
-// @ts-ignore
-import * as acorn from "acorn";
-// @ts-ignore
-import { simple as walkSimple } from "acorn-walk";
 // ─── Modern Library Imports ───────────────────────────────────────────────────
+
 import * as cheerio from "cheerio";
 import semver from "semver";
 import { CookieJar } from "tough-cookie";
@@ -27,6 +24,8 @@ import { extractHtmlLinksAndForms, isSpaHtmlFallback as isSpaHtmlFallbackModule 
 import { probeSQLiMultiFormat } from "./scanner/probes/sqli";
 import { probeReflectedXSSMultiFormat, analyzeDomXssEvents } from "./scanner/probes/xss";
 import { checkGraphQLIntrospection as checkGraphQLIntrospectionModule, probeNoSQLiJson } from "./scanner/probes/api";
+import { analyzeJsAst } from "./scanner/js-analyzer";
+
 
 
 interface PendingFinding {
@@ -3105,6 +3104,24 @@ async function analyzeJSFiles(html: string, baseUrl: string): Promise<PendingFin
       const resp = await safeFetch(src, 5000);
       if (!resp || !resp.ok) continue;
       const code = await resp.text();
+
+      // ── Step 1: Perform Acorn AST static analysis for JS sinks ─────────────
+      const astFindings = analyzeJsAst(code);
+      if (astFindings.length > 0 && !jsIssueFound) {
+        const firstAst = astFindings[0];
+        const lineInfo = firstAst.line ? ` (line ${firstAst.line})` : "";
+        findings.push({
+          type: "js-dangerous-sink",
+          severity: "HIGH",
+          url: src,
+          evidence: `AST Analysis: "${firstAst.label}" detected in JavaScript file ${src}${lineInfo}. DOM-based sinks like eval(), document.write(), or innerHTML assignment with location/query data are prime vectors for DOM XSS if any upstream input is attacker-controlled.`,
+          cvssScore: 7.5,
+          cveId: "CWE-79",
+        });
+        jsIssueFound = true;
+      }
+
+      // ── Step 2: Perform Secret & Regex Pattern Analysis ─────────────────────
       for (const { label, re } of SECRET_PATTERNS) {
         if (re.test(code)) {
           const isSecret = !label.includes("eval") && !label.includes("document") && !label.includes("innerHTML");

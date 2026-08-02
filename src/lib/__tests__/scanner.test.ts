@@ -96,3 +96,41 @@ test("extractHtmlLinksAndForms extracts SPA router paths from inline script bloc
   assert.ok(result.links.includes("https://example.com/admin/analytics"));
 });
 
+test("analyzeJsAst detects dangerous DOM sinks via AST parsing", () => {
+  const { analyzeJsAst } = require("../scanner/js-analyzer");
+  const code = `
+    // Safe comment: eval('should be ignored')
+    const safeStr = "eval('in string should be ignored')";
+    
+    function dangerousAction() {
+      eval(location.hash);
+      document.write("<p>unsafe</p>");
+      document.body.innerHTML = window.location.search;
+    }
+  `;
+  const findings = analyzeJsAst(code);
+  assert.strictEqual(findings.length, 3);
+  assert.strictEqual(findings[0].sinkType, "eval");
+  assert.strictEqual(findings[1].sinkType, "document.write");
+  assert.strictEqual(findings[2].sinkType, "innerHTML");
+});
+
+test("analyzeJsAst ignores comments and string literals (no false positives)", () => {
+  const { analyzeJsAst } = require("../scanner/js-analyzer");
+  const code = `
+    // eval("this is a comment")
+    /* document.write("multiline comment") */
+    const text = "eval() in a string literal";
+  `;
+  const findings = analyzeJsAst(code);
+  assert.strictEqual(findings.length, 0);
+});
+
+test("analyzeJsAst handles invalid JS syntax gracefully", () => {
+  const { analyzeJsAst } = require("../scanner/js-analyzer");
+  const code = `<div>Invalid JS syntax <<<</div>`;
+  const findings = analyzeJsAst(code);
+  assert.deepStrictEqual(findings, []);
+});
+
+
