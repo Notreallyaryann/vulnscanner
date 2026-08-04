@@ -1,0 +1,13 @@
+{
+  "name": "vulnscanner-nuclei-service",
+  "version": "1.0.0",
+  "description": "Microservice to run Nuclei vulnerability scans for VulnScanner",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}

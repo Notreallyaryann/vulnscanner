@@ -5,6 +5,7 @@ import { emitLog, cleanupScan } from "./scan-logger";
 import { sendScanReportEmail } from "./mail";
 import { renderWithBrowser, interactiveFormInjection, auditClientStorage, type InteractiveInjectionResult, type StorageFinding } from "./browser";
 import { runNmapScan, type NmapFinding } from "./nmap";
+import { runNucleiScan, type NucleiFinding } from "./nuclei";
 import { registerScanController, cleanupScanController } from "./scan-controller";
 import { acquireBrowser, releaseBrowser, destroyBrowser } from "./browser-pool";
 import * as tls from "tls";
@@ -4894,10 +4895,11 @@ export async function runVulnerabilityScan(
     await prisma.scan.update({ where: { id: scanId }, data: { status: "CRAWLING" } });
 
     // ══════════════════════════════════════════════════════════════════════
-    // PHASE 0: NMAP PORT SCAN (fires in parallel with main page fetch)
+    // PHASE 0: NMAP & NUCLEI SCANS (fires in parallel with main page fetch)
     // ══════════════════════════════════════════════════════════════════════
-    log(`🔌  Phase 0: Nmap port scan & service fingerprinting (runs in parallel)...`);
+    log(`🔌  Phase 0: Nmap port scan & Nuclei template scanning (running in parallel)...`);
     const nmapPromise = runNmapScan(targetUrl, log);
+    const nucleiPromise = runNucleiScan(targetUrl, log);
 
     // Attempt to acquire an authenticated session before the crawl begins
     log(`🔐  Phase 0b: Attempting auto-login to acquire authenticated session...`);
@@ -5012,15 +5014,29 @@ export async function runVulnerabilityScan(
         log(`🛡️  Phase 1: Auditing security headers (CSP, HSTS, X-Frame-Options, CORS, referrer policy)...`);
         await prisma.scan.update({ where: { id: scanId }, data: { status: "SCANNING" } });
 
-        // Await the parallel nmap promise here
+        // Await the parallel nmap and nuclei promises here
         try {
-          const nmapFindings: NmapFinding[] = await nmapPromise;
+          const [nmapFindings, nucleiFindings] = await Promise.all([
+            nmapPromise.catch((err) => {
+              log(`⚠️   Phase 0 (nmap) encountered an error: ${err instanceof Error ? err.message : String(err)}`);
+              return [] as NmapFinding[];
+            }),
+            nucleiPromise.catch((err) => {
+              log(`⚠️   Phase 0 (nuclei) encountered an error: ${err instanceof Error ? err.message : String(err)}`);
+              return [] as NucleiFinding[];
+            }),
+          ]);
+
           for (const nf of nmapFindings) {
             findings.push(nf as PendingFinding);
           }
-          log(`🗺️   Phase 0 complete — ${nmapFindings.length} network finding(s) merged into scan results`);
-        } catch (nmapErr) {
-          log(`⚠️   Phase 0 (nmap) encountered an error: ${nmapErr instanceof Error ? nmapErr.message : String(nmapErr)}`);
+          for (const nf of nucleiFindings) {
+            findings.push(nf as PendingFinding);
+          }
+
+          log(`🗺️   Phase 0 complete — ${nmapFindings.length} Nmap & ${nucleiFindings.length} Nuclei finding(s) merged into scan results`);
+        } catch (phase0Err) {
+          log(`⚠️   Phase 0 encountered an error: ${phase0Err instanceof Error ? phase0Err.message : String(phase0Err)}`);
         }
 
         // A1 – Missing X-Frame-Options / frame-ancestors (Clickjacking)

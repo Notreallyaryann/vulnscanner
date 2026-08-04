@@ -4,7 +4,7 @@ const { chromium } = require("playwright");
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3002;
+const PORT = process.env.PORT || 3003;
 
 // ─── Chromium launch args safe for Docker and server environments ─────────────
 const CHROMIUM_ARGS = [
