@@ -4,6 +4,7 @@
   "description": "Microservice to run Nuclei vulnerability scans for VulnScanner",
   "main": "server.js",
   "scripts": {
+    "build": "echo 'No build step required'",
     "start": "node server.js"
   },
   "dependencies": {

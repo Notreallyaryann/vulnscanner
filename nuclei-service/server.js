@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const { spawn, execSync } = require("child_process");
+const fs = require("fs");
 
 const app = express();
 app.use(cors());
@@ -140,18 +141,32 @@ app.post("/scan", async (req, res) => {
 
   const timeoutMs = Math.min(parseInt(customTimeoutMs || "180000", 10), 300_000); // capped at 5 mins
 
+  // Determine home directory & template location
+  const homeDir = process.env.HOME || "/root";
+  const defaultTemplateDir = fs.existsSync("/root/nuclei-templates")
+    ? "/root/nuclei-templates"
+    : fs.existsSync(`${homeDir}/nuclei-templates`)
+    ? `${homeDir}/nuclei-templates`
+    : null;
+
   const args = [
     "-u", target,
     "-j",                       // Output in JSON lines format
     "-silent",                  // Only print findings JSON
     "-no-color",
     "-disable-update-check",
-    "-rate-limit", "150",
-    "-concurrency", "25",
+    "-rate-limit", "80",        // Stable rate limit for cloud microservices
+    "-concurrency", "15",
   ];
 
+  if (defaultTemplateDir && !templates) {
+    args.push("-t", defaultTemplateDir);
+  } else if (templates && typeof templates === "string" && !/[;&|`$]/g.test(templates)) {
+    args.push("-t", templates);
+  }
+
   if (severity && typeof severity === "string") {
-    // e.g. "critical,high,medium"
+    // e.g. "critical,high,medium,low,info"
     const safeSev = severity.replace(/[^a-zA-Z,]/g, "");
     if (safeSev) args.push("-severity", safeSev);
   }
@@ -161,18 +176,13 @@ app.post("/scan", async (req, res) => {
     if (safeTags) args.push("-tags", safeTags);
   }
 
-  if (templates && typeof templates === "string") {
-    if (!/[;&|`$]/g.test(templates)) {
-      args.push("-t", templates);
-    }
-  }
-
   let stdout = "";
   let stderr = "";
 
   try {
     let responded = false;
-    const proc = spawn("nuclei", args, { timeout: timeoutMs });
+    const procEnv = { ...process.env, HOME: homeDir };
+    const proc = spawn("nuclei", args, { timeout: timeoutMs, env: procEnv });
 
     proc.stdout.on("data", (chunk) => {
       stdout += chunk.toString();

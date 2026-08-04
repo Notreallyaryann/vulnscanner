@@ -40,7 +40,7 @@ export interface RawNucleiOutput {
 
 // ─── Shared Nuclei scan parameters ───────────────────────────────────────────
 
-const NUCLEI_SEVERITY = "critical,high,medium,low";
+const NUCLEI_SEVERITY = "critical,high,medium,low,info";
 const NUCLEI_TAGS     = "cve,exposure,misconfig,tech,panel,vuln";
 
 // ─── Severity & CVSS Normalization ───────────────────────────────────────────
