@@ -180,10 +180,9 @@ app.post("/scan", async (req, res) => {
     "-disable-update-check",
     "-fr",                       // follow redirects — critical for Vercel/Next.js apps that
     // redirect http->https, apex->www, or via middleware
-    "-timeout", "10",            // per-request timeout (seconds), keeps a slow target from
-    // starving the whole scan
-    "-rate-limit", "80",
-    "-concurrency", "15",
+    "-timeout", "5",             // per-request timeout (seconds) — prevents slow endpoints from stalling workers
+    "-rate-limit", "150",        // increased throughput for light requests
+    "-concurrency", "25",
   ];
 
   if (templates && typeof templates === "string" && !/[;&|`$]/g.test(templates)) {
