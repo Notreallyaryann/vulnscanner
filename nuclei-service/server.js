@@ -165,7 +165,10 @@ app.post("/scan", async (req, res) => {
   // Bumped default ceiling — a full unscoped template run against one host
   // can genuinely take several minutes. If you need faster turnaround,
   // scope with severity/tags rather than lowering this.
-  const timeoutMs = Math.min(parseInt(customTimeoutMs || "180000", 10), 600_000); // capped at 10 mins
+  const timeoutMs = Math.max(
+    Math.min(parseInt(customTimeoutMs || "180000", 10), 600_000), // capped at 10 mins
+    120_000 // never allow a caller to set less than 2 minutes
+  );
 
   const homeDir = process.env.HOME || "/root";
 

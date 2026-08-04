@@ -41,7 +41,7 @@ export interface RawNucleiOutput {
 // ─── Shared Nuclei scan parameters ───────────────────────────────────────────
 
 const NUCLEI_SEVERITY = "critical,high,medium,low,info";
-const NUCLEI_TAGS     = "cve,exposure,misconfig,tech,panel,vuln,api,jwt,cors,graphql,swagger,openapi,token,auth,django,nextjs,react,express";
+const NUCLEI_TAGS     = "cve,exposure,misconfig,tech,panel,vuln,api,jwt,cors,graphql,swagger,openapi";
 
 // ─── Severity & CVSS Normalization ───────────────────────────────────────────
 
@@ -127,8 +127,8 @@ function parseNucleiFinding(item: RawNucleiOutput, targetUrl: string): NucleiFin
 export async function runNucleiScan(
   targetUrl: string,
   logFn?: (msg: string) => void,
-  // 90s scan budget — service gets 90s to run nuclei; fetch gets 100s (10s grace)
-  timeoutMs = 90_000
+  // 300s (5 min) scan budget — service gets timeoutMs to run nuclei; fetch gets +10s grace
+  timeoutMs = 300_000
 ): Promise<NucleiFinding[]> {
   const log = logFn ?? console.log;
 
