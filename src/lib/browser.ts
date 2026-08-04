@@ -664,3 +664,118 @@ export async function auditClientStorage(
 
   return findings;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BROWSER INTERACTIVE LOGIN — SPA / React / Client-Hydrated Form Authentication
+// ══════════════════════════════════════════════════════════════════════════════
+
+export async function browserInteractiveLogin(
+  targetUrl: string,
+  log: (msg: string) => void,
+  scanId: string,
+  creds: { email?: string; password?: string }
+): Promise<{ bearerToken?: string; cookies?: string; userId?: string } | null> {
+  if (!creds.email || !creds.password) return null;
+  if (process.env.VERCEL || process.env.NEXT_PUBLIC_VERCEL) return null;
+
+  const browser = await acquireBrowser(scanId);
+  if (!browser) return null;
+
+  try {
+    log(`🌐  Playwright: Launching headless browser for SPA interactive login...`);
+    const context = await browser.newContext({ userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" });
+    const page = await context.newPage();
+
+    let capturedToken: string | undefined;
+    let capturedUserId: string | undefined;
+
+    // Listen for authentication network responses (API requests triggered by form submit)
+    page.on("response", async (response) => {
+      const url = response.url();
+      if (url.includes("/api/") || url.includes("/auth/") || url.includes("/login") || url.includes("/user")) {
+        try {
+          const json = await response.json();
+          const token = json?.token || json?.data?.token || json?.access_token || json?.accessToken || json?.jwt;
+          const uId = String(json?.data?.id || json?.id || json?.user?.id || json?.userId || "");
+          if (token) capturedToken = token;
+          if (uId) capturedUserId = uId;
+        } catch { /* not JSON */ }
+      }
+    });
+
+    const safeJoin = (base: string, p: string) => { try { return new URL(p, base).toString(); } catch { return null; } };
+    const loginPages = [
+      safeJoin(targetUrl, "/login"),
+      safeJoin(targetUrl, "/signin"),
+      targetUrl,
+    ].filter(Boolean) as string[];
+
+    for (const pageUrl of loginPages) {
+      try {
+        log(`🌐  Playwright: Navigating to ${pageUrl}`);
+        await page.goto(pageUrl, { waitUntil: "networkidle", timeout: 15000 }).catch(() => {});
+
+        // Wait for inputs to hydrate
+        await page.waitForSelector("input", { timeout: 5000 }).catch(() => {});
+
+        const emailInput = await page.$("input[type='email'], input[name*='email'], input[name*='user'], input[name*='login'], input[placeholder*='email' i], input[placeholder*='user' i]").catch(() => null);
+        const passInput = await page.$("input[type='password'], input[name*='pass'], input[placeholder*='pass' i]").catch(() => null);
+
+        if (emailInput && passInput) {
+          log(`🎯  Playwright: Found interactive login form on ${pageUrl}`);
+          await emailInput.fill(creds.email);
+          await passInput.fill(creds.password);
+
+          // Find and click submit button
+          const submitBtn = await page.$("button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign In'), button:has-text('Log In')").catch(() => null);
+          if (submitBtn) {
+            await Promise.all([
+              page.waitForNavigation({ timeout: 6000 }).catch(() => {}),
+              page.waitForResponse((res) => res.url().includes("/api/") || res.url().includes("/auth/"), { timeout: 6000 }).catch(() => {}),
+              submitBtn.click(),
+            ]);
+          } else {
+            await passInput.press("Enter");
+            await page.waitForTimeout(3000);
+          }
+
+          // Read cookies after login submission
+          const cookiesList = await context.cookies();
+          const cookieStr = cookiesList.map((c) => `${c.name}=${c.value}`).join("; ");
+
+          // Also check localStorage for JWT tokens
+          const localStorageToken = await page.evaluate(() => {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (k) {
+                const v = localStorage.getItem(k) || "";
+                if (v.startsWith("eyJ") || k.toLowerCase().includes("token") || k.toLowerCase().includes("jwt")) {
+                  return v;
+                }
+              }
+            }
+            return null;
+          }).catch(() => null);
+
+          const finalToken = capturedToken || localStorageToken || undefined;
+          if (finalToken || cookieStr) {
+            log(`✅  Playwright: Interactive login successful! Session acquired.`);
+            await context.close();
+            return { bearerToken: finalToken, cookies: cookieStr, userId: capturedUserId };
+          }
+        }
+      } catch (err: any) {
+        log(`⚠️  Playwright login attempt failed on ${pageUrl}: ${err?.message || String(err)}`);
+      }
+    }
+
+    await context.close();
+  } catch (err: any) {
+    log(`⚠️  Playwright interactive login error: ${err?.message || String(err)}`);
+  } finally {
+    await releaseBrowser(scanId);
+  }
+
+  return null;
+}
+

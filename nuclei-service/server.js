@@ -9,6 +9,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3002;
 
+// Set this to true while debugging, false (or unset) in production —
+// controls whether stderr/args get echoed back in the API response.
+const DEBUG_SCAN = process.env.DEBUG_SCAN === "true";
+
 // ── Keep-Alive / Anti-Sleep Configuration ─────────────────────────────────────
 const KEEP_ALIVE_ENABLED = process.env.ENABLE_KEEP_ALIVE !== "false";
 const SELF_PING_INTERVAL_MS = parseInt(process.env.SELF_PING_INTERVAL_MS || "600000", 10); // 10 minutes default
@@ -21,17 +25,12 @@ const pingStats = {
   targetUrl: null,
 };
 
-// Start Keep-Alive self-ping background loop if enabled
 function startKeepAliveLoop() {
   if (!KEEP_ALIVE_ENABLED) {
     console.log("ℹ️  Keep-Alive self-ping is DISABLED via ENABLE_KEEP_ALIVE=false");
     return;
   }
 
-  // Determine target URL for self-ping:
-  // 1. SELF_PING_URL (user defined, e.g. https://nuclei-service.onrender.com)
-  // 2. RENDER_EXTERNAL_URL (automatically provided by Render on deployed Web Services)
-  // 3. Fallback to localhost
   const targetHost =
     process.env.SELF_PING_URL ||
     process.env.RENDER_EXTERNAL_URL ||
@@ -78,26 +77,51 @@ function getNucleiVersion() {
   }
 }
 
+// Resolve the template directory once at startup and log it loudly —
+// if this ever logs "NOT FOUND", every scan below is silently running
+// with zero templates (or falling back to Nuclei's own default lookup,
+// which will fail under -disable-update-check with no network).
+function resolveTemplateDir() {
+  const homeDir = process.env.HOME || "/root";
+  const candidates = ["/root/nuclei-templates", `${homeDir}/nuclei-templates`];
+
+  for (const dir of candidates) {
+    if (fs.existsSync(dir)) {
+      let count = 0;
+      try {
+        count = execSync(`find ${dir} -name "*.yaml" | wc -l`, { encoding: "utf8" }).trim();
+      } catch {
+        count = "unknown";
+      }
+      console.log(`✅ Template dir resolved: ${dir} (${count} templates)`);
+      return dir;
+    }
+  }
+
+  console.error(`❌ No template dir found. Checked: ${candidates.join(", ")} — scans will run with NO -t flag.`);
+  return null;
+}
+
+const RESOLVED_TEMPLATE_DIR = resolveTemplateDir();
+
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 
-// Root endpoint for default health check
 app.get("/", (req, res) => {
   res.status(200).send("Nuclei Vulnerability Scanning Microservice is online.");
 });
 
-// Health check endpoint
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "healthy",
     service: "nuclei-microservice",
     nucleiVersion: getNucleiVersion(),
+    templateDir: RESOLVED_TEMPLATE_DIR,
     uptimeSeconds: Math.floor(process.uptime()),
     keepAlive: pingStats,
     timestamp: new Date().toISOString(),
   });
 });
 
-// Endpoint to trigger Nuclei template updates
 app.post("/update-templates", (req, res) => {
   console.log("🔄 Triggering Nuclei template update...");
   try {
@@ -132,41 +156,43 @@ app.post("/scan", async (req, res) => {
     return res.status(400).json({ error: "target or targetUrl or host is required in request body" });
   }
 
-  // Basic sanitization
   if (typeof target !== "string" || target.startsWith("-") || /[;&|`$]/g.test(target)) {
     return res.status(400).json({ error: "Invalid target format" });
   }
 
   console.log(`🎯 Received Nuclei scan request for target: ${target}`);
 
-  const timeoutMs = Math.min(parseInt(customTimeoutMs || "180000", 10), 300_000); // capped at 5 mins
+  // Bumped default ceiling — a full unscoped template run against one host
+  // can genuinely take several minutes. If you need faster turnaround,
+  // scope with severity/tags rather than lowering this.
+  const timeoutMs = Math.min(parseInt(customTimeoutMs || "180000", 10), 600_000); // capped at 10 mins
 
-  // Determine home directory & template location
   const homeDir = process.env.HOME || "/root";
-  const defaultTemplateDir = fs.existsSync("/root/nuclei-templates")
-    ? "/root/nuclei-templates"
-    : fs.existsSync(`${homeDir}/nuclei-templates`)
-    ? `${homeDir}/nuclei-templates`
-    : null;
 
   const args = [
     "-u", target,
-    "-j",                       // Output in JSON lines format
-    "-silent",                  // Only print findings JSON
+    "-j",                       // JSONL output
+    "-silent",                  // only findings on stdout (warnings/errors still go to stderr)
     "-no-color",
     "-disable-update-check",
-    "-rate-limit", "80",        // Stable rate limit for cloud microservices
+    "-fr",                       // follow redirects — critical for Vercel/Next.js apps that
+    // redirect http->https, apex->www, or via middleware
+    "-timeout", "10",            // per-request timeout (seconds), keeps a slow target from
+    // starving the whole scan
+    "-rate-limit", "80",
     "-concurrency", "15",
   ];
 
-  if (defaultTemplateDir && !templates) {
-    args.push("-t", defaultTemplateDir);
-  } else if (templates && typeof templates === "string" && !/[;&|`$]/g.test(templates)) {
+  if (templates && typeof templates === "string" && !/[;&|`$]/g.test(templates)) {
     args.push("-t", templates);
+  } else if (RESOLVED_TEMPLATE_DIR) {
+    args.push("-t", RESOLVED_TEMPLATE_DIR);
   }
+  // else: intentionally no -t. Nuclei will fall back to its own default
+  // resolution, which is almost certainly wrong in this container — this
+  // case should never be hit if resolveTemplateDir() logged success at boot.
 
   if (severity && typeof severity === "string") {
-    // e.g. "critical,high,medium,low,info"
     const safeSev = severity.replace(/[^a-zA-Z,]/g, "");
     if (safeSev) args.push("-severity", safeSev);
   }
@@ -175,6 +201,8 @@ app.post("/scan", async (req, res) => {
     const safeTags = tags.replace(/[^a-zA-Z0-9,-]/g, "");
     if (safeTags) args.push("-tags", safeTags);
   }
+
+  console.log(`▶️  nuclei ${args.join(" ")}`);
 
   let stdout = "";
   let stderr = "";
@@ -193,6 +221,7 @@ app.post("/scan", async (req, res) => {
     });
 
     const timer = setTimeout(() => {
+      console.warn(`⏱️  Scan for ${target} hit ${timeoutMs}ms timeout — killing process`);
       proc.kill("SIGTERM");
     }, timeoutMs);
 
@@ -202,6 +231,11 @@ app.post("/scan", async (req, res) => {
       responded = true;
 
       console.log(`✅ Nuclei process exited with code ${code} for target: ${target}`);
+      if (stderr.trim()) {
+        // Always log server-side, even when DEBUG_SCAN is off — this is
+        // what tells you *why* a scan came back empty.
+        console.log(`   stderr: ${stderr.slice(0, 2000)}`);
+      }
 
       const findings = [];
       const lines = stdout.split("\n").filter((l) => l.trim().length > 0);
@@ -215,12 +249,23 @@ app.post("/scan", async (req, res) => {
         }
       }
 
-      res.status(200).json({
+      const responseBody = {
         target,
         count: findings.length,
         findings,
         rawCount: lines.length,
-      });
+        exitCode: code,
+      };
+
+      if (DEBUG_SCAN) {
+        responseBody.debug = {
+          args,
+          templateDir: RESOLVED_TEMPLATE_DIR,
+          stderr: stderr.slice(0, 4000),
+        };
+      }
+
+      res.status(200).json(responseBody);
     });
 
     proc.on("error", (err) => {

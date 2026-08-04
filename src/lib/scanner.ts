@@ -3,7 +3,7 @@ import { retrieveContext } from "./rag";
 import { generateFixReport } from "./cerebras";
 import { emitLog, cleanupScan } from "./scan-logger";
 import { sendScanReportEmail } from "./mail";
-import { renderWithBrowser, interactiveFormInjection, auditClientStorage, type InteractiveInjectionResult, type StorageFinding } from "./browser";
+import { renderWithBrowser, interactiveFormInjection, auditClientStorage, browserInteractiveLogin, type InteractiveInjectionResult, type StorageFinding } from "./browser";
 import { runNmapScan, type NmapFinding } from "./nmap";
 import { runNucleiScan, type NucleiFinding } from "./nuclei";
 import { registerScanController, cleanupScanController } from "./scan-controller";
@@ -211,8 +211,21 @@ async function attemptAutoLogin(
   targetUrl: string,
   log: (m: string) => void,
   session: AuthSession,
-  customAuth?: { email?: string; password?: string }
+  customAuth?: { email?: string; password?: string },
+  scanId?: string
 ): Promise<void> {
+  // Step 0: Try Playwright Browser Interactive Login for SPA / JS-rendered login forms
+  if (customAuth?.email && customAuth?.password && scanId) {
+    log(`🌐  Attempting Playwright SPA interactive login for ${customAuth.email}...`);
+    const browserResult = await browserInteractiveLogin(targetUrl, log, scanId, customAuth);
+    if (browserResult?.bearerToken || browserResult?.cookies) {
+      if (browserResult.bearerToken) session.bearerToken = browserResult.bearerToken;
+      if (browserResult.cookies) session.cookies = browserResult.cookies;
+      if (browserResult.userId) session.userId = browserResult.userId;
+      log(`✅  Auth session acquired via Playwright SPA interactive login!`);
+      return;
+    }
+  }
   const REST_LOGIN_PATHS = [
     "/rest/user/login", "/api/auth/login", "/api/login",
     "/api/v1/auth/login", "/auth/login", "/login", "/admin/login",
@@ -241,8 +254,10 @@ async function attemptAutoLogin(
 
   log("🔑  Attempting authenticated session acquisition...");
 
-  // Register scanner test accounts first so they exist on fresh targets (if custom auth is not supplied or fails)
-  await attemptAutoRegister(targetUrl, log);
+  // Register scanner test accounts only if custom auth is not supplied
+  if (!customAuth?.email || !customAuth?.password) {
+    await attemptAutoRegister(targetUrl, log);
+  }
 
   // ── Step 1: HTML Login Form Discovery & Submission ────────────────────────
   const loginPagesToProbe = [
@@ -4903,7 +4918,7 @@ export async function runVulnerabilityScan(
 
     // Attempt to acquire an authenticated session before the crawl begins
     log(`🔐  Phase 0b: Attempting auto-login to acquire authenticated session...`);
-    await attemptAutoLogin(targetUrl, log, session, customAuth);
+    await attemptAutoLogin(targetUrl, log, session, customAuth, scanId);
 
     // Also run TLS analysis in parallel with nmap
     log(`🔒  Phase 0c: TLS/SSL certificate inspection...`);
