@@ -14,9 +14,68 @@ const TARGET_PORTS = [
   2181, 2375, 2376, 4200, 9092,
 ];
 
-// Simple health check endpoint
+// ── Keep-Alive / Anti-Sleep Configuration ─────────────────────────────────────
+const KEEP_ALIVE_ENABLED = process.env.ENABLE_KEEP_ALIVE !== "false";
+const SELF_PING_INTERVAL_MS = parseInt(process.env.SELF_PING_INTERVAL_MS || "600000", 10); // 10 minutes default
+
+const pingStats = {
+  enabled: KEEP_ALIVE_ENABLED,
+  pingCount: 0,
+  lastPingTime: null,
+  lastPingStatus: null,
+  targetUrl: null,
+};
+
+function startKeepAliveLoop() {
+  if (!KEEP_ALIVE_ENABLED) {
+    console.log("ℹ️  Keep-Alive self-ping is DISABLED via ENABLE_KEEP_ALIVE=false");
+    return;
+  }
+
+  const targetHost =
+    process.env.SELF_PING_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    `http://localhost:${PORT}`;
+
+  const cleanTargetHost = targetHost.replace(/\/$/, "");
+  const pingEndpoint = `${cleanTargetHost}/health`;
+  pingStats.targetUrl = pingEndpoint;
+
+  console.log(`⏰ Starting Anti-Sleep Keep-Alive loop (pinging ${pingEndpoint} every ${SELF_PING_INTERVAL_MS / 1000}s)`);
+
+  setInterval(async () => {
+    try {
+      pingStats.lastPingTime = new Date().toISOString();
+      const response = await fetch(pingEndpoint, {
+        method: "GET",
+        headers: { "User-Agent": "Render-KeepAlive-Ping/1.0" },
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (response.ok) {
+        pingStats.pingCount++;
+        pingStats.lastPingStatus = `OK (${response.status})`;
+        console.log(`📡 [Keep-Alive Ping #${pingStats.pingCount}] Successfully pinged ${pingEndpoint} — service state reset`);
+      } else {
+        pingStats.lastPingStatus = `HTTP Error ${response.status}`;
+        console.warn(`⚠️ [Keep-Alive Ping] Ping to ${pingEndpoint} returned status ${response.status}`);
+      }
+    } catch (err) {
+      pingStats.lastPingStatus = `Error: ${err.message}`;
+      console.error(`❌ [Keep-Alive Ping] Ping failed:`, err.message);
+    }
+  }, SELF_PING_INTERVAL_MS);
+}
+
+// Health check endpoint
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy" });
+  res.status(200).json({
+    status: "healthy",
+    service: "nmap-microservice",
+    uptimeSeconds: Math.floor(process.uptime()),
+    keepAlive: pingStats,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // Root path handler to satisfy Render's default health check
@@ -94,4 +153,5 @@ app.post("/scan", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Nmap service listening on port ${PORT}`);
+  startKeepAliveLoop();
 });

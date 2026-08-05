@@ -132,6 +132,9 @@ export async function runNucleiScan(
 ): Promise<NucleiFinding[]> {
   const log = logFn ?? console.log;
 
+  // Clean target URL by removing client-side SPA hash fragments (e.g. /#/)
+  const cleanTargetUrl = targetUrl.split('#')[0] || targetUrl;
+
   // Check if explicitly disabled via environment variable
   if (process.env.ENABLE_NUCLEI === "false") {
     log(`ℹ️  Nuclei: scan disabled via ENABLE_NUCLEI=false`);
@@ -154,7 +157,7 @@ export async function runNucleiScan(
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          targetUrl,
+          targetUrl: cleanTargetUrl,
           severity: NUCLEI_SEVERITY,
           tags:     NUCLEI_TAGS,
           timeoutMs,  // microservice uses this as its own nuclei process timeout
@@ -176,7 +179,7 @@ export async function runNucleiScan(
       if (data.error) throw new Error(data.error);
 
       const rawFindings = data.findings || [];
-      const findings = rawFindings.map((item) => parseNucleiFinding(item, targetUrl));
+      const findings = rawFindings.map((item) => parseNucleiFinding(item, cleanTargetUrl));
 
       log(`✅  Nuclei: microservice scan complete — ${findings.length} template match(es) returned`);
       return findings;
@@ -190,10 +193,10 @@ export async function runNucleiScan(
 
   // ── Case 2: Local CLI Fallback (development only) ─────────────────────────
   return new Promise((resolve) => {
-    log(`☢️   Nuclei: running local CLI scan against ${targetUrl}...`);
+    log(`☢️   Nuclei: running local CLI scan against ${cleanTargetUrl}...`);
 
     const args = [
-      "-u", targetUrl,
+      "-u", cleanTargetUrl,
       "-j",
       "-silent",
       "-no-color",

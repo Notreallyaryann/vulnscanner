@@ -146,19 +146,22 @@ app.post("/update-templates", (req, res) => {
 
 // Scan endpoint
 app.post("/scan", async (req, res) => {
-  const target = req.body.target || req.body.targetUrl || req.body.host;
+  let rawTarget = req.body.target || req.body.targetUrl || req.body.host;
   const severity = req.body.severity; // e.g. "critical,high,medium"
   const tags = req.body.tags;         // e.g. "cve,exposure"
   const templates = req.body.templates; // specific template path/file
   const customTimeoutMs = req.body.timeoutMs;
 
-  if (!target) {
+  if (!rawTarget) {
     return res.status(400).json({ error: "target or targetUrl or host is required in request body" });
   }
 
-  if (typeof target !== "string" || target.startsWith("-") || /[;&|`$]/g.test(target)) {
+  if (typeof rawTarget !== "string" || rawTarget.startsWith("-") || /[;&|`$]/g.test(rawTarget)) {
     return res.status(400).json({ error: "Invalid target format" });
   }
+
+  // Strip client-side SPA hash fragments (e.g. /#/)
+  const target = rawTarget.split('#')[0] || rawTarget;
 
   console.log(`🎯 Received Nuclei scan request for target: ${target}`);
 
