@@ -127,8 +127,8 @@ function parseNucleiFinding(item: RawNucleiOutput, targetUrl: string): NucleiFin
 export async function runNucleiScan(
   targetUrl: string,
   logFn?: (msg: string) => void,
-  // 300s (5 min) scan budget — service gets timeoutMs to run nuclei; fetch gets +10s grace
-  timeoutMs = 300_000
+  // 45s fast scan budget — service gets timeoutMs to run nuclei; fetch gets +5s grace
+  timeoutMs = 45_000
 ): Promise<NucleiFinding[]> {
   const log = logFn ?? console.log;
 
@@ -148,10 +148,8 @@ export async function runNucleiScan(
     try {
       log(`☢️   Nuclei: dispatching scan to microservice (${serviceUrl})...`);
 
-      // Give the HTTP fetch 10s MORE than the nuclei scan budget so the
-      // service has time to finish nuclei and send the response before the
-      // connection is aborted by AbortSignal.timeout()
-      const fetchTimeoutMs = timeoutMs + 10_000;
+      // Give HTTP fetch 5s grace buffer over nuclei scan budget
+      const fetchTimeoutMs = timeoutMs + 5_000;
 
       const response = await fetch(`${serviceUrl.replace(/\/$/, "")}/scan`, {
         method:  "POST",

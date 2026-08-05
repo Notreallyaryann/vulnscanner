@@ -77,32 +77,58 @@ function getNucleiVersion() {
   }
 }
 
-// Resolve the template directory once at startup and log it loudly —
-// if this ever logs "NOT FOUND", every scan below is silently running
-// with zero templates (or falling back to Nuclei's own default lookup,
-// which will fail under -disable-update-check with no network).
-function resolveTemplateDir() {
+// ── Web-Relevant Template Subdirectories ──────────────────────────────────────
+// Instead of loading ALL ~12,000+ templates (network, DNS, IoT, cloud, etc.),
+// only load the ~500 web-relevant ones. This cuts scan time from 5+ min to ~15s.
+const WEB_TEMPLATE_SUBDIRS = [
+  "http/cves",                // known CVEs in web frameworks
+  "http/vulnerabilities",     // general web vulnerabilities
+  "http/exposures",           // exposed files, configs, backups
+  "http/misconfiguration",    // security misconfigs (CORS, headers, etc.)
+  "http/miscellaneous",       // other HTTP checks
+  "javascript/cves",          // JS framework CVEs
+];
+
+function resolveWebTemplatePaths() {
   const homeDir = process.env.HOME || "/root";
   const candidates = ["/root/nuclei-templates", `${homeDir}/nuclei-templates`];
 
+  let baseDir = null;
   for (const dir of candidates) {
     if (fs.existsSync(dir)) {
-      let count = 0;
-      try {
-        count = execSync(`find ${dir} -name "*.yaml" | wc -l`, { encoding: "utf8" }).trim();
-      } catch {
-        count = "unknown";
-      }
-      console.log(`✅ Template dir resolved: ${dir} (${count} templates)`);
-      return dir;
+      baseDir = dir;
+      break;
     }
   }
 
-  console.error(`❌ No template dir found. Checked: ${candidates.join(", ")} — scans will run with NO -t flag.`);
-  return null;
+  if (!baseDir) {
+    console.error(`❌ No template dir found. Checked: ${candidates.join(", ")}`);
+    return [];
+  }
+
+  // Resolve only existing subdirectories
+  const resolved = [];
+  for (const sub of WEB_TEMPLATE_SUBDIRS) {
+    const fullPath = `${baseDir}/${sub}`;
+    if (fs.existsSync(fullPath)) {
+      resolved.push(fullPath);
+    }
+  }
+
+  let totalCount = 0;
+  try {
+    const countCmd = resolved.map(d => `find ${d} -name "*.yaml"`).join("; ");
+    totalCount = execSync(`(${countCmd}) | wc -l`, { encoding: "utf8" }).trim();
+  } catch {
+    totalCount = "unknown";
+  }
+
+  console.log(`✅ Web template dirs resolved: ${resolved.length} subdirs (${totalCount} templates)`);
+  console.log(`   Paths: ${resolved.join(", ")}`);
+  return resolved;
 }
 
-const RESOLVED_TEMPLATE_DIR = resolveTemplateDir();
+const RESOLVED_WEB_TEMPLATE_PATHS = resolveWebTemplatePaths();
 
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -115,7 +141,8 @@ app.get("/health", (req, res) => {
     status: "healthy",
     service: "nuclei-microservice",
     nucleiVersion: getNucleiVersion(),
-    templateDir: RESOLVED_TEMPLATE_DIR,
+    templateDirs: RESOLVED_WEB_TEMPLATE_PATHS,
+    templateDirCount: RESOLVED_WEB_TEMPLATE_PATHS.length,
     uptimeSeconds: Math.floor(process.uptime()),
     keepAlive: pingStats,
     timestamp: new Date().toISOString(),
@@ -165,12 +192,10 @@ app.post("/scan", async (req, res) => {
 
   console.log(`🎯 Received Nuclei scan request for target: ${target}`);
 
-  // Bumped default ceiling — a full unscoped template run against one host
-  // can genuinely take several minutes. If you need faster turnaround,
-  // scope with severity/tags rather than lowering this.
+  // Fast turnaround scan budget — max 60s, default 45s, min 15s
   const timeoutMs = Math.max(
-    Math.min(parseInt(customTimeoutMs || "180000", 10), 600_000), // capped at 10 mins
-    120_000 // never allow a caller to set less than 2 minutes
+    Math.min(parseInt(customTimeoutMs || "45000", 10), 60_000), // capped at 60 seconds
+    15_000 // min 15 seconds
   );
 
   const homeDir = process.env.HOME || "/root";
@@ -178,12 +203,12 @@ app.post("/scan", async (req, res) => {
   const args = [
     "-u", target,
     "-j",                       // JSONL output
-    "-silent",                  // only findings on stdout (warnings/errors still go to stderr)
+    "-silent",                  // only findings on stdout
     "-no-color",
     "-disable-update-check",
     "-fr",                       // follow redirects
-    "-timeout", "3",             // 3s per-request timeout — keeps scan fast
-    "-max-host-error", "5",      // abort scan if host drops 5 requests (prevents 5-min stalls)
+    "-timeout", "2",             // 2s per-request timeout — prevents slow targets from hanging
+    "-max-host-error", "3",      // abort scan if host drops 3 requests (fast exit)
     "-rate-limit", "50",         // 50 req/sec — memory safe for 512MB free container
     "-concurrency", "10",        // 10 worker threads — prevents container OOM
     "-bulk-size", "25",
@@ -191,8 +216,11 @@ app.post("/scan", async (req, res) => {
 
   if (templates && typeof templates === "string" && !/[;&|`$]/g.test(templates)) {
     args.push("-t", templates);
-  } else if (RESOLVED_TEMPLATE_DIR) {
-    args.push("-t", RESOLVED_TEMPLATE_DIR);
+  } else if (RESOLVED_WEB_TEMPLATE_PATHS.length > 0) {
+    // Add each web-relevant subdirectory as a separate -t flag
+    for (const tPath of RESOLVED_WEB_TEMPLATE_PATHS) {
+      args.push("-t", tPath);
+    }
   }
 
   if (severity && typeof severity === "string") {
@@ -277,7 +305,7 @@ app.post("/scan", async (req, res) => {
       if (DEBUG_SCAN) {
         responseBody.debug = {
           args,
-          templateDir: RESOLVED_TEMPLATE_DIR,
+          templateDirs: RESOLVED_WEB_TEMPLATE_PATHS,
           stderr: stderr.slice(0, 4000),
         };
       }
