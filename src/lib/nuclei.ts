@@ -165,12 +165,13 @@ export async function runNucleiScan(
         signal: AbortSignal.timeout(fetchTimeoutMs),
       });
 
+      const responseText = await response.text();
+
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
-        throw new Error(`Nuclei service HTTP ${response.status}: ${errorText || response.statusText}`);
+        throw new Error(`Nuclei service HTTP ${response.status}: ${responseText.trim() || response.statusText}`);
       }
 
-      const data = (await response.json()) as {
+      const data = JSON.parse(responseText.trim()) as {
         findings?: RawNucleiOutput[];
         count?: number;
         error?: string;
@@ -185,7 +186,10 @@ export async function runNucleiScan(
       return findings;
 
     } catch (err) {
-      log(`⚠️   Nuclei microservice error: ${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error
+        ? `${err.message}${err.cause ? ` (${(err.cause as Error).message || String(err.cause)})` : ""}`
+        : String(err);
+      log(`⚠️   Nuclei microservice error: ${errMsg}`);
       // No local fallback — local binary won't be present in cloud/Vercel environments
       return [];
     }

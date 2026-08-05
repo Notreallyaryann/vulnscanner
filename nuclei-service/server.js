@@ -181,11 +181,12 @@ app.post("/scan", async (req, res) => {
     "-silent",                  // only findings on stdout (warnings/errors still go to stderr)
     "-no-color",
     "-disable-update-check",
-    "-fr",                       // follow redirects — critical for Vercel/Next.js apps that
-    // redirect http->https, apex->www, or via middleware
-    "-timeout", "5",             // per-request timeout (seconds) — prevents slow endpoints from stalling workers
-    "-rate-limit", "150",        // increased throughput for light requests
-    "-concurrency", "25",
+    "-fr",                       // follow redirects
+    "-timeout", "3",             // 3s per-request timeout — keeps scan fast
+    "-max-host-error", "5",      // abort scan if host drops 5 requests (prevents 5-min stalls)
+    "-rate-limit", "50",         // 50 req/sec — memory safe for 512MB free container
+    "-concurrency", "10",        // 10 worker threads — prevents container OOM
+    "-bulk-size", "25",
   ];
 
   if (templates && typeof templates === "string" && !/[;&|`$]/g.test(templates)) {
@@ -193,9 +194,6 @@ app.post("/scan", async (req, res) => {
   } else if (RESOLVED_TEMPLATE_DIR) {
     args.push("-t", RESOLVED_TEMPLATE_DIR);
   }
-  // else: intentionally no -t. Nuclei will fall back to its own default
-  // resolution, which is almost certainly wrong in this container — this
-  // case should never be hit if resolveTemplateDir() logged success at boot.
 
   if (severity && typeof severity === "string") {
     const safeSev = severity.replace(/[^a-zA-Z,]/g, "");
@@ -211,6 +209,20 @@ app.post("/scan", async (req, res) => {
 
   let stdout = "";
   let stderr = "";
+
+  // ── Heartbeat Keep-Alive to prevent Cloudflare/Render 100s proxy timeout ───
+  // Send HTTP 200 headers immediately and emit whitespace every 10s while nuclei runs
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.status(200);
+
+  const heartbeatTimer = setInterval(() => {
+    try {
+      res.write(" ");
+    } catch {
+      // Socket closed by client
+    }
+  }, 10_000);
 
   try {
     let responded = false;
@@ -232,13 +244,13 @@ app.post("/scan", async (req, res) => {
 
     proc.on("close", (code) => {
       clearTimeout(timer);
+      clearInterval(heartbeatTimer);
+
       if (responded) return;
       responded = true;
 
       console.log(`✅ Nuclei process exited with code ${code} for target: ${target}`);
       if (stderr.trim()) {
-        // Always log server-side, even when DEBUG_SCAN is off — this is
-        // what tells you *why* a scan came back empty.
         console.log(`   stderr: ${stderr.slice(0, 2000)}`);
       }
 
@@ -270,26 +282,36 @@ app.post("/scan", async (req, res) => {
         };
       }
 
-      res.status(200).json(responseBody);
+      res.write(JSON.stringify(responseBody));
+      res.end();
     });
 
     proc.on("error", (err) => {
       clearTimeout(timer);
+      clearInterval(heartbeatTimer);
       if (responded) return;
       responded = true;
 
       console.error(`❌ Nuclei process error:`, err);
       const isNotFound = err.code === "ENOENT" || err.message.includes("ENOENT");
-      res.status(500).json({
+      const errPayload = {
         error: isNotFound
           ? "Nuclei binary not found in PATH on host/container. Install nuclei or deploy via Docker."
           : err.message || "Failed to start nuclei scan",
-      });
+      };
+      res.write(JSON.stringify(errPayload));
+      res.end();
     });
 
   } catch (error) {
+    clearInterval(heartbeatTimer);
     console.error(`❌ Exception during scan dispatch:`, error);
-    res.status(500).json({ error: error.message || "Internal server error during scan" });
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message || "Internal server error during scan" });
+    } else {
+      res.write(JSON.stringify({ error: error.message || "Internal server error during scan" }));
+      res.end();
+    }
   }
 });
 
