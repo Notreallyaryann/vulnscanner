@@ -3,7 +3,7 @@
 import { prisma } from "./prisma";
 import { runVulnerabilityScan } from "./scanner";
 import { retrieveContext, searchPastFindings } from "./rag";
-import { answerFromContext } from "./cerebras";
+import { answerFromContext } from "./openrouter";
 
 /**
  * Initiates a new vulnerability scan.
@@ -126,7 +126,17 @@ export async function getScanDetailsAction(scanId: string) {
       };
     });
 
-    return { ...scan, findings: parsedFindings };
+    const scanObj = scan as any;
+    let parsedRecon = null;
+    if (scanObj.reconData) {
+      try {
+        parsedRecon = typeof scanObj.reconData === "string" ? JSON.parse(scanObj.reconData) : scanObj.reconData;
+      } catch {
+        parsedRecon = scanObj.reconData;
+      }
+    }
+
+    return { ...scan, reconData: parsedRecon, findings: parsedFindings };
   } catch (error) {
     console.error(`Failed to fetch details for scan ${scanId}:`, error);
     return null;

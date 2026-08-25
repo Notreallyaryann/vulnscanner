@@ -17,6 +17,7 @@ model Scan {
   authEmail    String?
   authPassword String?
   status       ScanStatus @default(PENDING)
+  reconData    Json?
   createdAt    DateTime   @default(now())
   completedAt  DateTime?
 

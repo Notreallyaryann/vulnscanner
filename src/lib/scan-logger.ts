@@ -1,22 +1,11 @@
-/**
- * scan-logger.ts
- * In-memory pub/sub log bus for real-time scan progress streaming.
- *
- * How it works:
- *  1. scanner.ts calls `emitLog(scanId, message)` at each step.
- *  2. The SSE route at /api/scan-logs/[scanId] subscribes via `subscribe()`.
- *  3. The client's EventSource receives each log line as it is emitted.
- *
- * We store a rolling buffer of up to MAX_LINES per scan so late-joining
- * clients (e.g. a page refresh) can still get the recent history.
- */
+
 
 export interface ScanLogEntry {
   ts: number;   // Unix ms
   msg: string;
 }
 
-const MAX_LINES = 200;
+const MAX_LINES = 1000;
 
 // Buffer: scanId → array of log entries
 const logBuffer = new Map<string, ScanLogEntry[]>();

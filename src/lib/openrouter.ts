@@ -1,22 +1,18 @@
-const CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1";
-const MODEL = "gpt-oss-120b";
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct";
 
 let _rotatorIndex = 0;
 
 function getApiKeys(): string[] {
     const keys = [
-        process.env.CEREBRAS_API_KEY_1,
-        process.env.CEREBRAS_API_KEY_2,
-        process.env.CEREBRAS_API_KEY_3,
-        process.env.CEREBRAS_API_KEY_4,
-        process.env.CEREBRAS_API_KEY_5,
-        // Legacy single key fallback
-        process.env.CEREBRAS_API_KEY,
+        process.env.OPENROUTER_API_KEY_1,
+        process.env.OPENROUTER_API_KEY_2,
+        process.env.OPENROUTER_API_KEY_3,
+        process.env.OPENROUTER_API_KEY,
     ]
         .filter((k): k is string => !!k && k.trim() !== "" && k !== "undefined")
         .map((k) => k.trim());
 
-    // Deduplicate in case single key and key_1 are the same
     return [...new Set(keys)];
 }
 
@@ -26,49 +22,66 @@ function getNextKey(keys: string[]): { key: string; index: number } {
     return { key: keys[index], index };
 }
 
-async function cerebrasRequest(
+async function openrouterRequest(
     payload: object,
-    retryOnRateLimit = true
+    attemptCount = 0
 ): Promise<Response> {
     const keys = getApiKeys();
     if (keys.length === 0) throw new Error("NO_KEYS");
 
-    const { key, index } = getNextKey(keys);
-
-    const resp = await fetch(`${CEREBRAS_BASE_URL}/chat/completions`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${key}`,
-        },
-        body: JSON.stringify(payload),
-    });
-
-    // If rate-limited and we have more keys, retry with next key
-    if (resp.status === 429 && retryOnRateLimit && keys.length > 1) {
-        console.warn(`⚠️ Cerebras key[${index + 1}] hit rate limit (429). Rotating to next key...`);
-        return cerebrasRequest(payload, false); // one retry with next key
+    // Allow at most keys.length attempts across all available keys
+    if (attemptCount >= keys.length) {
+        throw new Error("ALL_KEYS_EXHAUSTED");
     }
 
-    return resp;
-}
+    const { key, index } = getNextKey(keys);
 
+    try {
+        const resp = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${key}`,
+                "HTTP-Referer": "http://localhost:3000",
+                "X-Title": "VulnScanner",
+            },
+            body: JSON.stringify(payload),
+        });
+
+        // If rate-limited (429) or server error (5xx), rotate key and retry
+        if ((resp.status === 429 || resp.status >= 500) && keys.length > 1) {
+            console.warn(
+                `⚠️ OpenRouter key[${index + 1}] returned HTTP ${resp.status}. Rotating to next key (attempt ${attemptCount + 1}/${keys.length})...`
+            );
+            return openrouterRequest(payload, attemptCount + 1);
+        }
+
+        return resp;
+    } catch (err: any) {
+        if (keys.length > 1 && attemptCount + 1 < keys.length) {
+            console.warn(
+                `⚠️ Network failure using OpenRouter key[${index + 1}]: ${err?.message}. Rotating to next key...`
+            );
+            return openrouterRequest(payload, attemptCount + 1);
+        }
+        throw err;
+    }
+}
 
 export interface FixReport {
     title: string;
-    explanation: string; // plain English: what happened, why it's dangerous
-    attackSimulation: string; // what an attacker actually does
-    fixSteps: string[]; // ordered remediation steps
+    explanation: string;
+    attackSimulation: string;
+    fixSteps: string[];
     codeExample: {
         vulnerable: string;
         fixed: string;
         language: string;
     };
-    references: string[]; // OWASP/CWE links
+    references: string[];
 }
 
-// Offline/Mock mode fallback to provide instant, detailed reports
-function getMockFixReport(params: {
+export function getMockFixReport(params: {
     findingType: string;
     url: string;
     parameter?: string;
@@ -259,9 +272,8 @@ function getMockFixReport(params: {
         };
     }
 
-    // Default fallback with human-readable title
     const humanTitle = params.findingType
-        .replace(/[-_]+/g, ' ')
+        .replace(/[-_]+/g, " ")
         .replace(/\b\w/g, (c) => c.toUpperCase());
 
     return {
@@ -294,21 +306,20 @@ export async function generateFixReport(params: {
 }): Promise<FixReport> {
     const { findingType, url, parameter, evidence, cveId, ragContext } = params;
 
-    // Gracefully handle missing API Keys (Offline / Mock Mode fallback)
     const availableKeys = getApiKeys();
     if (availableKeys.length === 0) {
-        console.log(`🤖 No Cerebras API keys configured. Falling back to mock fix report for: "${findingType}"`);
+        console.log(`🤖 No OpenRouter API keys configured. Falling back to mock fix report for: "${findingType}"`);
         return getMockFixReport(params);
     }
 
-    console.log(`🔑 Using Cerebras key rotator (${availableKeys.length} key(s) available). Current index: ${_rotatorIndex}.`);
+    console.log(`🔑 Using OpenRouter key rotator (${availableKeys.length} key(s) available). Current rotator index: ${_rotatorIndex}.`);
+
+    const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
 
     const systemPrompt = `You are a senior application security engineer. 
 Your job is to produce clear, accurate security advisories for developers.
 Always respond with valid JSON only — no markdown, no preamble.`;
 
-    // Hard caps on variable-length fields to keep total prompt tokens well under the
-    // Cerebras 64k limit. RAG context is also capped in rag.ts, but we guard here too.
     const safeEvidence = (evidence ?? "").slice(0, 300);
     const safeContext = ragContext.slice(0, 1200);
 
@@ -341,9 +352,9 @@ Respond with a JSON object containing exactly these fields:
 
     let response: Response;
     try {
-        response = await cerebrasRequest({
-            model: MODEL,
-            max_tokens: 2500, // Increased to prevent truncation of complex JSON output
+        response = await openrouterRequest({
+            model,
+            max_tokens: 2500,
             temperature: 0.2,
             response_format: { type: "json_object" },
             messages: [
@@ -352,13 +363,16 @@ Respond with a JSON object containing exactly these fields:
             ],
         });
     } catch (e: any) {
-        if (e.message === "NO_KEYS") return getMockFixReport(params);
+        if (e.message === "NO_KEYS" || e.message === "ALL_KEYS_EXHAUSTED") {
+            console.warn(`⚠️ OpenRouter request failed (${e.message}). Falling back to mock fix report.`);
+            return getMockFixReport(params);
+        }
         throw e;
     }
 
     if (!response.ok) {
         const err = await response.text();
-        console.error(`Cerebras API error (${response.status}): ${err}. Falling back to mock.`);
+        console.error(`OpenRouter API error (${response.status}): ${err}. Falling back to mock.`);
         return getMockFixReport(params);
     }
 
@@ -366,7 +380,7 @@ Respond with a JSON object containing exactly these fields:
         const data = await response.json();
         const raw = data?.choices?.[0]?.message?.content;
         if (!raw) {
-            console.warn(`⚠️ Cerebras response format invalid or empty. Falling back to mock.`);
+            console.warn(`⚠️ OpenRouter response format invalid or empty. Falling back to mock.`);
             return getMockFixReport(params);
         }
 
@@ -375,21 +389,19 @@ Respond with a JSON object containing exactly these fields:
         try {
             return JSON.parse(clean) as FixReport;
         } catch (parseError) {
-            // If the model hit max_tokens and truncated the response, try to repair the JSON
             try {
-                // A basic heuristic to close truncated JSON objects or arrays at the end of the string
                 let repaired = clean;
                 if (repaired.lastIndexOf('"') > repaired.lastIndexOf('}')) repaired += '"';
                 if (repaired.lastIndexOf('[') > repaired.lastIndexOf(']')) repaired += ']';
                 repaired += '}';
                 return JSON.parse(repaired) as FixReport;
             } catch (repairError) {
-                console.warn(`⚠️ Failed to parse/repair Cerebras JSON response. Truncated output. Falling back to mock.`);
+                console.warn(`⚠️ Failed to parse/repair OpenRouter JSON response. Falling back to mock.`);
                 return getMockFixReport(params);
             }
         }
     } catch (err: any) {
-        console.error(`⚠️ Error parsing Cerebras API response: ${err?.message ?? String(err)}. Falling back to mock.`);
+        console.error(`⚠️ Error parsing OpenRouter API response: ${err?.message ?? String(err)}. Falling back to mock.`);
         return getMockFixReport(params);
     }
 }
@@ -398,17 +410,18 @@ export async function answerFromContext(
     query: string,
     context: string
 ): Promise<string> {
-    // Gracefully handle missing API Keys (Offline / Mock Mode fallback)
     const availableKeysForChat = getApiKeys();
     if (availableKeysForChat.length === 0) {
-        console.log("🤖 No Cerebras API keys configured. Returning offline mock RAG response.");
-        return `⚠️ **Offline Mode**: Add your Cerebras API keys to your \`.env\` file (CEREBRAS_API_KEY_1, _2, _3) to enable live AI answers.\n\nBased on the local security guidelines:\n${context.substring(0, 400)}...`;
+        console.log("🤖 No OpenRouter API keys configured. Returning offline mock RAG response.");
+        return `⚠️ **Offline Mode**: Add your OpenRouter API keys to your \`.env\` file (OPENROUTER_API_KEY_1, _2, _3) to enable live AI answers.\n\nBased on the local security guidelines:\n${context.substring(0, 400)}...`;
     }
+
+    const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
 
     let chatResponse: Response;
     try {
-        chatResponse = await cerebrasRequest({
-            model: MODEL,
+        chatResponse = await openrouterRequest({
+            model,
             max_tokens: 600,
             temperature: 0.3,
             messages: [
@@ -423,13 +436,15 @@ export async function answerFromContext(
             ],
         });
     } catch (e: any) {
-        if (e.message === "NO_KEYS") return "No API keys configured. Please add Cerebras API keys to your .env file.";
+        if (e.message === "NO_KEYS" || e.message === "ALL_KEYS_EXHAUSTED") {
+            return "No valid API keys available. Please check your OpenRouter API keys in .env.";
+        }
         throw e;
     }
 
     if (!chatResponse.ok) {
         const err = await chatResponse.text();
-        throw new Error(`Cerebras API error: ${err}`);
+        throw new Error(`OpenRouter API error: ${err}`);
     }
 
     const data = await chatResponse.json();

@@ -1,6 +1,6 @@
 # VulnScanner 🛡️
 
-**VulnScanner** is an advanced, full-stack automated web application vulnerability scanner built with **Next.js**, **React**, and **Prisma**. It features headless browser verification via Playwright, Acorn AST static code analysis, Nmap network scanning, and AI-powered vulnerability remediation reports powered by **Cerebras AI** and **RAG (Retrieval-Augmented Generation)**.
+**VulnScanner** is an advanced, full-stack automated web application vulnerability scanner built with **Next.js**, **React**, and **Prisma**. It features headless browser verification via Playwright, Acorn AST static code analysis, Nmap network scanning, and AI-powered vulnerability remediation reports powered by **OpenRouter AI** and **RAG (Retrieval-Augmented Generation)**.
 
 ---
 
@@ -15,7 +15,7 @@
 - 🌳 **Acorn AST Static Analysis**: Parses client-side JavaScript bundles into Abstract Syntax Trees (AST) using `acorn` and `acorn-walk` to accurately identify dangerous DOM sinks (`eval`, `document.write`, `innerHTML`) and hardcoded secrets with line-level evidence.
 - 🌐 **Headless Browser Verification**: Uses **Playwright** to verify real client-side JavaScript hydration, evaluate DOM-XSS sink execution in dynamic SPAs, and capture intercepted network requests.
 - 📡 **Nmap Integration**: Port scanning and service fingerprinting via a dedicated containerized microservice.
-- 🤖 **AI-Powered Remediation Reports**: Integrates **Cerebras AI** and vector-based **RAG** to generate custom, context-aware code fixes and remediation guides for discovered vulnerabilities.
+- 🤖 **AI-Powered Remediation Reports**: Integrates **OpenRouter AI** (with multi-key round-robin rotation and automatic 429 rate-limit failover) and vector-based **RAG** to generate custom, context-aware code fixes and remediation guides for discovered vulnerabilities.
 - 📧 **Automated Email Reports**: Delivers HTML scan summary reports via Nodemailer.
 
 ---
@@ -35,7 +35,8 @@ vulnscanner/
 │       │   └── probes/         # Vulnerability probe sub-modules (SQLi, XSS, API)
 │       ├── browser.ts      # Headless browser rendering & hydration logic
 │       ├── browser-pool.ts # Playwright browser instance lifecycle manager
-│       ├── cerebras.ts     # Cerebras AI report generation integration
+│       ├── openrouter.ts   # OpenRouter AI integration with multi-key rotation
+│       ├── cerebras.ts     # Compatibility wrapper re-exporting openrouter.ts
 │       ├── rag.ts          # RAG context retriever for remediation
 │       ├── nmap.ts         # Network port scanner integration
 │       └── mail.ts         # Nodemailer report dispatcher

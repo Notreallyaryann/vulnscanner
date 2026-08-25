@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3002;
 const DEBUG_SCAN = process.env.DEBUG_SCAN === "true";
 
 // ── Keep-Alive / Anti-Sleep Configuration ─────────────────────────────────────
-const KEEP_ALIVE_ENABLED = process.env.ENABLE_KEEP_ALIVE !== "false";
+const KEEP_ALIVE_ENABLED = process.env.ENABLE_KEEP_ALIVE === "true";
 const SELF_PING_INTERVAL_MS = parseInt(process.env.SELF_PING_INTERVAL_MS || "600000", 10); // 10 minutes default
 
 const pingStats = {
@@ -27,7 +27,7 @@ const pingStats = {
 
 function startKeepAliveLoop() {
   if (!KEEP_ALIVE_ENABLED) {
-    console.log("ℹ️  Keep-Alive self-ping is DISABLED via ENABLE_KEEP_ALIVE=false");
+    console.log("ℹ️  Keep-Alive self-ping auto wake up is DISABLED by default (prevents exhausting Render free tier hours)");
     return;
   }
 
@@ -91,7 +91,13 @@ const WEB_TEMPLATE_SUBDIRS = [
 
 function resolveWebTemplatePaths() {
   const homeDir = process.env.HOME || "/root";
-  const candidates = ["/root/nuclei-templates", `${homeDir}/nuclei-templates`];
+  const candidates = [
+    "/root/nuclei-templates",
+    `${homeDir}/nuclei-templates`,
+    `${homeDir}/.local/nuclei-templates`,
+    `${process.cwd()}/nuclei-templates`,
+    "./nuclei-templates",
+  ];
 
   let baseDir = null;
   for (const dir of candidates) {
@@ -102,7 +108,7 @@ function resolveWebTemplatePaths() {
   }
 
   if (!baseDir) {
-    console.error(`❌ No template dir found. Checked: ${candidates.join(", ")}`);
+    console.log(`ℹ️  No local template dir found. Default Nuclei templates will be used if nuclei CLI is installed or when deployed via Docker.`);
     return [];
   }
 

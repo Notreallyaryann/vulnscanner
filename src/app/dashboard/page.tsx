@@ -164,7 +164,7 @@ interface ChatMessage {
 
 export default function DashboardPage() {
   // Navigation State
-  const [activeTab, setActiveTab] = useState<"dashboard" | "scans" | "rag">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "recon" | "scans" | "rag">("dashboard");
 
   // Real-time clock
   const [now, setNow] = useState(new Date());
@@ -228,7 +228,12 @@ export default function DashboardPage() {
       const autoDomain = params.get("domain");
       const autoEmail = params.get("email");
       const autoAuthEmail = params.get("authEmail");
-      const autoAuthPassword = params.get("authPassword");
+      // Read authPassword from sessionStorage (not URL — prevents credential leakage)
+      let autoAuthPassword: string | null = null;
+      try {
+        autoAuthPassword = sessionStorage.getItem("__vscan_authpwd");
+        if (autoAuthPassword) sessionStorage.removeItem("__vscan_authpwd");
+      } catch {}
       if (autoDomain) {
         scanInitiated.current = true;
         // Clean the URL param immediately to prevent re-triggering on any remount
@@ -348,6 +353,9 @@ export default function DashboardPage() {
         } else {
           // If still running, update the current screen scan state
           setSelectedScan(details);
+          if (!selectedFinding && details.findings && details.findings.length > 0) {
+            setSelectedFinding(details.findings[0] as Finding);
+          }
         }
       }
     }, 1500);
@@ -605,7 +613,17 @@ export default function DashboardPage() {
               Audits Dashboard
             </button>
 
-            {/* Scanner History Button Removed Temporarily */}
+            <button
+              onClick={() => setActiveTab("recon")}
+              className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-semibold transition-all cursor-pointer ${
+                activeTab === "recon"
+                  ? "bg-stone-100 border-l-4 border-[#D4380D] text-stone-900 font-bold"
+                  : "text-stone-600 hover:text-stone-900 hover:bg-stone-50"
+              }`}
+            >
+              <Globe className="w-4 h-4 text-[#D4380D]" />
+              Recon Intelligence
+            </button>
 
             <button
               onClick={() => setActiveTab("rag")}
@@ -1254,6 +1272,204 @@ export default function DashboardPage() {
                   </tbody>
                 </table>
               </div>
+            </div>
+          )}
+
+          {/* TAB 2: RECON INTELLIGENCE DASHBOARD */}
+          {activeTab === "recon" && (
+            <div className="space-y-6">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-6 rounded-xl border border-stone-200/80 shadow-sm">
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <Globe className="w-5 h-5 text-[#D4380D]" />
+                    <h2 className="text-xl font-extrabold text-stone-900">Reconnaissance & Asset Intelligence</h2>
+                  </div>
+                  <p className="text-xs text-stone-600">
+                    Non-vulnerability asset telemetry: WHOIS registry, domain expiration tracking, Certificate Transparency subdomains, detected framework versions, and API endpoint inventories.
+                  </p>
+                </div>
+
+                {selectedScan && (
+                  <div className="text-right font-mono text-xs text-stone-500">
+                    <p className="font-bold text-stone-900">{selectedScan.targetUrl}</p>
+                    <p className="text-[11px] text-stone-400">Scan ID: {selectedScan.id.slice(0, 8)}</p>
+                  </div>
+                )}
+              </div>
+
+              {!selectedScan ? (
+                <div className="cyber-card p-12 rounded-xl text-center text-stone-500 bg-white border border-stone-200">
+                  <Globe className="w-12 h-12 opacity-20 mx-auto mb-3 text-stone-400" />
+                  <p className="font-bold text-stone-800 text-sm">No Active Scan Selected</p>
+                  <p className="text-xs text-stone-500 mt-1 mb-4">Select a scan from the Audits Dashboard or launch a new audit to inspect recon intelligence.</p>
+                  <button
+                    onClick={() => setActiveTab("dashboard")}
+                    className="px-4 py-2 rounded-lg text-xs font-semibold bg-[#D4380D] text-white hover:bg-[#B5300A] transition-all cursor-pointer"
+                  >
+                    Go to Dashboard
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  {/* WHOIS & Domain Expiration Intel Card */}
+                  <div className="cyber-card p-6 rounded-xl bg-white border border-stone-200/80">
+                    <div className="flex items-center justify-between border-b border-stone-150 pb-4 mb-4">
+                      <div className="flex items-center gap-2">
+                        <Database className="w-4 h-4 text-[#D4380D]" />
+                        <h3 className="text-sm font-extrabold text-stone-900 uppercase tracking-wider">Domain WHOIS & Expiration Registry</h3>
+                      </div>
+                      {selectedScan.reconData?.whois?.isExpired && (
+                        <span className="px-2.5 py-1 text-xs font-bold rounded bg-red-100 border border-red-300 text-red-800 animate-pulse">
+                          ⚠️ DOMAIN EXPIRED
+                        </span>
+                      )}
+                    </div>
+
+                    {selectedScan.reconData?.whois ? (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-mono">
+                        <div className="p-3 rounded-lg bg-stone-50 border border-stone-200">
+                          <span className="text-stone-400 block text-[10px] uppercase font-sans">Registrar</span>
+                          <span className="font-bold text-stone-900 text-sm">{selectedScan.reconData.whois.registrar || "Not Disclosed"}</span>
+                        </div>
+                        <div className="p-3 rounded-lg bg-stone-50 border border-stone-200">
+                          <span className="text-stone-400 block text-[10px] uppercase font-sans">Registration Date</span>
+                          <span className="font-bold text-stone-900">
+                            {selectedScan.reconData.whois.registeredAt
+                              ? new Date(selectedScan.reconData.whois.registeredAt).toLocaleDateString()
+                              : "Unknown"}
+                          </span>
+                        </div>
+                        <div className="p-3 rounded-lg bg-stone-50 border border-stone-200">
+                          <span className="text-stone-400 block text-[10px] uppercase font-sans">Expiration Date</span>
+                          <span className={`font-bold ${selectedScan.reconData.whois.isExpired ? "text-red-700" : "text-stone-900"}`}>
+                            {selectedScan.reconData.whois.expiresAt
+                              ? new Date(selectedScan.reconData.whois.expiresAt).toLocaleDateString()
+                              : "Unknown"}
+                          </span>
+                        </div>
+                        <div className="p-3 rounded-lg bg-stone-50 border border-stone-200">
+                          <span className="text-stone-400 block text-[10px] uppercase font-sans">Days Until Expiration</span>
+                          <span className={`font-bold text-sm ${
+                            selectedScan.reconData.whois.daysUntilExpiration !== undefined && selectedScan.reconData.whois.daysUntilExpiration < 30
+                              ? "text-amber-600"
+                              : "text-emerald-700"
+                          }`}>
+                            {selectedScan.reconData.whois.daysUntilExpiration !== undefined
+                              ? `${selectedScan.reconData.whois.daysUntilExpiration} Days`
+                              : "N/A"}
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="p-4 rounded-lg bg-stone-50 text-xs text-stone-500 border border-stone-200">
+                        ℹ️ WHOIS / RDAP lookup for apex domain <code className="font-bold">{selectedScan.targetUrl}</code> is being resolved or RDAP query had no public privacy release.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Certificate Transparency Subdomains (crt.sh / crt.name) */}
+                  <div className="cyber-card p-6 rounded-xl bg-white border border-stone-200/80">
+                    <div className="flex items-center justify-between border-b border-stone-150 pb-4 mb-4">
+                      <div className="flex items-center gap-2">
+                        <Server className="w-4 h-4 text-[#D4380D]" />
+                        <h3 className="text-sm font-extrabold text-stone-900 uppercase tracking-wider">
+                          Discovered Subdomains (CT Logs — crt.sh / crt.name)
+                        </h3>
+                      </div>
+                      <span className="px-2 py-0.5 text-xs font-bold rounded bg-orange-50 border border-orange-200 text-[#D4380D] font-mono">
+                        {selectedScan.reconData?.subdomains?.length || 0} Subdomains
+                      </span>
+                    </div>
+
+                    {selectedScan.reconData?.subdomains && selectedScan.reconData.subdomains.length > 0 ? (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 max-h-64 overflow-y-auto p-1 font-mono text-xs">
+                        {selectedScan.reconData.subdomains.map((sub: string, idx: number) => (
+                          <a
+                            key={idx}
+                            href={`https://${sub}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="p-2 rounded bg-stone-50 border border-stone-200 hover:border-[#D4380D] hover:bg-orange-50/50 text-stone-800 hover:text-[#D4380D] transition-all truncate flex items-center justify-between"
+                          >
+                            <span className="truncate">{sub}</span>
+                            <ChevronRight className="w-3 h-3 text-stone-400 flex-shrink-0" />
+                          </a>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="p-4 rounded-lg bg-stone-50 text-xs text-stone-500 border border-stone-200">
+                        No subdomains discovered in CT logs or target is an isolated apex domain.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Software Stack & Version Fingerprinting */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div className="cyber-card p-6 rounded-xl bg-white border border-stone-200/80">
+                      <div className="flex items-center gap-2 border-b border-stone-150 pb-4 mb-4">
+                        <Layers className="w-4 h-4 text-[#D4380D]" />
+                        <h3 className="text-sm font-extrabold text-stone-900 uppercase tracking-wider">Software Stack & Versions</h3>
+                      </div>
+
+                      {(() => {
+                        const techFindings = selectedScan.findings?.filter((f: any) => f.type === "technology-fingerprinting" || f.type === "service-version-disclosure" || f.type === "server-version-disclosure") || [];
+                        const reconTechs = selectedScan.reconData?.techStack || [];
+                        if (techFindings.length === 0 && reconTechs.length === 0) {
+                          return <div className="p-4 rounded-lg bg-stone-50 text-xs text-stone-500">No framework/version signatures detected.</div>;
+                        }
+                        return (
+                          <ul className="space-y-2.5">
+                            {reconTechs.map((t: any, idx: number) => (
+                              <li key={idx} className="p-3 rounded-lg bg-stone-50 border border-stone-200 flex items-center justify-between text-xs">
+                                <span className="font-bold text-stone-900">{t.name}</span>
+                                <span className="px-2 py-0.5 text-[10px] font-mono font-bold bg-stone-200/60 text-stone-700 rounded">
+                                  {t.category || "Detected Stack"}
+                                </span>
+                              </li>
+                            ))}
+                            {techFindings.map((f: any, idx: number) => (
+                              <li key={idx} className="p-3 rounded-lg bg-stone-50 border border-stone-200 text-xs space-y-1">
+                                <div className="flex justify-between items-center font-mono text-[11px] text-[#D4380D] font-bold">
+                                  <span>{f.parameter || f.type}</span>
+                                </div>
+                                <p className="text-stone-700 text-xs">{f.evidence}</p>
+                              </li>
+                            ))}
+                          </ul>
+                        );
+                      })()}
+                    </div>
+
+                    {/* Discovered API Endpoints Inventory */}
+                    <div className="cyber-card p-6 rounded-xl bg-white border border-stone-200/80">
+                      <div className="flex items-center justify-between border-b border-stone-150 pb-4 mb-4">
+                        <div className="flex items-center gap-2">
+                          <FileCode className="w-4 h-4 text-[#D4380D]" />
+                          <h3 className="text-sm font-extrabold text-stone-900 uppercase tracking-wider">API Surface & Endpoints Inventory</h3>
+                        </div>
+                        <span className="px-2 py-0.5 text-xs font-bold rounded bg-[#D4380D]/10 text-[#D4380D] font-mono">
+                          {selectedScan.reconData?.apiEndpoints?.length || 0} APIs
+                        </span>
+                      </div>
+
+                      {selectedScan.reconData?.apiEndpoints && selectedScan.reconData.apiEndpoints.length > 0 ? (
+                        <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                          {selectedScan.reconData.apiEndpoints.map((api: any, idx: number) => (
+                            <div key={idx} className="p-2.5 rounded bg-stone-50 border border-stone-200 text-xs font-mono flex items-center justify-between">
+                              <span className="text-stone-900 truncate font-bold">{api.url}</span>
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 border border-blue-200 text-blue-700 font-sans font-bold">API</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-4 rounded-lg bg-stone-50 text-xs text-stone-500 border border-stone-200">
+                          No background REST/GraphQL API endpoints discovered during crawling.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

@@ -44,7 +44,7 @@ export async function retrieveContext(
 
     // Format chunks into a single context string for the LLM prompt.
     // Each chunk content is capped at 400 chars; total context capped at 1500 chars
-    // to prevent the downstream Cerebras prompt from exceeding the token limit.
+    // to prevent the downstream OpenRouter prompt from exceeding the token limit.
     const MAX_CHUNK_CHARS = 400;
     const MAX_TOTAL_CHARS = 1500;
 

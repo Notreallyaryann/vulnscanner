@@ -57,7 +57,7 @@ const FAQ_ITEMS: FaqItem[] = [
   },
   {
     question: "How does the AI RAG remediation work?",
-    answer: "When a vulnerability is identified, VulnScanner pulls reference guidelines from its local OWASP, CWE, and NVD vector knowledge base, combines it with the scan findings, and uses Cerebras Llama 3.1 to generate exact, contextual code fixes.",
+    answer: "When a vulnerability is identified, VulnScanner pulls reference guidelines from its local OWASP, CWE, and NVD vector knowledge base, combines it with the scan findings, and uses OpenRouter AI (Llama 3.3 70B) to generate exact, contextual code fixes.",
   },
   {
     question: "Will the security audit impact my server's performance?",
@@ -122,8 +122,10 @@ export default function LandingPage() {
     if (authEmail.trim()) {
       queryParams.set("authEmail", authEmail.trim());
     }
+    // authPassword intentionally NOT put in URL (would leak via browser history / server logs)
+    // Pass via sessionStorage instead so dashboard page.tsx can read it on mount
     if (authPassword) {
-      queryParams.set("authPassword", authPassword);
+      try { sessionStorage.setItem("__vscan_authpwd", authPassword); } catch {}
     }
     router.push(`/dashboard?${queryParams.toString()}`);
   };
