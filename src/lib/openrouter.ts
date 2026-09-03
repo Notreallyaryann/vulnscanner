@@ -272,6 +272,42 @@ export function getMockFixReport(params: {
         };
     }
 
+    if (type.includes("sca") || type.includes("cve") || params.cveId) {
+        const pkgMatch = params.parameter?.match(/^(@?[^@]+)@(.+)$/);
+        const pkgName = pkgMatch ? pkgMatch[1] : params.parameter || "dependency";
+        const pkgVersion = pkgMatch ? pkgMatch[2] : "";
+        const cveId = params.cveId || "CVE Advisory";
+        
+        let title = `${pkgName} Security Vulnerability (${cveId})`;
+        if (params.evidence && params.evidence.includes("]")) {
+            const rawTitle = params.evidence.split("]").slice(1).join("]").replace(/\s*\(Fixed in.*?\)$/i, "").trim();
+            if (rawTitle) title = rawTitle;
+        }
+
+        const fixVerMatch = params.evidence?.match(/Fixed in >=\s*([^\)]+)/i);
+        const targetVersion = fixVerMatch ? fixVerMatch[1] : "latest";
+
+        return {
+            title: title.length > 90 ? title.slice(0, 87) + "..." : title,
+            explanation: `Known security advisory (${cveId}) in ${pkgName}${pkgVersion ? `@${pkgVersion}` : ""}. Unpatched dependencies can expose your application to security exploits, denial of service, or unauthorized data access.`,
+            attackSimulation: `1. The attacker identifies vulnerable dependency ${pkgName}@${pkgVersion || "installed version"} via public advisory ${cveId}.\n2. The attacker crafts targeted payloads exploiting the unpatched code path.\n3. The system processes the payload, triggering the disclosed advisory vulnerability.`,
+            fixSteps: [
+                `Upgrade ${pkgName} to version ${targetVersion} or later: npm install ${pkgName}@${targetVersion}`,
+                `Run "npm audit" or "npm audit fix" to ensure all related sub-dependencies are cleanly resolved.`,
+                `Verify application tests pass after the dependency upgrade.`
+            ],
+            codeExample: {
+                language: "json",
+                vulnerable: `// package.json (Vulnerable)\n{\n  "dependencies": {\n    "${pkgName}": "${pkgVersion || "x.x.x"}"\n  }\n}`,
+                fixed: `// package.json (Patched)\n{\n  "dependencies": {\n    "${pkgName}": "^${targetVersion}"\n  }\n}`
+            },
+            references: [
+                params.cveId?.startsWith("GHSA-") ? `https://github.com/advisories/${params.cveId}` : `https://nvd.nist.gov/vuln/detail/${params.cveId || ""}`,
+                "https://owasp.org/www-project-top-ten/2017/A9_2017-Using_Components_with_Known_Vulnerabilities"
+            ]
+        };
+    }
+
     const humanTitle = params.findingType
         .replace(/[-_]+/g, " ")
         .replace(/\b\w/g, (c) => c.toUpperCase());
@@ -384,21 +420,36 @@ Respond with a JSON object containing exactly these fields:
             return getMockFixReport(params);
         }
 
-        const clean = (raw as string).replace(/```json|```/g, "").trim();
+        // Strip code block markers if present
+        let cleaned = (raw as string).replace(/```json/gi, "").replace(/```/g, "").trim();
 
+        // Attempt 1: Direct parse
         try {
-            return JSON.parse(clean) as FixReport;
-        } catch (parseError) {
-            try {
-                let repaired = clean;
-                if (repaired.lastIndexOf('"') > repaired.lastIndexOf('}')) repaired += '"';
-                if (repaired.lastIndexOf('[') > repaired.lastIndexOf(']')) repaired += ']';
-                repaired += '}';
-                return JSON.parse(repaired) as FixReport;
-            } catch (repairError) {
-                console.warn(`⚠️ Failed to parse/repair OpenRouter JSON response. Falling back to mock.`);
-                return getMockFixReport(params);
+            return JSON.parse(cleaned) as FixReport;
+        } catch {
+            // Attempt 2: Extract substring between first '{' and last '}'
+            const firstBrace = cleaned.indexOf("{");
+            const lastBrace = cleaned.lastIndexOf("}");
+            if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+                const extracted = cleaned.substring(firstBrace, lastBrace + 1);
+                try {
+                    return JSON.parse(extracted) as FixReport;
+                } catch {
+                    // Attempt 3: Repair missing closing quotes/braces
+                    let repaired = extracted;
+                    if (repaired.lastIndexOf('"') > repaired.lastIndexOf('}')) repaired += '"';
+                    if (repaired.lastIndexOf('[') > repaired.lastIndexOf(']')) repaired += ']';
+                    repaired += '}';
+                    try {
+                        return JSON.parse(repaired) as FixReport;
+                    } catch {
+                        // Fall through
+                    }
+                }
             }
+
+            console.warn(`⚠️ Failed to parse/repair OpenRouter JSON response. Falling back to mock.`);
+            return getMockFixReport(params);
         }
     } catch (err: any) {
         console.error(`⚠️ Error parsing OpenRouter API response: ${err?.message ?? String(err)}. Falling back to mock.`);
@@ -447,6 +498,143 @@ export async function answerFromContext(
         throw new Error(`OpenRouter API error: ${err}`);
     }
 
+
     const data = await chatResponse.json();
     return data.choices[0].message.content as string;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LLM Code Review — for GitHub source code scanning
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface LLMCodeFinding {
+    type: string;
+    severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
+    line: number;
+    evidence: string;
+    explanation: string;
+}
+
+const CODE_REVIEW_SYSTEM_PROMPT = `You are an elite, highly precise Application Security (AppSec) engineer.
+Your task is to identify ONLY genuine, verifiable, and exploitable security vulnerabilities in the provided backend code.
+
+CRITICAL QUALITY RULES & FALSE POSITIVE BAN LIST:
+You MUST NEVER report any of the following standard development patterns:
+1. NEVER flag reading environment variables (e.g., process.env.API_KEY, process.env.DATABASE_URL) as "hardcoded credentials" or "insecure storage". Using process.env is the correct security standard.
+2. NEVER flag JSON.parse() or req.json() as "Insecure Deserialization". In JavaScript/TypeScript, native JSON parsing is memory-safe and is NOT vulnerable to remote code execution deserialization attacks.
+3. NEVER flag console.error() or console.log() as "Insecure Error Handling" or "Information Disclosure" unless unredacted plaintext private keys or passwords are explicitly logged.
+4. NEVER flag React client state (e.g. useState, useSession, UI button onClick handlers) as backend security vulnerabilities or missing rate limits.
+5. NEVER flag example placeholders (e.g., "your_api_key_here", "https://example.com") in documentation, examples, or schemas.
+6. NEVER flag database queries that filter by owner ID (e.g., { userId }, { documentId, userId }) as "Missing Ownership Check" or "IDOR".
+7. NEVER flag missing rate limiting on internal utility functions, helper libraries, or authenticated data queries. Only flag on high-risk, public unauthenticated endpoints (e.g. login brute-force, SMS/OTP triggers).
+
+ONLY REPORT TRUE VULNERABILITIES:
+- Authentication bypasses (missing auth checks before sensitive mutations)
+- True IDOR (user input directly queries resource without verifying tenant/userId)
+- Real SQL / Command / Code injection (unvalidated user input passed directly into shell/SQL execution)
+- Server-Side Request Forgery (SSRF) where server fetches arbitrary internal URLs without validation
+- Unsafe file path traversal allowing reading/writing outside target directories
+
+OUTPUT INSTRUCTIONS:
+- If no genuine, exploitable security vulnerabilities are found, return ONLY an empty JSON array: []
+- Do NOT output recommendations, style suggestions, or theoretical warnings.
+- Return ONLY a raw JSON array of objects with the following schema:
+[
+  {
+    "type": "short_kebab_case_category",
+    "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
+    "line": <line_number_integer_or_0>,
+    "evidence": "exact short vulnerable code line",
+    "explanation": "Concrete explanation of how an attacker exploits this specific line"
+  }
+]`;
+
+/**
+ * Sends a code chunk to the LLM for security review.
+ * Uses the same OpenRouter key rotator as all other AI features.
+ * Returns an array of structured findings (empty array if none found or on error).
+ */
+export async function reviewCodeForVulnerabilities(
+    code: string,
+    filename: string,
+    language: string,
+    skillContext?: string
+): Promise<LLMCodeFinding[]> {
+    const userMessage = `File: ${filename}\nLanguage: ${language}\n\n\`\`\`${language}\n${code}\n\`\`\``;
+
+    // Inject relevant security skill guidance into the system prompt if available
+    const systemPrompt = skillContext
+        ? `${CODE_REVIEW_SYSTEM_PROMPT}\n\n--- SECURITY SKILL GUIDANCE ---\n${skillContext}`
+        : CODE_REVIEW_SYSTEM_PROMPT;
+
+    const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
+
+    try {
+        const resp = await openrouterRequest({
+            model,
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userMessage },
+            ],
+            max_tokens: 2048,
+            temperature: 0.1, // low temperature for consistent structured output
+        });
+
+        if (!resp.ok) {
+            console.warn(`LLM code review: OpenRouter returned ${resp.status} for ${filename}`);
+            return [];
+        }
+
+        const data = await resp.json();
+        const raw = data.choices?.[0]?.message?.content as string | undefined;
+        if (!raw) return [];
+
+        // Strip markdown code fences if model wrapped the JSON
+        const cleaned = raw
+            .replace(/^```(?:json)?\s*/i, "")
+            .replace(/\s*```\s*$/, "")
+            .trim();
+
+        let parsed: any;
+        try {
+            parsed = JSON.parse(cleaned);
+        } catch {
+            const firstBracket = cleaned.indexOf("[");
+            const lastBracket = cleaned.lastIndexOf("]");
+            if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+                try {
+                    parsed = JSON.parse(cleaned.substring(firstBracket, lastBracket + 1));
+                } catch {
+                    return [];
+                }
+            } else {
+                return [];
+            }
+        }
+
+        if (!Array.isArray(parsed)) return [];
+
+        // Validate and sanitize each entry
+        return parsed
+            .filter(
+                (f: any) =>
+                    typeof f.type === "string" &&
+                    typeof f.severity === "string" &&
+                    typeof f.explanation === "string"
+            )
+            .map((f: any): LLMCodeFinding => ({
+                type: String(f.type),
+                severity: ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"].includes(f.severity)
+                    ? (f.severity as LLMCodeFinding["severity"])
+                    : "MEDIUM",
+                line: typeof f.line === "number" ? f.line : 0,
+                evidence: String(f.evidence ?? ""),
+                explanation: String(f.explanation),
+            }));
+    } catch (err) {
+        // Non-fatal — LLM review is best-effort
+        console.warn(`LLM code review parse error for ${filename}:`, err);
+        return [];
+    }
+}
+

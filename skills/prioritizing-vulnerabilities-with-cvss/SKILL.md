@@ -1,0 +1,28 @@
+---
+name: prioritizing-vulnerabilities-with-cvss
+description: Calculate CVSS v3.1 base scores from vector strings using the official metric formulas.
+---
+
+# Prioritizing Vulnerabilities With Cvss
+
+## Purpose
+Calculate CVSS v3.1 base scores from vector strings using the official metric formulas.
+
+## Safe operating rules
+- Only assess systems you own or have explicit authorization to test.
+- Prefer passive or non-destructive checks.
+- Do not attempt credential stuffing, destructive actions, data exfiltration, or persistence.
+- Treat automated results as leads that require verification.
+- Record URL, evidence, confidence, severity, and remediation guidance for every finding.
+
+## Workflow
+1. Validate the target and scope.
+2. Collect the minimum information needed for the check.
+3. Run the companion script where applicable.
+4. Normalize evidence into the VulnScanner finding schema.
+5. Assign severity and confidence.
+6. Deduplicate related findings.
+7. Generate remediation guidance grounded in the evidence.
+
+## Script
+The `scripts/` directory contains a small reference implementation. Integrate its logic into your scanner services rather than executing arbitrary target-side commands.

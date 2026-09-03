@@ -67,7 +67,8 @@ export async function retrieveContext(
       console.warn('⚠️  pgvector extension not installed. RAG context retrieval disabled.');
       return "pgvector extension not available. Using general OWASP guidelines instead.";
     }
-    console.error('Error in retrieveContext:', error);
+    const errMsg = error?.message || error?.code || (error?.name ? `${error.name}: ${error.message ?? ''}` : 'Database connection error');
+    console.warn('⚠️  Could not retrieve RAG context from database (falling back to OWASP guidelines):', errMsg);
     return "Error retrieving context from knowledge base. Using general guidelines instead.";
   }
 }

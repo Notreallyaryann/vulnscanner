@@ -4,6 +4,7 @@ import { prisma } from "./prisma";
 import { runVulnerabilityScan } from "./scanner";
 import { retrieveContext, searchPastFindings } from "./rag";
 import { answerFromContext } from "./openrouter";
+import { getGitHubSession } from "./github-session";
 
 /**
  * Initiates a new vulnerability scan.
@@ -207,3 +208,157 @@ ${findingsContext}
     throw new Error("Failed to process security query. Please check server logs.");
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GitHub Integration Actions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Returns the current GitHub session (login + avatar) or null if not connected.
+ */
+export async function getGitHubSessionAction() {
+  const session = await getGitHubSession();
+  if (!session) return null;
+  return { login: session.login, avatarUrl: session.avatarUrl, name: session.name };
+}
+
+/**
+ * Fetches the authenticated user's GitHub repositories (up to 100, sorted by push date).
+ */
+export async function getGitHubReposAction() {
+  const session = await getGitHubSession();
+  if (!session) throw new Error("Not authenticated with GitHub");
+
+  const res = await fetch(
+    "https://api.github.com/user/repos?sort=pushed&per_page=100&affiliation=owner,collaborator",
+    {
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        Accept: "application/vnd.github+json",
+      },
+    }
+  );
+
+  if (!res.ok) throw new Error(`GitHub API error: ${res.status}`);
+
+  const repos = await res.json();
+  return (repos as any[]).map((r) => ({
+    id: r.id as number,
+    fullName: r.full_name as string,
+    name: r.name as string,
+    private: r.private as boolean,
+    language: (r.language as string | null) ?? null,
+    description: (r.description as string | null) ?? null,
+    stargazersCount: (r.stargazers_count as number) ?? 0,
+    pushedAt: (r.pushed_at as string) ?? null,
+    defaultBranch: (r.default_branch as string) ?? "main",
+  }));
+}
+
+/**
+ * Fetches the list of branches for a given repository.
+ */
+export async function getRepoBranchesAction(repoFullName: string) {
+  const session = await getGitHubSession();
+  if (!session) throw new Error("Not authenticated with GitHub");
+
+  const res = await fetch(
+    `https://api.github.com/repos/${repoFullName}/branches?per_page=100`,
+    {
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        Accept: "application/vnd.github+json",
+      },
+    }
+  );
+
+  if (!res.ok) throw new Error(`GitHub API error: ${res.status}`);
+  const branches = await res.json();
+  return (branches as any[]).map((b) => b.name as string);
+}
+
+/**
+ * Creates a new GitHub scan record and fires the background scan engine.
+ */
+export async function createGitHubScanAction(
+  repoFullName: string,
+  branch: string,
+  enableLLM: boolean
+): Promise<string> {
+  const session = await getGitHubSession();
+  if (!session) throw new Error("Not authenticated with GitHub");
+
+  const { runGitHubScan } = await import("./github-scanner");
+
+  const scan = await prisma.gitHubScan.create({
+    data: {
+      repoFullName,
+      branch,
+      enableLLM,
+      status: "PENDING",
+    },
+  });
+
+  setTimeout(() => {
+    runGitHubScan(scan.id, repoFullName, branch, session.accessToken, enableLLM).catch(
+      (err) => console.error(`GitHub scan ${scan.id} error:`, err)
+    );
+  }, 0);
+
+  return scan.id;
+}
+
+/**
+ * Fetches the list of all GitHub scans with finding counts.
+ */
+export async function getGitHubScansAction() {
+  return prisma.gitHubScan.findMany({
+    orderBy: { createdAt: "desc" },
+    include: { _count: { select: { findings: true } } },
+  });
+}
+
+/**
+ * Fetches a single GitHub scan with all its findings.
+ */
+export async function getGitHubScanDetailsAction(scanId: string) {
+  const scan = await prisma.gitHubScan.findUnique({ where: { id: scanId } });
+  if (!scan) return null;
+
+  const findings = await prisma.finding.findMany({
+    where: { gitHubScanId: scanId },
+    select: {
+      id: true,
+      type: true,
+      severity: true,
+      url: true,
+      parameter: true,
+      evidence: true,
+      cvssScore: true,
+      cveId: true,
+      title: true,
+      explanation: true,
+      fixSteps: true,
+      codeExample: true,
+      confidence: true,
+      isVerified: true,
+      createdAt: true,
+    },
+    orderBy: { cvssScore: "desc" },
+  });
+
+  const parsedFindings = findings.map((f) => {
+    let parsedCodeExample = null;
+    let parsedFixSteps = null;
+    if (f.codeExample) {
+      try { parsedCodeExample = typeof f.codeExample === "string" ? JSON.parse(f.codeExample) : f.codeExample; } catch { parsedCodeExample = f.codeExample; }
+    }
+    if (f.fixSteps) {
+      try { parsedFixSteps = typeof f.fixSteps === "string" ? JSON.parse(f.fixSteps) : f.fixSteps; } catch { parsedFixSteps = f.fixSteps; }
+    }
+    return { ...f, codeExample: parsedCodeExample, fixSteps: parsedFixSteps };
+  });
+
+  return { ...scan, findings: parsedFindings };
+}
+

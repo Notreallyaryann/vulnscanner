@@ -24,10 +24,24 @@ model Scan {
   findings    Finding[]
 }
 
+model GitHubScan {
+  id            String     @id @default(cuid())
+  repoFullName  String
+  branch        String     @default("main")
+  commitSha     String?
+  enableLLM     Boolean    @default(true)
+  status        ScanStatus @default(PENDING)
+  createdAt     DateTime   @default(now())
+  completedAt   DateTime?
+  findings      Finding[]
+}
+
 model Finding {
   id          String   @id @default(cuid())
-  scanId      String
-  scan        Scan     @relation(fields: [scanId], references: [id])
+  scanId      String?
+  scan        Scan?    @relation(fields: [scanId], references: [id])
+  gitHubScanId String?
+  gitHubScan   GitHubScan? @relation(fields: [gitHubScanId], references: [id])
   type        String   // sqli, xss, csrf, idor, headers, redirect, secrets, lfi, cve
   severity    Severity
   url         String
