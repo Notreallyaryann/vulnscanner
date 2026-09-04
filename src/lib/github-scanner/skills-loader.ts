@@ -117,20 +117,26 @@ const SKILL_KEYWORD_MAP: Record<string, string[]> = {
   "generating-git-patch-remediations":         ["patch", "git patch", "remediation", "fix"],
   "generating-vulnerability-remediation-report": ["report", "remediation report", "executive summary"],
   "mapping-owasp-asvs-compliance":             ["asvs", "owasp", "compliance", "security requirement"],
+  "detecting-http-request-smuggling":          ["smuggl", "request smuggling", "desync", "cl.te", "te.cl", "transfer-encoding", "http desync"],
+  "detecting-broken-function-level-authorization-bfla": ["bfla", "function level", "privilege escalation", "admin api", "role bypass", "rbac", "vertical privilege"],
+  "auditing-llm-prompt-injection-and-leakage": ["prompt injection", "system prompt", "llm", "jailbreak", "prompt leakage", "ai security", "guardrail"],
+  "auditing-websocket-security":               ["websocket", "cswsh", "ws://", "wss://", "socket.io", "upgrade", "handshake"],
+  "detecting-subdomain-takeover":              ["takeover", "subdomain takeover", "dangling cname", "dangling dns", "orphaned domain"],
+  "exporting-sarif-security-reports":          ["sarif", "github security", "code scanning", "oasis sarif", "sarif export"],
 };
 
 // ── File-path → skill ID map ──────────────────────────────────────────────────
 // Matches file paths to the most relevant skills for LLM context injection.
 const FILE_PATH_SKILL_MAP: Array<{ pattern: RegExp; skills: string[] }> = [
   { pattern: /dockerfile/i,                                          skills: ["auditing-docker-and-containerfile-security"] },
-  { pattern: /\.github\/workflows\//i,                              skills: ["auditing-github-actions-and-cicd"] },
+  { pattern: /\.github\/workflows\//i,                              skills: ["auditing-github-actions-and-cicd", "exporting-sarif-security-reports"] },
   { pattern: /(?:docker-compose|compose\.ya?ml)/i,                  skills: ["auditing-docker-and-containerfile-security"] },
   { pattern: /(?:terraform|\.tf$)/i,                                skills: ["auditing-infrastructure-as-code"] },
   { pattern: /(?:cloudformation|\.cfn\.ya?ml|\.cfn\.json)/i,       skills: ["auditing-infrastructure-as-code"] },
   { pattern: /(?:package(?:-lock)?\.json|yarn\.lock|pnpm-lock)/i,  skills: ["analyzing-javascript-dependencies"] },
-  { pattern: /(?:auth|login|session|middleware|jwt|oauth|token)/i,  skills: ["analyzing-authentication-security", "detecting-jwt-and-session-flaws"] },
+  { pattern: /(?:auth|login|session|middleware|jwt|oauth|token)/i,  skills: ["analyzing-authentication-security", "detecting-jwt-and-session-flaws", "detecting-broken-function-level-authorization-bfla"] },
   { pattern: /(?:graphql|schema\.gql|resolver)/i,                   skills: ["auditing-graphql-security"] },
-  { pattern: /(?:cors|header|security\.ts|next\.config)/i,          skills: ["analyzing-security-headers", "detecting-cors-misconfiguration"] },
+  { pattern: /(?:cors|header|security\.ts|next\.config)/i,          skills: ["analyzing-security-headers", "detecting-cors-misconfiguration", "detecting-http-request-smuggling"] },
   { pattern: /(?:upload|file\.ts|file\.js|multer)/i,                skills: ["detecting-insecure-file-uploads"] },
   { pattern: /(?:sql|query|db|database|prisma|knex|sequelize)/i,    skills: ["detecting-sql-injection"] },
   { pattern: /(?:fetch|axios|request|http\.get|https\.get)/i,       skills: ["detecting-ssrf-vulnerabilities"] },
@@ -138,9 +144,12 @@ const FILE_PATH_SKILL_MAP: Array<{ pattern: RegExp; skills: string[] }> = [
   { pattern: /(?:template|render|nunjucks|ejs|handlebars|pug)/i,    skills: ["detecting-ssti-vulnerabilities"] },
   { pattern: /(?:cookie|session)/i,                                  skills: ["analyzing-session-cookie-security"] },
   { pattern: /(?:\.env|secret|key|password|credential)/i,           skills: ["hunting-hardcoded-secrets-and-keys"] },
-  { pattern: /(?:api\/|route\.|controller|handler)/i,               skills: ["conducting-api-security-testing", "evaluating-rate-limiting-and-brute-force"] },
+  { pattern: /(?:api\/|route\.|controller|handler)/i,               skills: ["conducting-api-security-testing", "evaluating-rate-limiting-and-brute-force", "detecting-broken-function-level-authorization-bfla"] },
   { pattern: /(?:xml|xxe|sax|dom\.parse)/i,                         skills: ["detecting-xxe-injection"] },
   { pattern: /(?:deserializ|pickle|marshal)/i,                       skills: ["detecting-insecure-deserialization"] },
+  { pattern: /(?:websocket|socket|ws\.ts|ws\.js)/i,                 skills: ["auditing-websocket-security"] },
+  { pattern: /(?:ai|llm|chat|openai|anthropic|prompt|agent)/i,      skills: ["auditing-llm-prompt-injection-and-leakage"] },
+  { pattern: /(?:dns|domain|cname|zone)/i,                          skills: ["detecting-subdomain-takeover"] },
 ];
 
 /**
