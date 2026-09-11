@@ -1,7 +1,7 @@
 "use server";
 
 import { prisma } from "./prisma";
-import { scanQueue } from "./queue/scan-queue";
+import { enqueueDastScan } from "./queue/scan-queue";
 import { retrieveContext, searchPastFindings } from "./rag";
 import { answerFromContext } from "./openrouter";
 import { getGitHubSession } from "./github-session";
@@ -39,9 +39,8 @@ export async function createScanAction(url: string, authEmail?: string, authPass
     password: cleanAuthPassword || undefined,
   } : undefined;
 
-  // Enqueue the scan job — survives server restarts, retries on failure.
-  // The BullMQ worker (started via src/instrumentation.ts) will pick this up.
-  await scanQueue.add("dast-scan", {
+  // Enqueue the scan job — uses BullMQ if Redis is configured, or safe in-process execution.
+  await enqueueDastScan({
     scanId:    scan.id,
     targetUrl: cleanUrl,
     customAuth,

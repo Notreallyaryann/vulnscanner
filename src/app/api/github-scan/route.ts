@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getGitHubSession } from "@/lib/github-session";
-import { githubScanQueue } from "@/lib/queue/scan-queue";
+import { enqueueGitHubScan } from "@/lib/queue/scan-queue";
 
 export const dynamic = "force-dynamic";
 
@@ -33,8 +33,8 @@ export async function POST(req: NextRequest) {
 
     const targetEmail = (typeof email === "string" && email.trim()) ? email.trim() : (session.email || undefined);
 
-    // Enqueue the GitHub scan job — survives server restarts, retries on failure.
-    await githubScanQueue.add("github-scan", {
+    // Enqueue the GitHub scan job — uses BullMQ if Redis is configured, or safe in-process execution.
+    await enqueueGitHubScan({
       scanId:      scan.id,
       repoFullName,
       branch:      String(branch),

@@ -11,7 +11,7 @@ const CONCURRENCY = Number(process.env.SCAN_CONCURRENCY ?? 2);
 
 let dastWorker: Worker | null = null;
 
-function createDastWorker(): Worker<DastScanJobData> {
+function createDastWorker(connection: any): Worker<DastScanJobData> {
   // Lazy import to avoid circular dependency at module init time.
   const worker = new Worker<DastScanJobData>(
     "dast-scan",
@@ -26,7 +26,7 @@ function createDastWorker(): Worker<DastScanJobData> {
       console.log(`[BullMQ] DAST job ${job.id} completed — scanId: ${scanId}`);
     },
     {
-      connection: getRedisConnection(),
+      connection,
       concurrency: CONCURRENCY,
     }
   );
@@ -61,7 +61,7 @@ function createDastWorker(): Worker<DastScanJobData> {
 
 let githubWorker: Worker | null = null;
 
-function createGitHubWorker(): Worker<GitHubScanJobData> {
+function createGitHubWorker(connection: any): Worker<GitHubScanJobData> {
   const worker = new Worker<GitHubScanJobData>(
     "github-scan",
     async (job: Job<GitHubScanJobData>) => {
@@ -75,7 +75,7 @@ function createGitHubWorker(): Worker<GitHubScanJobData> {
       console.log(`[BullMQ] GitHub job ${job.id} completed — scanId: ${scanId}`);
     },
     {
-      connection: getRedisConnection(),
+      connection,
       concurrency: CONCURRENCY,
     }
   );
@@ -111,12 +111,18 @@ function createGitHubWorker(): Worker<GitHubScanJobData> {
  * are no-ops if workers are already running.
  */
 export function startWorkers(): void {
+  const connection = getRedisConnection();
+  if (!connection) {
+    console.warn("[BullMQ] Redis connection unavailable — skipping worker startup.");
+    return;
+  }
+
   if (!dastWorker) {
-    dastWorker = createDastWorker();
+    dastWorker = createDastWorker(connection);
     console.log(`[BullMQ] DAST worker started (concurrency: ${CONCURRENCY})`);
   }
   if (!githubWorker) {
-    githubWorker = createGitHubWorker();
+    githubWorker = createGitHubWorker(connection);
     console.log(`[BullMQ] GitHub worker started (concurrency: ${CONCURRENCY})`);
   }
 }

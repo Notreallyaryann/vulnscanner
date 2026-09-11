@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { scanQueue } from "@/lib/queue/scan-queue";
+import { enqueueDastScan } from "@/lib/queue/scan-queue";
 
 export const dynamic = "force-dynamic";
 
@@ -42,8 +42,8 @@ export async function POST(req: NextRequest) {
       password: cleanAuthPassword || undefined,
     } : undefined;
 
-    // Enqueue the scan job — survives server restarts, retries on failure.
-    await scanQueue.add("dast-scan", {
+    // Enqueue the scan job — uses BullMQ if Redis is configured, or safe in-process execution.
+    await enqueueDastScan({
       scanId:    scan.id,
       targetUrl: cleanUrl,
       customAuth,
