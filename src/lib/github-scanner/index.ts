@@ -19,6 +19,7 @@ import { extractPackages, scanDependenciesForCVEs } from "./sca";
 import { runLLMCodeReview, type FileContent } from "./llm-review";
 import { loadSecuritySkills, getRelevantSkillContext } from "./skills-loader";
 import { PendingFinding } from "../scanner/types";
+import { sendGitHubScanReportEmail } from "../mail";
 
 // ── GitHub API helpers ─────────────────────────────────────────────────────────
 
@@ -214,12 +215,13 @@ export async function runGitHubScan(
   repoFullName: string,
   branch: string,
   accessToken: string,
-  enableLLM: boolean
+  enableLLM: boolean,
+  email?: string
 ): Promise<void> {
   const [owner, repo] = repoFullName.split("/");
   const repoUrl = `https://github.com/${repoFullName}`;
 
-  console.log(`🐙 Starting GitHub scan [${scanId}] for ${repoFullName}@${branch}`);
+  console.log(`🐙 Starting GitHub scan [${scanId}] for ${repoFullName}@${branch}${email ? ` (Email: ${email})` : ""}`);
   const availableSkills = loadSecuritySkills();
   console.log(`  🛡️ Loaded ${availableSkills.length} modular defensive security skill(s) for code review & remediation`);
 
@@ -307,6 +309,12 @@ export async function runGitHubScan(
       where: { id: scanId },
       data: { status: "COMPLETED", completedAt: new Date() },
     });
+
+    if (email && email.trim()) {
+      sendGitHubScanReportEmail(scanId, email.trim()).catch((err) => {
+        console.error(`Failed to send email for GitHub scan ${scanId}:`, err);
+      });
+    }
 
     console.log(`🎉 GitHub scan [${scanId}] completed.`);
   } catch (err: any) {

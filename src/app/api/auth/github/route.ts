@@ -20,7 +20,7 @@ export async function GET() {
   }
 
   const redirectUri = `${appUrl}/api/auth/github/callback`;
-  const scopes = "read:user repo";
+  const scopes = "read:user user:email repo";
 
   const params = new URLSearchParams({
     client_id: clientId,

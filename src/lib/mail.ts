@@ -145,3 +145,116 @@ export async function sendScanReportEmail(scanId: string, email: string) {
     console.error(`❌ Mailer: Failed to send scan report email for scan ${scanId}:`, err);
   }
 }
+
+export async function sendGitHubScanReportEmail(scanId: string, email: string) {
+  try {
+    const scan = await prisma.gitHubScan.findUnique({
+      where: { id: scanId },
+      include: { findings: true },
+    });
+
+    if (!scan) {
+      console.error(`❌ Mailer: GitHub Scan ${scanId} not found.`);
+      return;
+    }
+
+    const mailTransporter = await getTransporter();
+
+    // Prepare JSON report matching the format of repository scan findings
+    const report = {
+      scanId: scan.id,
+      repoFullName: scan.repoFullName,
+      branch: scan.branch,
+      commitSha: scan.commitSha,
+      status: scan.status,
+      scannedAt: scan.createdAt,
+      completedAt: scan.completedAt,
+      summary: {
+        totalFindings: scan.findings?.length ?? 0,
+        critical: scan.findings?.filter((f) => f.severity === "CRITICAL").length ?? 0,
+        high:     scan.findings?.filter((f) => f.severity === "HIGH").length ?? 0,
+        medium:   scan.findings?.filter((f) => f.severity === "MEDIUM").length ?? 0,
+        low:      scan.findings?.filter((f) => f.severity === "LOW").length ?? 0,
+        info:     scan.findings?.filter((f) => f.severity === "INFO").length ?? 0,
+      },
+      findings: scan.findings ?? [],
+      generatedBy: "VulnScanner v2.0 — GitHub Source Code Security Audit",
+    };
+
+    const reportContent = JSON.stringify(report, null, 2);
+    const fromAddress = process.env.SMTP_FROM || 
+      (process.env.SMTP_USER ? `"VulnScanner" <${process.env.SMTP_USER}>` : '"VulnScanner" <no-reply@vulnscanner.local>');
+
+    const sanitizedRepoName = scan.repoFullName.replace(/[/\\?%*:|"<>]/g, "-");
+
+    const info = await mailTransporter.sendMail({
+      from: fromAddress,
+      to: email,
+      subject: `🛡️ VulnScanner Audit Report: ${scan.repoFullName} (${scan.branch})`,
+      text: `Hello,\n\nYour security audit for GitHub repository ${scan.repoFullName} (branch: ${scan.branch}) has completed with status: ${scan.status}.\n\nTotal Findings: ${report.summary.totalFindings} (Critical: ${report.summary.critical}, High: ${report.summary.high}, Medium: ${report.summary.medium}, Low: ${report.summary.low}, Info: ${report.summary.info})\n\nPlease find the detailed JSON audit report attached to this email.\n\nBest regards,\nThe VulnScanner Team`,
+      html: `
+        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e5e5ea; border-radius: 8px;">
+          <h2 style="color: #D4380D; margin-bottom: 10px;">🛡️ VulnScanner GitHub Audit Complete</h2>
+          <p style="color: #666; font-size: 14px; margin-top: 0;">Automated Source Code & Dependency Security Report</p>
+          <p>Hello,</p>
+          <p>Your repository security scan for <strong>${scan.repoFullName}</strong> (branch: <code>${scan.branch}</code>) has completed with status: <span style="font-weight: bold; color: ${scan.status === "COMPLETED" ? "#27C93F" : "#FF5F56"}">${scan.status}</span>.</p>
+          
+          <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+            <thead>
+              <tr style="background-color: #fbfbfc; border-bottom: 2px solid #e5e5ea;">
+                <th style="padding: 10px; text-align: left; font-size: 14px;">Metric</th>
+                <th style="padding: 10px; text-align: right; font-size: 14px;">Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea; font-weight: bold;">Total Findings</td>
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea; text-align: right; font-weight: bold;">${report.summary.totalFindings}</td>
+              </tr>
+              <tr style="color: #FF5F56;">
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea;">Critical</td>
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea; text-align: right; font-weight: bold;">${report.summary.critical}</td>
+              </tr>
+              <tr style="color: #FFBD2E;">
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea;">High</td>
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea; text-align: right; font-weight: bold;">${report.summary.high}</td>
+              </tr>
+              <tr style="color: #27C93F;">
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea;">Medium</td>
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea; text-align: right; font-weight: bold;">${report.summary.medium}</td>
+              </tr>
+              <tr style="color: #86868B;">
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea;">Low</td>
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea; text-align: right; font-weight: bold;">${report.summary.low}</td>
+              </tr>
+              <tr style="color: #007aff;">
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea;">Info</td>
+                <td style="padding: 10px; border-bottom: 1px solid #e5e5ea; text-align: right; font-weight: bold;">${report.summary.info}</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <p>Please find the detailed vulnerability and remediation JSON audit report attached to this email.</p>
+          <hr style="border: 0; border-top: 1px solid #e5e5ea; margin: 20px 0;" />
+          <p style="font-size: 12px; color: #86868B;">This is an automated report from VulnScanner. Please do not reply directly to this email.</p>
+        </div>
+      `,
+      attachments: [
+        {
+          filename: `vulnscan-gh-${sanitizedRepoName}-${scan.id.slice(0, 8)}.json`,
+          content: reportContent,
+          contentType: "application/json",
+        },
+      ],
+    });
+
+    console.log(`📨 Mailer: Email sent successfully for GitHub scan ${scanId} to ${email}`);
+    const previewUrl = nodemailer.getTestMessageUrl(info);
+    if (previewUrl) {
+      console.log(`🔗 Mailer: Ethereal Preview URL: ${previewUrl}`);
+    }
+  } catch (err) {
+    console.error(`❌ Mailer: Failed to send GitHub scan report email for scan ${scanId}:`, err);
+  }
+}
+

@@ -219,7 +219,7 @@ ${findingsContext}
 export async function getGitHubSessionAction() {
   const session = await getGitHubSession();
   if (!session) return null;
-  return { login: session.login, avatarUrl: session.avatarUrl, name: session.name };
+  return { login: session.login, avatarUrl: session.avatarUrl, name: session.name, email: session.email ?? null };
 }
 
 /**
@@ -283,7 +283,8 @@ export async function getRepoBranchesAction(repoFullName: string) {
 export async function createGitHubScanAction(
   repoFullName: string,
   branch: string,
-  enableLLM: boolean
+  enableLLM: boolean,
+  email?: string
 ): Promise<string> {
   const session = await getGitHubSession();
   if (!session) throw new Error("Not authenticated with GitHub");
@@ -299,8 +300,10 @@ export async function createGitHubScanAction(
     },
   });
 
+  const targetEmail = (email && email.trim()) ? email.trim() : (session.email || undefined);
+
   setTimeout(() => {
-    runGitHubScan(scan.id, repoFullName, branch, session.accessToken, enableLLM).catch(
+    runGitHubScan(scan.id, repoFullName, branch, session.accessToken, enableLLM, targetEmail).catch(
       (err) => console.error(`GitHub scan ${scan.id} error:`, err)
     );
   }, 0);

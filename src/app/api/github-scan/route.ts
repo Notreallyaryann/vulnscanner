@@ -16,7 +16,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const { repoFullName, branch = "main", enableLLM = true } = await req.json();
+    const { repoFullName, branch = "main", enableLLM = true, email } = await req.json();
 
     if (!repoFullName || typeof repoFullName !== "string") {
       return NextResponse.json({ error: "repoFullName is required" }, { status: 400 });
@@ -31,6 +31,8 @@ export async function POST(req: NextRequest) {
       },
     });
 
+    const targetEmail = (typeof email === "string" && email.trim()) ? email.trim() : (session.email || undefined);
+
     // Fire scan in background — don't await
     setTimeout(() => {
       runGitHubScan(
@@ -38,7 +40,8 @@ export async function POST(req: NextRequest) {
         repoFullName,
         String(branch),
         session.accessToken,
-        Boolean(enableLLM)
+        Boolean(enableLLM),
+        targetEmail
       ).catch((err) => {
         console.error(`GitHub scan ${scan.id} background error:`, err);
       });

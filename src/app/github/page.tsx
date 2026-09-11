@@ -25,6 +25,7 @@ import {
   Layers,
   List,
   Tag,
+  Mail,
 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -47,6 +48,7 @@ interface GitHubUser {
   login: string;
   avatarUrl: string;
   name: string | null;
+  email?: string | null;
 }
 
 interface Repo {
@@ -362,6 +364,7 @@ function GitHubPageInner() {
 
   // Scan settings
   const [enableLLM, setEnableLLM] = useState(true);
+  const [reportEmail, setReportEmail] = useState("");
   const [isScanning, setIsScanning] = useState(false);
   const [currentScanId, setCurrentScanId] = useState<string | null>(null);
 
@@ -382,6 +385,7 @@ function GitHubPageInner() {
     getGitHubSessionAction()
       .then((s) => {
         setUser(s);
+        if (s?.email) setReportEmail(s.email);
         if (s) loadRepos();
       })
       .finally(() => setLoadingUser(false));
@@ -429,7 +433,7 @@ function GitHubPageInner() {
     setEngineProgress({ secrets: "pending", sast: "pending", sca: "pending", llm: "pending" });
 
     try {
-      const scanId = await createGitHubScanAction(selectedRepo.fullName, selectedBranch, enableLLM);
+      const scanId = await createGitHubScanAction(selectedRepo.fullName, selectedBranch, enableLLM, reportEmail);
       setCurrentScanId(scanId);
       startPolling(scanId);
     } catch (err: any) {
@@ -760,6 +764,22 @@ function GitHubPageInner() {
                   >
                     <div className={`w-4 h-4 bg-white rounded-full shadow transition-transform mx-1 ${enableLLM ? "translate-x-4" : "translate-x-0"}`} />
                   </button>
+                </div>
+
+                {/* Email Report Input */}
+                <div className="p-3 bg-[#FBFBFC] rounded-xl border border-[#E5E5EA] mb-3">
+                  <label className="text-[11px] font-bold text-[#86868B] uppercase tracking-wide flex items-center gap-1.5 mb-1.5">
+                    <Mail className="w-3.5 h-3.5 text-[#D4380D]" />
+                    Email Report (Optional)
+                  </label>
+                  <input
+                    type="email"
+                    value={reportEmail}
+                    onChange={(e) => setReportEmail(e.target.value)}
+                    placeholder="email@example.com"
+                    className="w-full bg-white border border-[#E5E5EA] focus:border-[#D4380D] text-[#1D1D1F] rounded-lg px-3 py-2 text-xs outline-none font-medium placeholder:text-[#C5C5C7]"
+                  />
+                  <p className="text-[10px] text-[#86868B] mt-1">Full vulnerability JSON report will be sent upon completion.</p>
                 </div>
 
                 {/* Static engines always on */}

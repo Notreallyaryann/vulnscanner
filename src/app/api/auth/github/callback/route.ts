@@ -64,12 +64,37 @@ export async function GET(req: NextRequest) {
 
     const user = await userRes.json();
 
-    // 3. Build signed session cookie and redirect
+    // 3. Fetch user email if not public on profile
+    let userEmail: string | null = (typeof user.email === "string" && user.email) ? user.email : null;
+    if (!userEmail) {
+      try {
+        const emailsRes = await fetch("https://api.github.com/user/emails", {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: "application/vnd.github+json",
+          },
+        });
+        if (emailsRes.ok) {
+          const emails = await emailsRes.json();
+          if (Array.isArray(emails)) {
+            const primaryObj = emails.find((e: any) => e.primary && e.verified) || emails.find((e: any) => e.primary) || emails[0];
+            if (primaryObj?.email) {
+              userEmail = primaryObj.email;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("Could not fetch user emails from GitHub:", e);
+      }
+    }
+
+    // 4. Build signed session cookie and redirect
     const cookieHeader = buildSessionCookie({
       accessToken,
       login: user.login as string,
       avatarUrl: user.avatar_url as string,
       name: (user.name as string | null) ?? null,
+      email: userEmail,
     });
 
     const response = NextResponse.redirect(`${appUrl}/github`);

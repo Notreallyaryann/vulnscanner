@@ -11,6 +11,7 @@ export interface GitHubSession {
   login: string;
   avatarUrl: string;
   name: string | null;
+  email?: string | null;
 }
 
 // ── Signing helpers ────────────────────────────────────────────────────────────
