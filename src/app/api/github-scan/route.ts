@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getGitHubSession } from "@/lib/github-session";
-import { runGitHubScan } from "@/lib/github-scanner";
+import { githubScanQueue } from "@/lib/queue/scan-queue";
 
 export const dynamic = "force-dynamic";
 
@@ -33,19 +33,15 @@ export async function POST(req: NextRequest) {
 
     const targetEmail = (typeof email === "string" && email.trim()) ? email.trim() : (session.email || undefined);
 
-    // Fire scan in background — don't await
-    setTimeout(() => {
-      runGitHubScan(
-        scan.id,
-        repoFullName,
-        String(branch),
-        session.accessToken,
-        Boolean(enableLLM),
-        targetEmail
-      ).catch((err) => {
-        console.error(`GitHub scan ${scan.id} background error:`, err);
-      });
-    }, 0);
+    // Enqueue the GitHub scan job — survives server restarts, retries on failure.
+    await githubScanQueue.add("github-scan", {
+      scanId:      scan.id,
+      repoFullName,
+      branch:      String(branch),
+      accessToken: session.accessToken,
+      enableLLM:   Boolean(enableLLM),
+      email:       targetEmail,
+    });
 
     return NextResponse.json({ scanId: scan.id });
   } catch (err: any) {

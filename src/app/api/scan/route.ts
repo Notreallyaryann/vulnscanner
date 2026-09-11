@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { runVulnerabilityScan } from "@/lib/scanner";
+import { scanQueue } from "@/lib/queue/scan-queue";
 
 export const dynamic = "force-dynamic";
 
@@ -42,12 +42,12 @@ export async function POST(req: NextRequest) {
       password: cleanAuthPassword || undefined,
     } : undefined;
 
-    // Fire the scan in the background on the Node event loop.
-    setTimeout(() => {
-      runVulnerabilityScan(scan.id, cleanUrl, customAuth).catch((err) => {
-        console.error(`Error executing background scan ${scan.id}:`, err);
-      });
-    }, 0);
+    // Enqueue the scan job — survives server restarts, retries on failure.
+    await scanQueue.add("dast-scan", {
+      scanId:    scan.id,
+      targetUrl: cleanUrl,
+      customAuth,
+    });
 
     return NextResponse.json({ scanId: scan.id });
   } catch (error: any) {

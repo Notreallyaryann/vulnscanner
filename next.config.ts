@@ -17,6 +17,8 @@ const nextConfig: NextConfig = {
     'tough-cookie',
     '@apidevtools/swagger-parser',
     'jsonwebtoken',
+    'bullmq',
+    'ioredis',
   ],
 
   turbopack: {

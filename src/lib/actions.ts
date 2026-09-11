@@ -1,7 +1,7 @@
 "use server";
 
 import { prisma } from "./prisma";
-import { runVulnerabilityScan } from "./scanner";
+import { scanQueue } from "./queue/scan-queue";
 import { retrieveContext, searchPastFindings } from "./rag";
 import { answerFromContext } from "./openrouter";
 import { getGitHubSession } from "./github-session";
@@ -39,13 +39,13 @@ export async function createScanAction(url: string, authEmail?: string, authPass
     password: cleanAuthPassword || undefined,
   } : undefined;
 
-  // Fire-and-forget background scan scheduled on the macro-task queue
-  // This prevents Next.js from blocking the Server Action response.
-  setTimeout(() => {
-    runVulnerabilityScan(scan.id, cleanUrl, customAuth).catch((err) => {
-      console.error(`Error executing background scan ${scan.id}:`, err);
-    });
-  }, 0);
+  // Enqueue the scan job — survives server restarts, retries on failure.
+  // The BullMQ worker (started via src/instrumentation.ts) will pick this up.
+  await scanQueue.add("dast-scan", {
+    scanId:    scan.id,
+    targetUrl: cleanUrl,
+    customAuth,
+  });
 
   return scan.id;
 }
