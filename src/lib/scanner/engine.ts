@@ -53,6 +53,7 @@ import {
   probePathTraversal,
   probeSSTI,
   probeFormSSTI,
+  probeRestApiSSTI,
 } from "./probes/injection";
 
 import {
@@ -89,6 +90,7 @@ import {
 
 import {
   discoverOpenApiEndpoints,
+  probeGraphQL,
   probeGraphQLInjection,
   probeHTTPMethodOverride,
   probeApiSensitiveDataExposure,
@@ -821,6 +823,7 @@ export async function runVulnerabilityScan(
               probeLimit(() => probeCRLFInjection(url)),
               probeLimit(() => probeBlindSQLiTiming(url)),
               probeLimit(() => probeBlindSQLiBooleanDiff(url)),
+              probeLimit(() => probeSSTI(url)),
             ])
           );
 
@@ -863,7 +866,6 @@ export async function runVulnerabilityScan(
           probeLimit(() => probeExposedBackupFiles(normalizedUrl, homepageHtml)),
           probeLimit(() => probeActiveOpenRedirect(renderedHtml, normalizedUrl, discoveredParamUrls)),
           probeLimit(() => probeIDORWithDualToken(normalizedUrl, jsBundleEndpoints, session)),
-          // New probes
           probeLimit(() => probeGraphQLInjection(normalizedUrl, session)),
           probeLimit(() => probeHTTPMethodOverride(normalizedUrl)),
           probeLimit(() => probeIDORSequentialFuzz(normalizedUrl, session)),
@@ -883,6 +885,8 @@ export async function runVulnerabilityScan(
             // New root-only probes
             probeJWTWeakSecret(targetUrl, session),
             probeBlindSQLiRestEndpoints(targetUrl, session),
+            probeGraphQL(targetUrl, session),
+            probeRestApiSSTI(targetUrl, session),
           ]);
 
           const fileUploadFindings = (rootOnlyResults[0] as PendingFinding[]) || [];
@@ -890,12 +894,15 @@ export async function runVulnerabilityScan(
           const businessLogicFindings = (rootOnlyResults[2] as PendingFinding[]) || [];
           const jwtWeakFinding = rootOnlyResults[3] as PendingFinding | null;
           const blindRestSqliFinding = rootOnlyResults[4] as PendingFinding | null;
+          const graphqlFindings = (rootOnlyResults[5] as PendingFinding[]) || [];
+          const restSstiFinding = rootOnlyResults[6] as PendingFinding | null;
 
-          for (const f of [...fileUploadFindings, ...massAssignmentFindings, ...businessLogicFindings]) {
+          for (const f of [...fileUploadFindings, ...massAssignmentFindings, ...businessLogicFindings, ...graphqlFindings]) {
             await recordFinding(f);
           }
           if (jwtWeakFinding) await recordFinding(jwtWeakFinding);
           if (blindRestSqliFinding) await recordFinding(blindRestSqliFinding);
+          if (restSstiFinding) await recordFinding(restSstiFinding);
 
           const passwordPolicyFinding = await probePasswordPolicy(targetUrl, session);
           const subdomainFinding = await probeCommonSubdomains(targetUrl);

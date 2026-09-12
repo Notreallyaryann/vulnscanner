@@ -681,31 +681,126 @@ export async function probeMassAssignment(
   return findings;
 }
 
+/**
+ * Shared helper: determines whether a response represents a successfully
+ * processed JSON payload (not a 404, error, or SPA HTML fallback).
+ */
+async function isSuccessfulJsonResponse(resp: Response | null): Promise<any | null> {
+  if (!resp || (resp.status !== 200 && resp.status !== 201)) return null;
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const text = await resp.text().catch(() => "");
+  if (isSpaHtmlFallback(resp, text)) return null;
+  if (!contentType.includes("application/json") && !text.trim().startsWith("{") && !text.trim().startsWith("[")) {
+    return null;
+  }
+  try {
+    const json = JSON.parse(text);
+    if (!json || typeof json !== "object") return null;
+    if (json.status === "error" || json.success === false || json.error) return null;
+    const msg = String(json.message || json.detail || json.error || "").toLowerCase();
+    if (msg.includes("invalid") || msg.includes("not found") || msg.includes("failed") || msg.includes("denied")) return null;
+    return json;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Probes for negative quantity manipulation (e.g. quantity=-1).
+ *
+ * Accepts an optional custom `fetchFn` so the function is unit-testable
+ * without making real network requests.
+ */
+export async function probeNegativeQuantity(
+  baseUrl: string,
+  session: AuthSession,
+  fetchFn?: (url: string, init?: RequestInit) => Promise<Response | null>
+): Promise<PendingFinding[]> {
+  const findings: PendingFinding[] = [];
+
+  const doFetch = fetchFn
+    ? (url: string, init?: RequestInit) => fetchFn(url, init)
+    : (url: string, init?: RequestInit) => authedFetch(url, init ?? {}, 6000, false, session);
+
+  // Endpoints that commonly accept item/quantity mutations
+  const quantityEndpoints = [
+    "/api/basket",
+    "/api/basket/checkout",
+    "/api/cart",
+    "/api/cart/items",
+    "/api/orders",
+    "/api/order-items",
+    "/api/v1/basket",
+    "/api/v1/cart",
+    "/api/v1/orders",
+    "/rest/basket",
+    "/api/checkout",
+  ];
+
+  // Negative quantity field variants seen across real-world APIs
+  const quantityFieldVariants = ["quantity", "qty", "count", "amount"] as const;
+
+  outer:
+  for (const path of quantityEndpoints) {
+    for (const field of quantityFieldVariants) {
+      try {
+        const url = new URL(path, baseUrl).toString();
+        const body = { productId: 1, [field]: -1 };
+
+        const resp = await doFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        const json = await isSuccessfulJsonResponse(resp);
+
+        // Positive signal: server accepted the request and echoed back the negative value,
+        // or responded with a success marker / created-resource ID.
+        const accepted =
+          json !== null &&
+          (
+            json[field] === -1 ||
+            json[field] < 0 ||
+            json.total < 0 ||
+            json.price < 0 ||
+            json.status === "success" ||
+            (typeof json.id !== "undefined" && json.id !== null)
+          );
+
+        if (accepted) {
+          findings.push({
+            type: "business-logic-negative-quantity",
+            severity: "CRITICAL",
+            url,
+            parameter: field,
+            evidence:
+              `Business Logic vulnerability: Negative quantity manipulation confirmed at ${url}. ` +
+              `Sending \`${field}: -1\` was accepted by the server (HTTP ${resp?.status}). ` +
+              `An attacker could exploit this to receive refunds, reduce order totals, or gain credits.`,
+            cvssScore: 9.1,
+            cveId: "CWE-840",
+            isVerified: true,
+            confidence: CONFIDENCE.EXEC_VERIFIED,
+            validationSteps: [
+              `POST ${url} with { ${field}: -1 } — server returned HTTP ${resp?.status}`,
+              `Response JSON accepted the negative ${field} value or contained a success/ID field`,
+            ],
+          });
+          break outer; // One confirmed finding per target is sufficient
+        }
+      } catch { /* next variant */ }
+    }
+  }
+
+  return findings;
+}
+
 export async function probeBusinessLogicVulnerabilities(
   baseUrl: string,
   session: AuthSession
 ): Promise<PendingFinding[]> {
   const findings: PendingFinding[] = [];
-
-  const isSuccessfulJsonResponse = async (resp: Response | null): Promise<any | null> => {
-    if (!resp || (resp.status !== 200 && resp.status !== 201)) return null;
-    const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-    const text = await resp.text().catch(() => "");
-    if (isSpaHtmlFallback(resp, text)) return null;
-    if (!contentType.includes("application/json") && !text.trim().startsWith("{") && !text.trim().startsWith("[")) {
-      return null;
-    }
-    try {
-      const json = JSON.parse(text);
-      if (!json || typeof json !== "object") return null;
-      if (json.status === "error" || json.success === false || json.error) return null;
-      const msg = String(json.message || json.detail || json.error || "").toLowerCase();
-      if (msg.includes("invalid") || msg.includes("not found") || msg.includes("failed") || msg.includes("denied")) return null;
-      return json;
-    } catch {
-      return null;
-    }
-  };
 
   const priceEndpoints = ["/api/basket", "/api/cart", "/api/orders", "/rest/basket", "/api/v1/basket"];
   for (const path of priceEndpoints) {
@@ -736,6 +831,10 @@ export async function probeBusinessLogicVulnerabilities(
       }
     } catch { /* next */ }
   }
+
+  // Probe for negative quantity manipulation (e.g. quantity=-1)
+  const quantityFindings = await probeNegativeQuantity(baseUrl, session);
+  findings.push(...quantityFindings);
 
   return findings;
 }

@@ -1,51 +1,489 @@
 import SwaggerParser from "@apidevtools/swagger-parser";
-import { AuthSession, EMPTY_SESSION, FETCH_HEADERS, PendingFinding } from "../types";
+import { AuthSession, CONFIDENCE, EMPTY_SESSION, FETCH_HEADERS, PendingFinding } from "../types";
 import { authedFetch, safeFetch } from "../session";
 
-export async function checkGraphQLIntrospection(
-  baseUrl: string,
-  sessionOrFetch?: AuthSession | ((url: string, init?: RequestInit) => Promise<Response | null>),
-  authedFetchFn?: (url: string, init?: RequestInit) => Promise<Response | null>
-): Promise<PendingFinding | null> {
-  const GRAPHQL_PATHS = ["/graphql", "/api/graphql", "/v1/graphql"];
-  let fetcher: (url: string, init?: RequestInit) => Promise<Response | null>;
-  if (typeof sessionOrFetch === "function") {
-    fetcher = sessionOrFetch;
-  } else if (authedFetchFn) {
-    fetcher = authedFetchFn;
-  } else {
-    const session = (sessionOrFetch as AuthSession) || EMPTY_SESSION;
-    fetcher = (u, init) => authedFetch(u, init, 8000, false, session);
+// ─── Shared ──────────────────────────────────────────────────────────────────
+
+const GRAPHQL_PATHS = ["/graphql", "/api/graphql", "/v1/graphql", "/graphiql", "/playground", "/query"] as const;
+
+type Fetcher = (url: string, init?: RequestInit) => Promise<Response | null>;
+
+/** Resolve a Fetcher from either a raw function or an AuthSession. */
+function resolveFetcher(session: AuthSession, fetchFn?: Fetcher): Fetcher {
+  return fetchFn ?? ((u, init) => authedFetch(u, init ?? {}, 8000, false, session));
+}
+
+/** POST a GraphQL JSON body and return the parsed JSON (or null on failure). */
+async function gqlPost(fetcher: Fetcher, url: string, body: object, timeoutMs = 8000): Promise<any | null> {
+  try {
+    const resp = await fetcher(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp) return null;
+    const text = await resp.text().catch(() => "");
+    try { return { status: resp.status, json: JSON.parse(text) }; }
+    catch { return { status: resp.status, json: null, raw: text }; }
+  } catch {
+    return null;
   }
+}
+
+/** Detect whether a URL is a live (non-404) GraphQL endpoint. */
+async function detectGraphQLEndpoint(fetcher: Fetcher, baseUrl: string): Promise<string | null> {
   for (const path of GRAPHQL_PATHS) {
     try {
       const u = new URL(path, baseUrl).toString();
-      const resp = await fetcher(u, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "{ __schema { queryType { name } } }" }),
-      });
-      if (!resp || resp.status !== 200) continue;
-      const json = await resp.json().catch(() => null);
-      if (json?.data?.__schema) {
-        return {
+      // A minimal introspection ping — every spec-compliant server returns data or errors, never 404
+      const result = await gqlPost(fetcher, u, { query: "{ __typename }" });
+      if (!result) continue;
+      if (result.status === 404 || result.status >= 502) continue;
+      // Accept 200, 400 (query errors still mean GraphQL is alive), 405
+      return u;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+// ─── 1. Introspection Leak ────────────────────────────────────────────────────
+
+/** Full introspection schema dump + field suggestion harvesting via deliberate typos. */
+export async function probeGraphQLIntrospection(
+  baseUrl: string,
+  session: AuthSession = EMPTY_SESSION,
+  fetchFn?: Fetcher
+): Promise<PendingFinding[]> {
+  const findings: PendingFinding[] = [];
+  const fetcher = resolveFetcher(session, fetchFn);
+
+  const FULL_INTROSPECTION_QUERY = `
+    query IntrospectionQuery {
+      __schema {
+        queryType { name }
+        mutationType { name }
+        subscriptionType { name }
+        types {
+          kind name description
+          fields(includeDeprecated: true) {
+            name description isDeprecated deprecationReason
+            args { name description type { kind name ofType { kind name } } }
+            type { kind name ofType { kind name } }
+          }
+          inputFields {
+            name description
+            type { kind name ofType { kind name } }
+          }
+          enumValues(includeDeprecated: true) { name description isDeprecated }
+        }
+        directives {
+          name description locations
+          args { name description type { kind name ofType { kind name } } }
+        }
+      }
+    }
+  `;
+
+  for (const path of GRAPHQL_PATHS) {
+    try {
+      const u = new URL(path, baseUrl).toString();
+
+      // Step 1: Full introspection dump
+      const result = await gqlPost(fetcher, u, { query: FULL_INTROSPECTION_QUERY });
+      if (!result || result.status !== 200) continue;
+
+      const schema = result.json?.data?.__schema;
+      if (schema) {
+        const typeCount = (schema.types as any[])?.filter(
+          (t: any) => !t.name?.startsWith("__")
+        ).length ?? 0;
+        const mutationTypeName = schema.mutationType?.name ?? "none";
+
+        findings.push({
           type: "graphql-introspection",
           severity: "MEDIUM",
           url: u,
-          evidence: `GraphQL Introspection is enabled at ${path}. Attackers can extract the complete GraphQL schema and query structure.`,
+          evidence:
+            `GraphQL Introspection fully enabled at ${u}. ` +
+            `Complete schema dumped: ${typeCount} user-defined type(s) exposed including mutation root "${mutationTypeName}". ` +
+            `Attackers can enumerate every query, mutation, field name, argument, and enum value without authentication.`,
           cvssScore: 5.3,
           cveId: "CWE-200",
-          confidence: 0.99,
+          confidence: CONFIDENCE.DETERMINISTIC,
           validationSteps: [
-            `Sent introspection query to ${u}`,
-            `Server returned HTTP 200 with full schema definition`,
+            `POST ${u} — full __schema introspection query returned HTTP 200`,
+            `Response contained ${typeCount} non-built-in type definitions`,
+          ],
+          isVerified: true,
+        });
+
+        // Step 2: Field suggestion harvesting — send a deliberate typo and parse "Did you mean...?" hints
+        const typoResult = await gqlPost(fetcher, u, { query: "{ _usrz }" });
+        if (typoResult?.json?.errors) {
+          const suggestions: string[] = [];
+          for (const err of typoResult.json.errors) {
+            const msg: string = err?.message ?? "";
+            const match = msg.match(/Did you mean ["']?([\w, "']+)["']?/i);
+            if (match) suggestions.push(match[1]);
+          }
+          if (suggestions.length > 0) {
+            findings.push({
+              type: "graphql-field-suggestion-leak",
+              severity: "LOW",
+              url: u,
+              evidence:
+                `GraphQL field suggestion oracle active at ${u}. ` +
+                `Sending a deliberate typo returned: "Did you mean ${suggestions[0]}?". ` +
+                `Attackers can brute-force field names without introspection being explicitly enabled.`,
+              cvssScore: 3.7,
+              cveId: "CWE-203",
+              confidence: CONFIDENCE.DUAL_VERIFIED,
+              validationSteps: [
+                `POST ${u} with intentional typo query "{ _usrz }"`,
+                `Error response suggested real field names: ${suggestions.join(", ")}`,
+              ],
+              isVerified: true,
+            });
+          }
+        }
+        break; // No need to probe further paths once confirmed
+      }
+
+      // Step 2b: Even if full introspection is blocked, check field suggestions alone
+      const typoResult2 = await gqlPost(fetcher, u, { query: "{ _usrz }" });
+      if (typoResult2?.json?.errors) {
+        for (const err of typoResult2.json.errors) {
+          const msg: string = err?.message ?? "";
+          const match = msg.match(/Did you mean ["']?([\w, "']+)["']?/i);
+          if (match) {
+            findings.push({
+              type: "graphql-field-suggestion-leak",
+              severity: "LOW",
+              url: u,
+              evidence:
+                `GraphQL field suggestion oracle active at ${u} even though full introspection is disabled. ` +
+                `Typo query returned: "Did you mean ${match[1]}?". ` +
+                `Attackers can enumerate real field names character-by-character.`,
+              cvssScore: 3.7,
+              cveId: "CWE-203",
+              confidence: CONFIDENCE.DUAL_VERIFIED,
+              validationSteps: [
+                `POST ${u} with intentional typo query "{ _usrz }"`,
+                `Error contained field name suggestion: "${match[1]}"`,
+              ],
+              isVerified: true,
+            });
+            break;
+          }
+        }
+      }
+    } catch { /* next path */ }
+  }
+  return findings;
+}
+
+// ─── 2. Deep Nesting DoS ─────────────────────────────────────────────────────
+
+/**
+ * Constructs a deeply nested GraphQL query to test for resource exhaustion.
+ * e.g. { a { b { a { b { ... } } } } } at configurable depth.
+ * A server with no depth limit will attempt to resolve O(2^depth) graph traversals.
+ */
+export async function probeGraphQLDoS(
+  baseUrl: string,
+  session: AuthSession = EMPTY_SESSION,
+  fetchFn?: Fetcher
+): Promise<PendingFinding | null> {
+  const fetcher = resolveFetcher(session, fetchFn);
+  const NESTING_DEPTH = 12; // enough to trigger exhaustion without being abusive
+  const TIMEOUT_MS = 10_000;
+  const SLOW_THRESHOLD_MS = 3_000; // response slower than this suggests no depth limit
+
+  /** Build a singly-chained nested query: { field { field { ... } } } */
+  function buildNestedQuery(fields: string[], depth: number): string {
+    let inner = "id";
+    for (let i = 0; i < depth; i++) {
+      const field = fields[i % fields.length];
+      inner = `${field} { ${inner} }`;
+    }
+    return `{ ${inner} }`;
+  }
+
+  // Common relational field names that parsers recurse on
+  const RELATIONAL_FIELDS = ["user", "posts", "comments", "author", "friends", "followers", "orders", "items", "node"];
+
+  for (const path of GRAPHQL_PATHS) {
+    try {
+      const u = new URL(path, baseUrl).toString();
+
+      // Liveness check: bail if the endpoint doesn't exist
+      const ping = await gqlPost(fetcher, u, { query: "{ __typename }" });
+      if (!ping || ping.status === 404 || ping.status >= 502) continue;
+
+      const nestedQuery = buildNestedQuery(RELATIONAL_FIELDS, NESTING_DEPTH);
+
+      const start = Date.now();
+      const result = await fetcher(u, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: nestedQuery }),
+      });
+      const elapsed = Date.now() - start;
+
+      if (!result) continue;
+      const text = await result.text().catch(() => "");
+
+      // Signals: slow response (no depth guard) OR server-side DoS protection triggered (429/503)
+      const isSlowResponse = elapsed >= SLOW_THRESHOLD_MS;
+      const isRateLimited = result.status === 429 || result.status === 503;
+      const hasDepthError = /max.*depth|query.*depth|depth.*limit|complexity.*exceeded|too.*deep|query.*too.*complex/i.test(text);
+
+      if (isSlowResponse && !hasDepthError) {
+        return {
+          type: "graphql-dos-deep-nesting",
+          severity: "HIGH",
+          url: u,
+          evidence:
+            `GraphQL Deep Nesting DoS: endpoint ${u} responded in ${elapsed}ms to a ${NESTING_DEPTH}-level nested query with no depth-limit error. ` +
+            `Attackers can craft malicious queries that exhaust server CPU/memory and cause denial of service.`,
+          cvssScore: 7.5,
+          cveId: "CWE-400",
+          confidence: CONFIDENCE.TIMING_VERIFIED,
+          validationSteps: [
+            `Sent ${NESTING_DEPTH}-deep nested GraphQL query to ${u}`,
+            `Server responded in ${elapsed}ms with no depth-limit enforcement`,
           ],
           isVerified: true,
         };
       }
-    } catch {}
+
+      if (isRateLimited && !hasDepthError) {
+        return {
+          type: "graphql-dos-deep-nesting",
+          severity: "MEDIUM",
+          url: u,
+          evidence:
+            `GraphQL Deep Nesting probe returned HTTP ${result.status} at ${u}. ` +
+            `No query-depth error was returned; the server relies solely on rate limiting for DoS protection. ` +
+            `Depth-level query guards are recommended in addition to rate limiting.`,
+          cvssScore: 5.3,
+          cveId: "CWE-400",
+          confidence: CONFIDENCE.SINGLE_PAYLOAD,
+          validationSteps: [
+            `Sent ${NESTING_DEPTH}-deep nested GraphQL query to ${u}`,
+            `Server returned HTTP ${result.status} — no explicit depth guard message`,
+          ],
+          isVerified: false,
+        };
+      }
+    } catch { /* next */ }
   }
   return null;
+}
+
+// ─── 3. Batched Query Rate-Limit Bypass ──────────────────────────────────────
+
+/**
+ * Sends an array of GraphQL operations in a single HTTP request.
+ * Many servers share the rate-limit budget per HTTP request, not per operation,
+ * allowing attackers to amplify requests by 50–100× at no extra cost.
+ */
+export async function probeGraphQLBatchedQueries(
+  baseUrl: string,
+  session: AuthSession = EMPTY_SESSION,
+  fetchFn?: Fetcher
+): Promise<PendingFinding | null> {
+  const fetcher = resolveFetcher(session, fetchFn);
+  const BATCH_SIZE = 50;
+
+  for (const path of GRAPHQL_PATHS) {
+    try {
+      const u = new URL(path, baseUrl).toString();
+
+      // Liveness check
+      const ping = await gqlPost(fetcher, u, { query: "{ __typename }" });
+      if (!ping || ping.status === 404 || ping.status >= 502) continue;
+
+      // Build a batch: 50 identical lightweight introspection operations
+      const batch = Array.from({ length: BATCH_SIZE }, (_, i) => ({
+        operationName: `Op${i}`,
+        query: `query Op${i} { __typename }`,
+        variables: {},
+      }));
+
+      const result = await gqlPost(fetcher, u, batch);
+      if (!result) continue;
+
+      const { status, json } = result;
+
+      // Success: server returned an array of responses (one per operation)
+      const serverAcceptedBatch =
+        status === 200 &&
+        Array.isArray(json) &&
+        json.length > 1;
+
+      // Soft signal: server accepted but collapsed to single response
+      const serverAcceptedSingle = status === 200 && !Array.isArray(json);
+
+      if (serverAcceptedBatch) {
+        return {
+          type: "graphql-batched-queries",
+          severity: "HIGH",
+          url: u,
+          evidence:
+            `GraphQL Batched Query Attack confirmed at ${u}. ` +
+            `A single HTTP POST containing ${BATCH_SIZE} operations returned an array of ${json.length} responses. ` +
+            `Attackers can bypass per-request rate limits and amplify brute-force or enumeration attacks ${BATCH_SIZE}×.`,
+          cvssScore: 7.5,
+          cveId: "CWE-770",
+          confidence: CONFIDENCE.EXEC_VERIFIED,
+          validationSteps: [
+            `Sent array of ${BATCH_SIZE} operations in one POST to ${u}`,
+            `Server returned HTTP 200 with array of ${json.length} result objects`,
+          ],
+          isVerified: true,
+        };
+      }
+
+      if (serverAcceptedSingle) {
+        return {
+          type: "graphql-batched-queries",
+          severity: "MEDIUM",
+          url: u,
+          evidence:
+            `GraphQL endpoint at ${u} accepted a batched request array (HTTP 200) but returned a single result. ` +
+            `The server may process all operations internally before collapsing the response. Manual verification recommended.`,
+          cvssScore: 5.3,
+          cveId: "CWE-770",
+          confidence: CONFIDENCE.SINGLE_PAYLOAD,
+          validationSteps: [
+            `Sent array of ${BATCH_SIZE} operations in one POST to ${u}`,
+            `Server returned HTTP 200 (non-array) — batch may be silently processed`,
+          ],
+          isVerified: false,
+        };
+      }
+    } catch { /* next */ }
+  }
+  return null;
+}
+
+// ─── 4. Alias Flooding DoS ───────────────────────────────────────────────────
+
+/**
+ * Sends a single operation with many aliased field resolvers.
+ * Unlike batching (which needs array support), alias flooding works on any GraphQL server
+ * and forces N resolver invocations from one request.
+ */
+export async function probeGraphQLAliasFlooding(
+  baseUrl: string,
+  session: AuthSession = EMPTY_SESSION,
+  fetchFn?: Fetcher
+): Promise<PendingFinding | null> {
+  const fetcher = resolveFetcher(session, fetchFn);
+  const ALIAS_COUNT = 100;
+  const SLOW_THRESHOLD_MS = 3_000;
+
+  // Build: { a0: __typename a1: __typename ... a99: __typename }
+  function buildAliasBomb(count: number): string {
+    const aliases = Array.from({ length: count }, (_, i) => `a${i}: __typename`).join(" ");
+    return `{ ${aliases} }`;
+  }
+
+  for (const path of GRAPHQL_PATHS) {
+    try {
+      const u = new URL(path, baseUrl).toString();
+
+      // Liveness check
+      const ping = await gqlPost(fetcher, u, { query: "{ __typename }" });
+      if (!ping || ping.status === 404 || ping.status >= 502) continue;
+
+      const aliasQuery = buildAliasBomb(ALIAS_COUNT);
+
+      const start = Date.now();
+      const result = await fetcher(u, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: aliasQuery }),
+      });
+      const elapsed = Date.now() - start;
+
+      if (!result) continue;
+      const text = await result.text().catch(() => "");
+
+      const hasComplexityError = /alias.*limit|too many alias|complexity|field.*limit/i.test(text);
+
+      if (result.status === 200 && !hasComplexityError) {
+        // Count how many alias keys appear in the response — confirms all were resolved
+        let resolvedAliases = 0;
+        try {
+          const json = JSON.parse(text);
+          if (json?.data) resolvedAliases = Object.keys(json.data).length;
+        } catch { /* estimate */ }
+
+        const isSlowOrAmplified = elapsed >= SLOW_THRESHOLD_MS || resolvedAliases >= ALIAS_COUNT * 0.8;
+
+        if (isSlowOrAmplified) {
+          return {
+            type: "graphql-dos-alias-flooding",
+            severity: "HIGH",
+            url: u,
+            evidence:
+              `GraphQL Alias Flooding DoS: endpoint ${u} resolved ${resolvedAliases} aliased field calls in one request ` +
+              `(elapsed: ${elapsed}ms). No alias-count or complexity limit is enforced. ` +
+              `Attackers can trigger N resolver executions with a single HTTP request.`,
+            cvssScore: 7.5,
+            cveId: "CWE-400",
+            confidence: resolvedAliases >= ALIAS_COUNT * 0.8 ? CONFIDENCE.EXEC_VERIFIED : CONFIDENCE.TIMING_VERIFIED,
+            validationSteps: [
+              `Sent query with ${ALIAS_COUNT} aliased __typename resolvers to ${u}`,
+              `Server responded in ${elapsed}ms, resolving ${resolvedAliases} alias(es) — no complexity guard`,
+            ],
+            isVerified: resolvedAliases >= ALIAS_COUNT * 0.8,
+          };
+        }
+      }
+    } catch { /* next */ }
+  }
+  return null;
+}
+
+// ─── Master entry point ───────────────────────────────────────────────────────
+
+/**
+ * Master GraphQL probe — runs all four attack classes in parallel and returns
+ * every finding. Call this from the engine instead of the individual probes.
+ */
+export async function probeGraphQL(
+  baseUrl: string,
+  session: AuthSession = EMPTY_SESSION,
+  fetchFn?: Fetcher
+): Promise<PendingFinding[]> {
+  const [introspectionFindings, dosNesting, batchFinding, aliasFinding] = await Promise.all([
+    probeGraphQLIntrospection(baseUrl, session, fetchFn),
+    probeGraphQLDoS(baseUrl, session, fetchFn),
+    probeGraphQLBatchedQueries(baseUrl, session, fetchFn),
+    probeGraphQLAliasFlooding(baseUrl, session, fetchFn),
+  ]);
+
+  return [
+    ...introspectionFindings,
+    ...(dosNesting ? [dosNesting] : []),
+    ...(batchFinding ? [batchFinding] : []),
+    ...(aliasFinding ? [aliasFinding] : []),
+  ];
+}
+
+/** @deprecated Use probeGraphQL() instead — kept for backward compatibility. */
+export async function checkGraphQLIntrospection(
+  baseUrl: string,
+  sessionOrFetch?: AuthSession | Fetcher,
+  authedFetchFn?: Fetcher
+): Promise<PendingFinding | null> {
+  const session = typeof sessionOrFetch !== "function" ? (sessionOrFetch ?? EMPTY_SESSION) : EMPTY_SESSION;
+  const fetchFn = typeof sessionOrFetch === "function" ? sessionOrFetch : authedFetchFn;
+  const findings = await probeGraphQLIntrospection(baseUrl, session, fetchFn);
+  return findings.find((f) => f.type === "graphql-introspection") ?? null;
 }
 
 /**
