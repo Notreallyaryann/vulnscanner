@@ -69,6 +69,7 @@ import {
 
 import {
   detectSSRF,
+  probeInBandSSRF,
   probeBlindSSRFWithTiming,
   detectSubdomainTakeoverSignals,
   probeHostHeaderInjection,
@@ -777,6 +778,9 @@ export async function runVulnerabilityScan(
         log(`🕸️   Page audit complete — ${discoveredLinks.length} links, ${apiEndpoints.length} API refs, ${discoveredParamUrls.length} param URLs, ${discoveredForms.length} form(s)`);
         discoveredLinks.forEach((l) => accumulatedDiscoveredLinks.add(l));
 
+        const ssrfSignal = detectSSRF(renderedHtml, discoveredParamUrls, normalizedUrl);
+        if (ssrfSignal) await recordFinding(ssrfSignal);
+
         const jsBundleEndpoints = await extractJsBundleEndpoints(renderedHtml, normalizedUrl);
 
         if (normalizedUrl === targetUrl) {
@@ -824,6 +828,8 @@ export async function runVulnerabilityScan(
               probeLimit(() => probeBlindSQLiTiming(url)),
               probeLimit(() => probeBlindSQLiBooleanDiff(url)),
               probeLimit(() => probeSSTI(url)),
+              probeLimit(() => probeInBandSSRF(url, session)),
+              probeLimit(() => probeBlindSSRFWithTiming(url)),
             ])
           );
 

@@ -12,6 +12,7 @@ import {
 } from "../scanner/probes/api";
 import { probeNegativeQuantity } from "../scanner/probes/misc";
 import { probeSSTI, probeRestApiSSTI } from "../scanner/probes/injection";
+import { probeInBandSSRF } from "../scanner/probes/network";
 import { EMPTY_SESSION } from "../scanner/types";
 
 // ── Original tests ────────────────────────────────────────────────────────────
@@ -215,7 +216,7 @@ test("probeGraphQLIntrospection detects full schema dump", async () => {
   if (!introspectionFinding) throw new Error("Expected a graphql-introspection finding");
   assert.strictEqual(introspectionFinding.severity, "MEDIUM");
   assert.strictEqual(introspectionFinding.isVerified, true);
-  assert.ok(introspectionFinding.evidence.includes("2 user-defined type(s)"));
+  assert.ok(introspectionFinding.evidence?.includes("2 user-defined type(s)"));
 });
 
 test("probeGraphQLIntrospection detects field suggestion oracle when full introspection is blocked", async () => {
@@ -238,7 +239,7 @@ test("probeGraphQLIntrospection detects field suggestion oracle when full intros
   const suggestionFinding = findings.find((f) => f.type === "graphql-field-suggestion-leak");
   if (!suggestionFinding) throw new Error("Expected a graphql-field-suggestion-leak finding");
   assert.strictEqual(suggestionFinding.severity, "LOW");
-  assert.ok(suggestionFinding.evidence.includes("user"));
+  assert.ok(suggestionFinding.evidence?.includes("user"));
 });
 
 test("probeGraphQLBatchedQueries detects server accepting batched operation arrays", async () => {
@@ -257,7 +258,7 @@ test("probeGraphQLBatchedQueries detects server accepting batched operation arra
   assert.strictEqual(finding.type, "graphql-batched-queries");
   assert.strictEqual(finding.severity, "HIGH");
   assert.strictEqual(finding.isVerified, true);
-  assert.ok(finding.evidence.includes("50 operations"));
+  assert.ok(finding.evidence?.includes("50 operations"));
 });
 
 test("probeGraphQLBatchedQueries does not flag a server that rejects batch arrays", async () => {
@@ -290,7 +291,7 @@ test("probeGraphQLAliasFlooding detects server resolving 100 aliased fields", as
   if (!finding) throw new Error("Expected an alias flooding finding");
   assert.strictEqual(finding.type, "graphql-dos-alias-flooding");
   assert.strictEqual(finding.severity, "HIGH");
-  assert.ok(finding.evidence.includes("100 aliased field"));
+  assert.ok(finding.evidence?.includes("100 aliased field"));
 });
 
 test("probeGraphQLAliasFlooding does not flag a server that enforces an alias complexity limit", async () => {
@@ -347,8 +348,8 @@ test("probeSSTI detects Jinja2/Twig expression execution in URL parameter", asyn
   assert.strictEqual(finding.severity, "CRITICAL");
   assert.strictEqual(finding.parameter, "q");
   assert.strictEqual(finding.isVerified, true);
-  assert.ok(finding.evidence.includes("Jinja2"), "Evidence should name the template engine family");
-  assert.ok(finding.evidence.includes("756877"), "Evidence should contain the evaluated marker");
+  assert.ok(finding.evidence?.includes("Jinja2"), "Evidence should name the template engine family");
+  assert.ok(finding.evidence?.includes("756877"), "Evidence should contain the evaluated marker");
 });
 
 test("probeSSTI does not flag a server that reflects {{N*M}} literally (pure reflection, no execution)", async () => {
@@ -383,8 +384,8 @@ test("probeRestApiSSTI detects SSTI in a JSON body field (name field evaluated b
   assert.strictEqual(finding.type, "ssti-injection-rest");
   assert.strictEqual(finding.severity, "CRITICAL");
   assert.strictEqual(finding.isVerified, true);
-  assert.ok(finding.evidence.includes("756877"), "Evidence should contain the evaluated marker value");
-  assert.ok(finding.evidence.includes("Jinja2"), "Evidence should identify the engine family");
+  assert.ok(finding.evidence?.includes("756877"), "Evidence should contain the evaluated marker value");
+  assert.ok(finding.evidence?.includes("Jinja2"), "Evidence should identify the engine family");
 });
 
 test("probeRestApiSSTI does not flag a server that echoes payload verbatim (no template evaluation)", async () => {
@@ -397,3 +398,58 @@ test("probeRestApiSSTI does not flag a server that echoes payload verbatim (no t
   const finding = await probeRestApiSSTI("https://example.com", EMPTY_SESSION, mockFetch);
   assert.strictEqual(finding, null, "Verbatim echo without evaluation must not be flagged");
 });
+
+test("probeInBandSSRF detects AWS metadata leakage via injected parameter", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url: string | URL | Request) => {
+      const urlStr = url.toString();
+      if (urlStr.includes("169.254.169.254")) {
+        return new Response("ami-id\ninstance-id\nlocal-ipv4\n", {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+      return new Response("Normal website page", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      });
+    };
+
+    const finding = await probeInBandSSRF("https://example.com/proxy?target=https://good.com");
+    assert.notStrictEqual(finding, null);
+    assert.strictEqual(finding?.type, "ssrf-inband-content-disclosure");
+    assert.strictEqual(finding?.severity, "CRITICAL");
+    assert.ok(finding?.evidence?.includes("AWS EC2 Metadata Service"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("probeInBandSSRF detects local file disclosure (/etc/passwd) via file:// URI", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url: string | URL | Request) => {
+      const urlStr = url.toString();
+      if (urlStr.includes("file%3A%2F%2F%2Fetc%2Fpasswd") || urlStr.includes("file:///etc/passwd")) {
+        return new Response("root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n", {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+      return new Response("Normal website page", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      });
+    };
+
+    const finding = await probeInBandSSRF("https://example.com/view?file=doc.pdf");
+    assert.notStrictEqual(finding, null);
+    assert.strictEqual(finding?.type, "ssrf-inband-content-disclosure");
+    assert.strictEqual(finding?.severity, "CRITICAL");
+    assert.ok(finding?.evidence?.includes("/etc/passwd"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
