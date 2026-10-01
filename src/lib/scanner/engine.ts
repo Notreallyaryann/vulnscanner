@@ -892,7 +892,7 @@ export async function runVulnerabilityScan(
         if (visitedUrls.size === 1) {
           log(`🔬  Running root-only vulnerability probes...`);
           const rootOnlyResults = await Promise.all([
-            probeFileUploadVulnerabilities(targetUrl, renderedHtml),
+            probeFileUploadVulnerabilities(targetUrl, renderedHtml, session, log, scanId),
             probeMassAssignment(targetUrl, jsBundleEndpoints, session),
             probeBusinessLogicVulnerabilities(targetUrl, session),
             // New root-only probes

