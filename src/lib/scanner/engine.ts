@@ -112,6 +112,11 @@ import {
   probeBusinessLogicVulnerabilities,
 } from "./probes/misc";
 
+import {
+  probeFormCSRF,
+  probeApiCSRF,
+} from "./probes/csrf";
+
 async function analyzeJSFiles(html: string, baseUrl: string): Promise<PendingFinding[]> {
   const base = new URL(baseUrl);
   const findings: PendingFinding[] = [];
@@ -845,6 +850,7 @@ export async function runVulnerabilityScan(
               probeLimit(() => probeFormSQLi(form, session)),
               probeLimit(() => probeFormXSS(form, session, log, scanId)),
               probeLimit(() => probeFormSSTI(form)),
+              probeLimit(() => probeFormCSRF(form, session)),
             ])
           );
 
@@ -876,6 +882,7 @@ export async function runVulnerabilityScan(
           probeLimit(() => probeHTTPMethodOverride(normalizedUrl)),
           probeLimit(() => probeIDORSequentialFuzz(normalizedUrl, session)),
           probeLimit(() => probeApiSensitiveDataExposure(normalizedUrl, apiEndpoints)),
+          probeLimit(() => probeApiCSRF(normalizedUrl, jsBundleEndpoints, session)),
         ]);
 
         for (const result of infraResults) {

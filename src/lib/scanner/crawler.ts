@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import { XMLParser } from "fast-xml-parser";
+import { FormTarget } from "./types";
 
 export interface CrawledTarget {
   url: string;
@@ -24,10 +25,10 @@ export function isSpaHtmlFallback(resp: Response | null, bodyText: string): bool
  * Extracts same-origin links and forms from HTML using Cheerio.
  * Supports React Router, Angular Router, Vue Router, Next.js links, and standard HTML forms.
  */
-export function extractHtmlLinksAndForms(html: string, baseUrl: string): { links: string[]; forms: { actionUrl: string; method: "GET" | "POST"; fields: string[] }[] } {
+export function extractHtmlLinksAndForms(html: string, baseUrl: string): { links: string[]; forms: FormTarget[] } {
   const base = new URL(baseUrl);
   const links = new Set<string>();
-  const forms: { actionUrl: string; method: "GET" | "POST"; fields: string[] }[] = [];
+  const forms: FormTarget[] = [];
 
   try {
     const $ = cheerio.load(html);
@@ -76,16 +77,23 @@ export function extractHtmlLinksAndForms(html: string, baseUrl: string): { links
         const methodRaw = ($(formEl).attr("method") || "POST").toUpperCase();
         const method: "GET" | "POST" = methodRaw === "GET" ? "GET" : "POST";
         const fields: string[] = [];
+        let hasCsrfToken = false;
+        let csrfFieldName: string | undefined;
 
         $(formEl).find("input, textarea, select").each((_, el) => {
           const name = $(el).attr("name") || $(el).attr("id") || $(el).attr("data-testid") || $(el).attr("ng-reflect-name") || $(el).attr("v-model");
-          if (name && !["_csrf", "csrfmiddlewaretoken", "__VIEWSTATE", "_token"].includes(name)) {
-            fields.push(name);
+          if (name) {
+            if (/^(?:_csrf|csrfmiddlewaretoken|__viewstate|_token|authenticity_token|csrf[-_]?token)$/i.test(name)) {
+              hasCsrfToken = true;
+              csrfFieldName = name;
+            } else {
+              fields.push(name);
+            }
           }
         });
 
         if (fields.length > 0) {
-          forms.push({ actionUrl: actionUrl.toString(), method, fields });
+          forms.push({ actionUrl: actionUrl.toString(), method, fields, hasCsrfToken, csrfFieldName });
         }
       } catch {}
     });

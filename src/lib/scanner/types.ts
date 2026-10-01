@@ -136,6 +136,8 @@ export interface FormTarget {
   actionUrl: string;
   method: "GET" | "POST";
   fields: string[];
+  hasCsrfToken?: boolean;
+  csrfFieldName?: string;
 }
 
 export interface JsApiEndpoint {

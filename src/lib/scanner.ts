@@ -19,3 +19,4 @@ export * from "./scanner/probes/network";
 export * from "./scanner/probes/headers";
 export * from "./scanner/probes/api";
 export * from "./scanner/probes/misc";
+export * from "./scanner/probes/csrf";
